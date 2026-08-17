@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "73.05%",
+    "missed": 1364,
+    "total": 5061
+  },
+  "generated_at": "2026-08-17T04:01:51Z",
+  "lines": {
+    "coverage": "77.39%",
+    "missed": 9480,
+    "total": 41936
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "76.57%",
+    "missed": 13790,
+    "total": 58846
+  },
+  "run_url": "https://github.com/guozy18/AgentENV/actions/runs/31991582043"
+}
