@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-54f86eab.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -200,7 +200,8 @@ make proto      # regenerate protobuf
 <pre><code class="language-bash"># Start scheduler (default: 127.0.0.1:9090)
 make -C services run-scheduler
 
-# Start gateway
+# Start gateway (use the same key on runtime nodes)
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
 make -C services run-gateway
 </code></pre>
 <h2 id="discovery-modes"><a class="header" href="#discovery-modes">Discovery Modes</a></h2>
@@ -211,7 +212,8 @@ make -C services run-gateway
 </ul>
 <h2 id="deployment"><a class="header" href="#deployment">Deployment</a></h2>
 <h3 id="docker-compose"><a class="header" href="#docker-compose">Docker Compose</a></h3>
-<pre><code class="language-bash">make deploy-up      # gateway + scheduler + 2 backend nodes
+<pre><code class="language-bash"># Run scripts/docker-setup.sh first for host prerequisites.
+make deploy-up      # gateway + scheduler + 2 backend nodes
 make deploy-ps      # status
 make deploy-logs    # logs
 make deploy-down    # teardown
