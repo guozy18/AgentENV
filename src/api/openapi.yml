@@ -182,6 +182,16 @@ components:
         - running
         - paused
 
+    SnapshotType:
+      type: string
+      enum:
+        - local
+        - distributed
+      description: >-
+        Storage availability of a reusable snapshot. Local snapshots are
+        available only on the publishing node; distributed snapshots are
+        published to the primary repository.
+
     SnapshotInfo:
       type: object
       required:
@@ -223,17 +233,7 @@ components:
             Omitted when no rootfs image was published.
         snapshotType:
           $ref: "#/components/schemas/SnapshotType"
-          description: Lifecycle and durability semantics of the snapshot.
-
-    SnapshotType:
-      type: string
-      enum:
-        - local
-        - distributed
-        - temporal
-      description: >-
-        Snapshot lifecycle intent. Temporal is reserved for owning sandbox
-        pause/resume and is rejected by the persistent snapshot endpoint.
+          description: Storage availability of the reusable snapshot.
 
     EnvVars:
       additionalProperties:
@@ -668,13 +668,13 @@ components:
       properties:
         name:
           type: string
-          description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+          description: Optional human-readable alias for the reusable snapshot. The alias must not already identify a different snapshot.
         snapshotType:
           $ref: "#/components/schemas/SnapshotType"
           default: distributed
           description: >-
-            Requested snapshot durability. Omitted requests retain the legacy
-            distributed behavior.
+            Requested storage availability for the reusable snapshot. Omitted
+            requests retain the legacy distributed behavior.
 
     SandboxForkRequest:
       type: object
@@ -1523,7 +1523,6 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
-  # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
   /sandboxes/{sandboxID}/pause:
     post:
       summary: Pause sandbox

@@ -15,7 +15,7 @@ use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
 use crate::snapshot::types::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
+    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
 };
 
 #[derive(Clone, Debug)]
@@ -208,9 +208,27 @@ impl PosixFsSnapshotRepository {
     }
 
     fn delete_sync(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let Some(record) = self.catalog_store.get(id_or_alias)? else {
+        let Some(record) = self.catalog_store.get_for_delete(id_or_alias)? else {
             return Ok(());
         };
+        self.catalog_store.delete_record(&record.id).map(|_| ())
+    }
+
+    fn delete_by_id_sync(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+        self.catalog_store.delete_record(id)
+    }
+
+    fn delete_matching_source_sync(
+        &self,
+        id_or_alias: &str,
+        source: SnapshotSourceKind,
+    ) -> RepositoryResult<bool> {
+        let Some(record) = self.catalog_store.get_for_delete(id_or_alias)? else {
+            return Ok(false);
+        };
+        if record.source.kind() != source {
+            return Ok(false);
+        }
         self.catalog_store.delete_record(&record.id)
     }
 
@@ -273,6 +291,28 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
+    async fn delete_by_id(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+        let repository = self.clone();
+        let id = id.clone();
+        run_repository_blocking("delete snapshot by id", move || {
+            repository.delete_by_id_sync(&id)
+        })
+        .await
+    }
+
+    async fn delete_matching_source(
+        &self,
+        id_or_alias: &str,
+        source: SnapshotSourceKind,
+    ) -> RepositoryResult<bool> {
+        let repository = self.clone();
+        let id_or_alias = id_or_alias.to_string();
+        run_repository_blocking("delete snapshot by source", move || {
+            repository.delete_matching_source_sync(&id_or_alias, source)
+        })
+        .await
+    }
+
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         let repository = self.clone();
         let alias = alias.to_string();
@@ -327,6 +367,7 @@ mod tests {
     use overlaybd::config::ImageConfig as OverlaybdImageConfig;
     use tempfile::TempDir;
 
+    use super::super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
@@ -551,6 +592,40 @@ mod tests {
                 .is_none(),
             "deleted snapshot should no longer be visible"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_recovers_after_visibility_marker_was_removed() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let repository = test_backend(tempdir.path()).repository();
+        let snapshot_id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse("interrupted-delete").expect("alias should parse");
+
+        repository
+            .publish(
+                sample_metadata(snapshot_id.clone(), Some(alias.as_ref())),
+                seed_built_snapshot(tempdir.path()),
+            )
+            .await
+            .expect("publish should work");
+
+        let layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
+        fs::remove_file(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER))
+            .expect("simulate delete interrupted after hiding the record");
+        assert!(repository
+            .get(alias.as_ref())
+            .await
+            .expect("hidden snapshot lookup should work")
+            .is_none());
+
+        repository
+            .delete(alias.as_ref())
+            .await
+            .expect("retry should remove the hidden record and artifacts");
+
+        assert!(!layout.snapshot_dir().exists());
+        assert!(!PosixFsSnapshotArtifactLayout::record_path(tempdir.path(), &snapshot_id).exists());
+        assert!(!PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias).exists());
     }
 
     #[tokio::test]

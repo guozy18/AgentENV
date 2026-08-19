@@ -24,8 +24,7 @@ use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, SnapshotType, TemplateBuildErrorReason, TemplateBuildInfo,
-    TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
@@ -217,7 +216,9 @@ impl SnapshotRepository for OssSnapshotRepository {
             }
         }
 
+        let previous_record = self.read_record(id).await?;
         let mut disk_publications = Vec::new();
+        let mut catalog_write_attempted = false;
 
         let publish_result = async {
             validate_publish_manifest_image_configs(&manifest)?;
@@ -297,15 +298,9 @@ impl SnapshotRepository for OssSnapshotRepository {
 
             // 5. The atomic record PUT makes the completed artifact closure
             // visible; bind the alias only after that commit point.
+            catalog_write_attempted = true;
             let record = self
-                .write_committed_record(
-                    metadata.id.clone(),
-                    metadata.alias.clone(),
-                    metadata.resources,
-                    committed,
-                    metadata.source.clone(),
-                    metadata.snapshot_type,
-                )
+                .write_committed_record(&metadata, committed, previous_record.clone())
                 .await?;
 
             // 6. Bind aliases only after the record is durable.
@@ -322,27 +317,27 @@ impl SnapshotRepository for OssSnapshotRepository {
             Err(error) => {
                 // Best-effort rollback. Content-addressed managed layers are intentionally left
                 // in place; they are shared across snapshots and require separate GC.
-                let record_key = OssSnapshotArtifactLayout::record_key(id);
-                if let Err(cleanup_error) = self.client.delete(&record_key).await {
-                    warn!(
-                        snapshot_id = %id,
-                        error = %cleanup_error,
-                        "failed to roll back OSS snapshot record"
-                    );
-                }
-                if let Some(alias) = metadata.alias.as_ref() {
-                    if self
-                        .load_alias_target(alias.as_ref())
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        == Some(id)
-                    {
-                        let _ = self
-                            .client
-                            .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
-                            .await;
+                if catalog_write_attempted {
+                    match previous_record.as_ref() {
+                        Some(record) => {
+                            if let Err(cleanup_error) = self.write_record(record).await {
+                                warn!(
+                                    snapshot_id = %id,
+                                    error = %cleanup_error,
+                                    "failed to restore previous OSS snapshot record"
+                                );
+                            }
+                        }
+                        None => {
+                            let record_key = OssSnapshotArtifactLayout::record_key(id);
+                            if let Err(cleanup_error) = self.client.delete(&record_key).await {
+                                warn!(
+                                    snapshot_id = %id,
+                                    error = %cleanup_error,
+                                    "failed to roll back OSS snapshot record"
+                                );
+                            }
+                        }
                     }
                 }
                 if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
@@ -420,46 +415,18 @@ impl SnapshotRepository for OssSnapshotRepository {
     }
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        // Resolve the actual id + metadata.
-        let record = match self.get(id_or_alias).await? {
-            Some(t) => t,
-            None => return Ok(()), // Idempotent.
+        let Some(record) = self.get(id_or_alias).await? else {
+            return Ok(());
         };
-        let id = &record.id;
-        let layout = self.layout(id);
+        self.delete_record(record).await
+    }
 
-        // 1. Delete alias binding.
-        if let Some(ref alias) = record.alias {
-            if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(id) {
-                if let Err(error) = self
-                    .client
-                    .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
-                    .await
-                {
-                    warn!(snapshot_id = %id, alias = %alias, error = %error, "failed to delete oss alias during snapshot removal");
-                }
-            }
-        }
-
-        // 2. Delete the catalog record.
-        self.client
-            .delete(&OssSnapshotArtifactLayout::record_key(id))
-            .await
-            .map_err(|e| RepositoryError::backend("delete snapshot record from oss", e))?;
-
-        // 3. Delete external disk publications on a best-effort basis.
-        if let Some(committed) = record.committed.as_ref() {
-            self.delete_disk_publications(id, &committed.disk_publications)
-                .await;
-        }
-
-        // 4. Delete artifacts.
-        if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-            warn!(snapshot_id = %id, error = %error, "failed to delete oss snapshot artifacts");
-        }
-
-        debug!(snapshot_id = %id, "deleted snapshot from oss");
-        Ok(())
+    async fn delete_by_id(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+        let Some(record) = self.read_record(id).await? else {
+            return Ok(false);
+        };
+        self.delete_record(record).await?;
+        Ok(true)
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
@@ -543,6 +510,47 @@ impl SnapshotRepository for OssSnapshotRepository {
 // ── private helpers ────────────────────────────────────────────────────
 
 impl OssSnapshotRepository {
+    async fn delete_record(&self, record: SnapshotRecord) -> RepositoryResult<()> {
+        let id = &record.id;
+        let layout = self.layout(id);
+
+        // Keep the alias reserved when record deletion fails so a retry cannot
+        // resolve the same alias to a newer snapshot.
+        self.client
+            .delete(&OssSnapshotArtifactLayout::record_key(id))
+            .await
+            .map_err(|error| RepositoryError::backend("delete snapshot record from oss", error))?;
+
+        if let Some(alias) = record.alias.as_ref() {
+            match self.load_alias_target(alias.as_ref()).await {
+                Ok(Some(target)) if &target == id => {
+                    if let Err(error) = self
+                        .client
+                        .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
+                        .await
+                    {
+                        warn!(snapshot_id = %id, %alias, %error, "failed to delete oss alias during snapshot removal");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(snapshot_id = %id, %alias, %error, "failed to inspect oss alias during snapshot removal; stale binding will be cleaned on lookup");
+                }
+            }
+        }
+
+        if let Some(committed) = record.committed.as_ref() {
+            self.delete_disk_publications(id, &committed.disk_publications)
+                .await;
+        }
+        if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
+            warn!(snapshot_id = %id, %error, "failed to delete oss snapshot artifacts");
+        }
+
+        debug!(snapshot_id = %id, "deleted snapshot from oss");
+        Ok(())
+    }
+
     async fn read_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
         let key = OssSnapshotArtifactLayout::record_key(id);
         match self.client.get_bytes(&key).await {
@@ -572,15 +580,17 @@ impl OssSnapshotRepository {
 
     async fn write_committed_record(
         &self,
-        id: SnapshotId,
-        alias: Option<SnapshotAlias>,
-        resources: crate::types::SandboxResources,
+        metadata: &SnapshotPublishMetadata,
         committed: CommittedSnapshot,
-        source: SnapshotPublishSource,
-        snapshot_type: SnapshotType,
+        previous_record: Option<SnapshotRecord>,
     ) -> RepositoryResult<SnapshotRecord> {
+        let id = metadata.id.clone();
+        let alias = metadata.alias.clone();
+        let resources = metadata.resources;
+        let source = metadata.source.clone();
+        let snapshot_type = metadata.snapshot_type;
         let now = now_unix_ms();
-        let record = if let Some(mut record) = self.read_record(&id).await? {
+        let record = if let Some(mut record) = previous_record {
             record.mark_committed(snapshot_type, alias, resources, committed, source, now);
             record
         } else {
@@ -1007,11 +1017,7 @@ impl OssSnapshotRepository {
         }
 
         if let Some(sources) = filter.sources.as_ref() {
-            let source = match &record.source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
+            if !sources.contains(&record.source.kind()) {
                 return false;
             }
         }

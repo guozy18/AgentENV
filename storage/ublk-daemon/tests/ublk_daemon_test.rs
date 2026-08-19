@@ -680,6 +680,11 @@ mod client_tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not running"));
+        assert!(
+            err.downcast_ref::<RestackSnapshotTerminalFailure>()
+                .is_some(),
+            "restack without a response has an unknown mutation outcome"
+        );
     }
 
     // ── request dispatch verification ───────────────────────────────────

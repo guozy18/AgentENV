@@ -21,9 +21,9 @@ use crate::types::{ImageConfigs, SandboxResources};
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
-    /// Lifecycle intent for this snapshot.
+    /// Storage availability requested for this reusable snapshot.
     ///
-    /// The intent is persisted with the record so a node restart does not
+    /// The value is persisted with the record so a node restart does not
     /// have to infer local-vs-distributed semantics from the configured
     /// repository backend.
     pub snapshot_type: SnapshotType,
@@ -64,20 +64,13 @@ impl SnapshotPublishMetadata {
     }
 }
 
-/// Availability and lifecycle semantics of a committed snapshot.
-///
-/// `Temporal` is reserved for the owning sandbox pause/resume continuation;
-/// the persistent snapshot repository accepts only `Local` and
-/// `Distributed`. Keeping it in the shared model makes invalid API requests
-/// explicit instead of silently treating a temporal continuation as a
-/// reusable snapshot.
+/// Storage availability of a committed reusable snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotType {
     Local,
     #[default]
     Distributed,
-    Temporal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,6 +167,15 @@ impl TemplateBuildInfo {
 pub enum SnapshotSource {
     Template { build: TemplateBuildInfo },
     Sandbox { source_sandbox_id: String },
+}
+
+impl SnapshotSource {
+    pub fn kind(&self) -> SnapshotSourceKind {
+        match self {
+            Self::Template { .. } => SnapshotSourceKind::Template,
+            Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,7 +353,7 @@ impl CommittedSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
-    /// The requested lifecycle/availability semantics.
+    /// Storage availability of the committed reusable snapshot.
     ///
     /// Older records did not carry this field; those records are the legacy
     /// durable (distributed) form.

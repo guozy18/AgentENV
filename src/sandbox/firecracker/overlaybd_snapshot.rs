@@ -18,7 +18,7 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::compact_to;
+use overlaybd::index_file::{compact_to, create_mappings_from_sparse};
 use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
@@ -509,49 +509,49 @@ async fn capture_live_overlaybd_snapshot(
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
-    if live_snapshot_layer_path != snapshot_layer_path {
-        // If this cross-filesystem copy fails, leave the live runtime config
-        // untouched and surface a terminal pause failure. The daemon has
-        // already sealed the old upper and reopened a fresh one, so callers
-        // must not continue treating the live runtime as safely resumable.
-        copy_file_atomically(
-            &live_snapshot_layer_path,
+    // The daemon has sealed the old upper and opened a new one. Every error
+    // after this mutation boundary is terminal until the live config is
+    // rewritten to describe that new stack.
+    async {
+        if live_snapshot_layer_path != snapshot_layer_path {
+            copy_file_atomically(
+                &live_snapshot_layer_path,
+                &snapshot_layer_path,
+                "restack snapshot layer",
+            )
+            .await
+            .context("copy restack snapshot layer into managed snapshot dir")?;
+        }
+
+        if let Some(descriptor) = descriptor.as_ref() {
+            let copied_size = tokio::fs::metadata(&snapshot_layer_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "read restack snapshot layer metadata {}",
+                        snapshot_layer_path.display()
+                    )
+                })?
+                .len();
+            if copied_size != descriptor.size {
+                anyhow::bail!(
+                    "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
+                    snapshot_layer_path.display(),
+                    descriptor.size,
+                    copied_size
+                );
+            }
+        }
+
+        rewrite_live_runtime_config_for_restack(
+            live_runtime_image_config_path,
             &snapshot_layer_path,
-            "restack snapshot layer",
+            descriptor.as_ref(),
         )
         .await
-        .context("copy restack snapshot layer into managed snapshot dir")
-        .map_err(into_terminal_snapshot_failure)?;
+        .context("rewrite live runtime config after restack snapshot")
     }
-
-    if let Some(descriptor) = descriptor.as_ref() {
-        let copied_size = tokio::fs::metadata(&snapshot_layer_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "read restack snapshot layer metadata {}",
-                    snapshot_layer_path.display()
-                )
-            })?
-            .len();
-        if copied_size != descriptor.size {
-            let _ = fs::remove_file(&snapshot_layer_path);
-            anyhow::bail!(
-                "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
-                snapshot_layer_path.display(),
-                descriptor.size,
-                copied_size
-            );
-        }
-    }
-
-    rewrite_live_runtime_config_for_restack(
-        live_runtime_image_config_path,
-        &snapshot_layer_path,
-        descriptor.as_ref(),
-    )
     .await
-    .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
@@ -784,6 +784,59 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     Ok((data_path, memory_size))
 }
 
+/// Convert Firecracker's standard sparse diff-memory file into a sealed
+/// OverlayBD layer.
+///
+/// Firecracker writes untouched guest-memory pages as holes in `mem.bin`.
+/// OverlayBD's raw packager preserves that sparse layout while producing the
+/// same sealed layer shape as the direct dirty-range path. The temporary
+/// sparse file is removed only after the final layer rename succeeds.
+pub(crate) async fn convert_sparse_mem_to_overlaybd(
+    sparse_mem_path: &Path,
+    output_dir: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<(PathBuf, u64)> {
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
+
+    let data_path = output_dir.join("overlaybd.commit");
+    let virtual_size = tokio::fs::metadata(sparse_mem_path)
+        .await
+        .with_context(|| format!("stat sparse memory snapshot: {}", sparse_mem_path.display()))?
+        .len();
+    let source: Arc<dyn VirtualFile> = Arc::new(
+        LocalFile::open_ro(sparse_mem_path, shared_transient_io_ring())
+            .await
+            .with_context(|| {
+                format!("open sparse memory snapshot: {}", sparse_mem_path.display())
+            })?,
+    );
+    let mappings = create_mappings_from_sparse(&source, 0)
+        .await
+        .with_context(|| format!("scan sparse memory snapshot: {}", sparse_mem_path.display()))?;
+    publish_memory_overlaybd_layer(
+        &[source],
+        &mappings,
+        virtual_size,
+        &data_path,
+        mode,
+        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+    )
+    .await
+    .context("convert sparse memory snapshot to overlaybd layer")?;
+
+    if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
+        warn!(
+            mem_path = %sparse_mem_path.display(),
+            error = %error,
+            "failed to remove sparse memory snapshot after overlaybd commit"
+        );
+    }
+
+    Ok((data_path, virtual_size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +845,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
+    use overlaybd::index_file::LSMTReadOnlyFile;
     use serde_json::json;
 
     #[test]
@@ -1144,5 +1198,35 @@ mod tests {
             tokio::fs::read(&output).await.expect("read final"),
             existing
         );
+    }
+
+    #[tokio::test]
+    async fn convert_sparse_mem_removes_source_after_atomic_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("mem.bin");
+        let expected: Vec<u8> = (0..8192).map(|offset| (offset / 4096) as u8).collect();
+        tokio::fs::write(&source, &expected)
+            .await
+            .expect("write sparse memory source");
+
+        let output_dir = temp.path().join("memory");
+        let (output, virtual_size) =
+            convert_sparse_mem_to_overlaybd(&source, &output_dir, OverlaybdCompactOutput::Raw)
+                .await
+                .expect("publish sparse memory layer");
+
+        assert_eq!(virtual_size, expected.len() as u64);
+        assert!(!source.exists());
+        assert!(!output.with_extension("commit.tmp").exists());
+
+        let file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::open_ro(&output, shared_transient_io_ring())
+                .await
+                .expect("open published layer"),
+        );
+        let layer = LSMTReadOnlyFile::open(file)
+            .await
+            .expect("open logical overlaybd layer");
+        assert_eq!(layer.read_at(0, expected.len()).await.unwrap(), expected);
     }
 }

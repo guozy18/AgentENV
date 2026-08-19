@@ -76,6 +76,8 @@ pub trait SandboxPersister: Send + Sync {
     ) -> PersistenceResult<Option<PathBuf>>;
 
     /// Persist metadata and runtime state for a paused sandbox.
+    /// On failure, `artifact_root` remains caller-owned because the live
+    /// backend may still reference artifacts there while it resumes.
     async fn persist_paused(
         &self,
         metadata: &SandboxMetadata,

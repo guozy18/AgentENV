@@ -450,18 +450,30 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Creates a diff snapshot containing VM state only.
-    ///
-    /// The memory data path is handled by AgentENV through dirty memory ranges.
-    #[tracing::instrument(skip(self), fields(snapshot_path = %snapshot_path.display()))]
-    pub async fn create_state_only_snapshot(&self, snapshot_path: &Path) -> Result<()> {
+    /// Creates a Firecracker diff snapshot, optionally including a sparse
+    /// memory file. AgentENV omits the file for its direct dirty-range path.
+    #[tracing::instrument(
+        skip(self),
+        fields(snapshot_path = %snapshot_path.display(), ?mem_file_path)
+    )]
+    pub async fn create_diff_snapshot(
+        &self,
+        snapshot_path: &Path,
+        mem_file_path: Option<&Path>,
+    ) -> Result<()> {
         let mut params = SnapshotCreateParams::new(snapshot_path.to_string_lossy().into_owned());
+        params.mem_file_path = mem_file_path.map(|path| path.to_string_lossy().into_owned());
         params.snapshot_type =
             Some(firecracker_client::models::snapshot_create_params::SnapshotType::Diff);
+        let context = if mem_file_path.is_some() {
+            "Failed to create compatibility diff snapshot"
+        } else {
+            "Failed to create state-only snapshot"
+        };
         self.client
             .request_no_content(Method::PUT, "/snapshot/create", Some(&params))
             .await
-            .context("Failed to create state-only snapshot")
+            .context(context)
     }
 
     /// Returns Firecracker's dirty memory ranges for direct memory snapshot packaging.

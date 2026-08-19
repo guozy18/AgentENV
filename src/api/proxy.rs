@@ -261,16 +261,11 @@ async fn proxy_request(
 ) -> Response<Body> {
     let is_websocket_request = is_websocket_upgrade_request(request.headers());
     let (parts, body) = request.into_parts();
-    let resolved =
+    let (resolved, proxy_gate) =
         match resolve_proxy_request(api_impl, &forward_path, &parts, is_websocket_request).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-
-    let proxy_gate = api_impl
-        .orchestrator()
-        .acquire_proxy_read(&resolved.sandbox_id)
-        .await;
 
     if is_websocket_request {
         return proxy_websocket_request(websocket_upgrade, parts, resolved, proxy_gate).await;
@@ -667,11 +662,27 @@ async fn resolve_proxy_request(
     proxy_path: &str,
     parts: &http::request::Parts,
     is_websocket_request: bool,
-) -> Result<ResolvedProxyRequest, Response<Body>> {
+) -> Result<(ResolvedProxyRequest, tokio::sync::OwnedRwLockReadGuard<()>), Response<Body>> {
     let sandbox_id =
         parse_sandbox_id_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
     let target_port =
         parse_target_port_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
+    let proxy_gate = match api_impl
+        .orchestrator()
+        .acquire_proxy_read(&sandbox_id)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(OrchestratorError::SandboxNotFound(_)) => {
+            return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
+                sandbox_id,
+            )))
+        }
+        Err(error) => {
+            warn!(sandbox_id = %sandbox_id, %error, "failed to acquire sandbox proxy gate");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
 
     let mut auto_resume_attempted = false;
     let target = loop {
@@ -750,11 +761,14 @@ async fn resolve_proxy_request(
     }
     .map_err(|_| proxy_error_response(&ProxyRequestError::InvalidUpstreamUri))?;
 
-    Ok(ResolvedProxyRequest {
-        sandbox_id,
-        upstream_uri,
-        original_host: parts.headers.get(header::HOST).cloned(),
-    })
+    Ok((
+        ResolvedProxyRequest {
+            sandbox_id,
+            upstream_uri,
+            original_host: parts.headers.get(header::HOST).cloned(),
+        },
+        proxy_gate,
+    ))
 }
 
 async fn authorize_secure_envd_auto_resume(

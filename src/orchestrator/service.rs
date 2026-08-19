@@ -598,7 +598,7 @@ where
                         let mut sandbox = source_handle.lock().await;
                         sandbox.stop().await
                     };
-                    self.store.remove(&source_sandbox_id).await?;
+                    self.remove_sandbox_metadata(&source_sandbox_id).await?;
                 } else {
                     let _ = self
                         .store
@@ -748,20 +748,6 @@ where
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn proxy_lookup_for(&self, sandbox_id: &SandboxId) -> Result<ProxyLookupResult> {
-        if let Some(route) = self.proxy_routes.read().await.route(sandbox_id).cloned() {
-            if let Some(metadata) = self.store.get(sandbox_id).await? {
-                if metadata.state != SandboxState::Running {
-                    debug!(state = ?metadata.state, "sandbox route exists but is not proxyable");
-                    return Ok(ProxyLookupResult::Unavailable(metadata.state));
-                }
-            }
-            trace!(
-                version = route.version(),
-                "resolved running proxy target from runtime table"
-            );
-            return Ok(ProxyLookupResult::Ready(route.target().clone()));
-        }
-
         let metadata = self.store.get(sandbox_id).await?;
         Ok(match metadata {
             None => {
@@ -769,8 +755,19 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
-                warn!("running sandbox is missing a runtime proxy route");
-                ProxyLookupResult::RouteMissing
+                match self.proxy_routes.read().await.route(sandbox_id).cloned() {
+                    Some(route) => {
+                        trace!(
+                            version = route.version(),
+                            "resolved running proxy target from runtime table"
+                        );
+                        ProxyLookupResult::Ready(route.target().clone())
+                    }
+                    None => {
+                        warn!("running sandbox is missing a runtime proxy route");
+                        ProxyLookupResult::RouteMissing
+                    }
+                }
             }
             Some(metadata) if metadata.state == SandboxState::Paused => {
                 debug!(auto_resume = metadata.auto_resume, "sandbox is paused");
@@ -790,8 +787,23 @@ where
     pub(crate) async fn acquire_proxy_read(
         &self,
         sandbox_id: &SandboxId,
-    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.sandbox_gate(sandbox_id).await.read_owned().await
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let existing_gate = self.sandbox_gates.read().await.get(sandbox_id).cloned();
+        if let Some(gate) = existing_gate {
+            return Ok(gate.read_owned().await);
+        }
+        if self.store.get(sandbox_id).await?.is_none() {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        }
+
+        let guard = self.sandbox_gate(sandbox_id).await.read_owned().await;
+        if self.store.get(sandbox_id).await?.is_some() {
+            return Ok(guard);
+        }
+
+        drop(guard);
+        self.sandbox_gates.write().await.remove(sandbox_id);
+        Err(OrchestratorError::SandboxNotFound(*sandbox_id))
     }
 
     async fn sandbox_gate(&self, sandbox_id: &SandboxId) -> Arc<RwLock<()>> {
@@ -804,6 +816,21 @@ where
                 .entry(*sandbox_id)
                 .or_insert_with(|| Arc::new(RwLock::new(()))),
         )
+    }
+
+    async fn remove_sandbox_metadata(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> super::store::Result<Option<SandboxMetadata>> {
+        let metadata = self.store.remove(sandbox_id).await?;
+        self.sandbox_gates.write().await.remove(sandbox_id);
+        Ok(metadata)
+    }
+
+    async fn cleanup_paused_artifacts(&self, sandbox_id: &SandboxId, after: &'static str) {
+        if let Err(error) = self.persister.delete_record_and_artifacts(sandbox_id).await {
+            warn!(%error, after, "failed to clean up paused sandbox artifacts");
+        }
     }
 
     /// Updates the keep-alive timeout for a RUNNING sandbox.
@@ -1014,7 +1041,7 @@ where
         }
 
         // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.store.remove(&sandbox_id).await?;
+        let metadata = self.remove_sandbox_metadata(&sandbox_id).await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1166,7 +1193,7 @@ where
             warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
-            self.store.remove(&sandbox_id).await?;
+            self.remove_sandbox_metadata(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1190,10 +1217,16 @@ where
                         let mut sandbox = handle.lock().await;
                         sandbox.stop().await
                     };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
+                    match stop_result {
+                        Ok(()) => {
+                            self.cleanup_paused_artifacts(&sandbox_id, "terminal pause failure")
+                                .await;
+                        }
+                        Err(stop_err) => {
+                            warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
+                        }
                     }
-                    self.store.remove(&sandbox_id).await?;
+                    self.remove_sandbox_metadata(&sandbox_id).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1247,10 +1280,19 @@ where
                     let mut sandbox = handle.lock().await;
                     sandbox.stop().await
                 };
-                if let Err(stop_err) = stop_result {
-                    warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
+                match stop_result {
+                    Ok(()) => {
+                        self.cleanup_paused_artifacts(
+                            &sandbox_id,
+                            "persistence and resume failure",
+                        )
+                        .await;
+                    }
+                    Err(stop_err) => {
+                        warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
+                    }
                 }
-                if let Err(error) = self.store.remove(&sandbox_id).await {
+                if let Err(error) = self.remove_sandbox_metadata(&sandbox_id).await {
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
             } else {
@@ -1453,9 +1495,6 @@ where
     ) -> Result<SnapshotCaptureResult> {
         self.ensure_accepting_lifecycle_operations()?;
 
-        let snapshot_gate = self.sandbox_gate(&sandbox_id).await;
-        let _snapshot_gate = snapshot_gate.write_owned().await;
-
         info!("capturing sandbox snapshot");
         match self
             .store
@@ -1479,6 +1518,12 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
+        // The state transition closes admission for new proxy requests. The
+        // write guard then drains requests that resolved while the sandbox was
+        // still Running before capture mutates the runtime.
+        let snapshot_gate = self.sandbox_gate(&sandbox_id).await;
+        let _snapshot_gate = snapshot_gate.write_owned().await;
+
         // Get the sandbox handle.
         let handle = {
             let sandboxes = self.sandboxes.read().await;
@@ -1487,7 +1532,7 @@ where
         let Some(handle) = handle else {
             warn!("sandbox handle not found while snapshotting, removing from store");
             self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            self.store.remove(&sandbox_id).await?;
+            self.remove_sandbox_metadata(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1511,7 +1556,7 @@ where
                     if let Err(stop_err) = stop_result {
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal snapshot failure");
                     }
-                    self.store.remove(&sandbox_id).await?;
+                    self.remove_sandbox_metadata(&sandbox_id).await?;
                 } else {
                     let _ = self
                         .store
@@ -2235,7 +2280,7 @@ where
             .await;
         match plan {
             LaunchPlan::Create(_) => {
-                if let Err(err) = self.store.remove(&plan.sandbox_id()).await {
+                if let Err(err) = self.remove_sandbox_metadata(&plan.sandbox_id()).await {
                     warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
                 }
             }

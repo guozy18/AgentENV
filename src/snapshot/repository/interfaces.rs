@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::errors::RepositoryResult;
+use super::errors::{RepositoryError, RepositoryResult};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
@@ -155,6 +155,36 @@ pub trait SnapshotRepository: Send + Sync {
     /// For committed records, implementations should also remove per-snapshot committed artifacts and
     /// any alias binding that still points at the deleted id.
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
+
+    /// Deletes exactly one snapshot id without interpreting its UUID text as an alias.
+    ///
+    /// This is required when a manager has already resolved a cross-repository identity: aliases
+    /// are allowed to look like UUIDs, so routing the id back through [`Self::delete`] could delete
+    /// an unrelated alias target in a repository where that id is absent.
+    /// Returns whether an exact record existed and was removed.
+    async fn delete_by_id(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
+        Err(RepositoryError::Unsupported {
+            feature: "deleting a snapshot by exact id".to_string(),
+        })
+    }
+
+    /// Deletes the resolved record only when it belongs to the requested source domain.
+    ///
+    /// Backends with hidden delete state should override this method so a retry can finish
+    /// cleanup after the record has stopped being visible through [`Self::get`].
+    async fn delete_matching_source(
+        &self,
+        id_or_alias: &str,
+        source: SnapshotSourceKind,
+    ) -> RepositoryResult<bool> {
+        let Some(record) = self.get(id_or_alias).await? else {
+            return Ok(false);
+        };
+        if record.source.kind() != source {
+            return Ok(false);
+        }
+        self.delete_by_id(&record.id).await
+    }
 
     /// Resolves a human-readable alias to the current snapshot id.
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;

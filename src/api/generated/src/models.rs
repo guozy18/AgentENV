@@ -6269,16 +6269,16 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxRefre
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxSnapshotRequest {
-    /// Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+    /// Optional human-readable alias for the reusable snapshot. The alias must not already identify a different snapshot.
     #[serde(rename = "name")]
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Requested snapshot durability. Omitted requests retain legacy distributed behavior.
     #[serde(rename = "snapshotType")]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_type: Option<SnapshotType>,
+    pub snapshot_type: Option<models::SnapshotType>,
 }
 
 impl SandboxSnapshotRequest {
@@ -6300,9 +6300,7 @@ impl std::fmt::Display for SandboxSnapshotRequest {
             self.name
                 .as_ref()
                 .map(|name| ["name".to_string(), name.to_string()].join(",")),
-            self.snapshot_type.as_ref().map(|snapshot_type| {
-                ["snapshotType".to_string(), snapshot_type.to_string()].join(",")
-            }),
+            // Skipping snapshotType in query parameter serialization
         ];
 
         write!(
@@ -6325,7 +6323,7 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub name: Vec<String>,
-            pub snapshot_type: Vec<SnapshotType>,
+            pub snapshot_type: Vec<models::SnapshotType>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6351,8 +6349,9 @@ impl std::str::FromStr for SandboxSnapshotRequest {
                     "name" => intermediate_rep.name.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
                     "snapshotType" => intermediate_rep.snapshot_type.push(
-                        <SnapshotType as std::str::FromStr>::from_str(val)
+                        <models::SnapshotType as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
                     _ => {
@@ -6595,51 +6594,6 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxTimeo
     }
 }
 
-/// Lifecycle and durability semantics of a snapshot.
-#[allow(non_camel_case_types, clippy::large_enum_variant)]
-#[repr(C)]
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
-pub enum SnapshotType {
-    #[serde(rename = "local")]
-    Local,
-    #[serde(rename = "distributed")]
-    Distributed,
-    #[serde(rename = "temporal")]
-    Temporal,
-}
-
-impl validator::Validate for SnapshotType {
-    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
-        std::result::Result::Ok(())
-    }
-}
-
-impl std::fmt::Display for SnapshotType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            SnapshotType::Local => write!(f, "local"),
-            SnapshotType::Distributed => write!(f, "distributed"),
-            SnapshotType::Temporal => write!(f, "temporal"),
-        }
-    }
-}
-
-impl std::str::FromStr for SnapshotType {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "local" => std::result::Result::Ok(SnapshotType::Local),
-            "distributed" => std::result::Result::Ok(SnapshotType::Distributed),
-            "temporal" => std::result::Result::Ok(SnapshotType::Temporal),
-            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotInfo {
@@ -6682,10 +6636,10 @@ pub struct SnapshotInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
 
-    /// Lifecycle and durability semantics of the snapshot.
     #[serde(rename = "snapshotType")]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_type: Option<SnapshotType>,
+    pub snapshot_type: Option<models::SnapshotType>,
 }
 
 impl SnapshotInfo {
@@ -6741,9 +6695,7 @@ impl std::fmt::Display for SnapshotInfo {
             self.image_ref
                 .as_ref()
                 .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
-            self.snapshot_type.as_ref().map(|snapshot_type| {
-                ["snapshotType".to_string(), snapshot_type.to_string()].join(",")
-            }),
+            // Skipping snapshotType in query parameter serialization
         ];
 
         write!(
@@ -6773,7 +6725,7 @@ impl std::str::FromStr for SnapshotInfo {
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub image_ref: Vec<String>,
-            pub snapshot_type: Vec<SnapshotType>,
+            pub snapshot_type: Vec<models::SnapshotType>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6831,8 +6783,9 @@ impl std::str::FromStr for SnapshotInfo {
                     "imageRef" => intermediate_rep.image_ref.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
                     "snapshotType" => intermediate_rep.snapshot_type.push(
-                        <SnapshotType as std::str::FromStr>::from_str(val)
+                        <models::SnapshotType as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
                     _ => {
@@ -6928,6 +6881,50 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SnapshotInfo
             std::result::Result::Err(e) => std::result::Result::Err(format!(
                 r#"Unable to convert header: {hdr_value:?} to string: {e}"#
             )),
+        }
+    }
+}
+
+/// Storage availability of a reusable snapshot. Local snapshots are available only on the publishing node; distributed snapshots are published to the primary repository.
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum SnapshotType {
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "distributed")]
+    Distributed,
+}
+
+impl validator::Validate for SnapshotType {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for SnapshotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SnapshotType::Local => write!(f, "local"),
+            SnapshotType::Distributed => write!(f, "distributed"),
+        }
+    }
+}
+
+impl std::str::FromStr for SnapshotType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "local" => std::result::Result::Ok(SnapshotType::Local),
+            "distributed" => std::result::Result::Ok(SnapshotType::Distributed),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }
 }

@@ -7,7 +7,8 @@ use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::repository::backends::OssBackend;
 use agentenv::snapshot::{
     OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
+    SnapshotSource, SnapshotType, TemplateBuildErrorReason, TemplateBuildStatus,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
@@ -27,6 +28,22 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),
         tools_drive_version: "0.1.0".to_string(),
+    }
+}
+
+fn test_publish_metadata(id: SnapshotId, alias: Option<SnapshotAlias>) -> SnapshotPublishMetadata {
+    SnapshotPublishMetadata {
+        id,
+        snapshot_type: SnapshotType::Distributed,
+        alias,
+        source: SnapshotPublishSource::Template,
+        context: agentenv::snapshot::CommandContext::default(),
+        startup: None,
+        resources: SandboxResources::default(),
+        runtime_versions: test_runtime_versions(),
+        virtualization_mode: ConfigManager::global_config().virtualization_mode,
+        image_configs: agentenv::types::ImageConfigs::new(),
+        custom_extension_params: None,
     }
 }
 
@@ -149,19 +166,10 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
 
     let stored = repository
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
-                alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
+            test_publish_metadata(
+                snapshot_id.clone(),
+                Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
+            ),
             manifest,
         )
         .await?;
@@ -267,19 +275,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
 
     let stored = repository
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
-                alias: Some(alias.clone()),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
+            test_publish_metadata(snapshot_id.clone(), Some(alias.clone())),
             manifest,
         )
         .await?;
@@ -308,6 +304,67 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires docker"]
+async fn snapshot_oss_publish_failure_preserves_pending_template_build() -> Result<()> {
+    let fixture = MinioFixture::start().await?;
+    let workspace = TempDir::new()?;
+    let prefix = "snapshots/pending-template-rollback";
+    let oss = test_oss_config(&fixture, prefix);
+    ensure_test_config()?;
+
+    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let alias = SnapshotAlias::parse("pending-template").expect("alias should parse");
+    let snapshot_id = SnapshotId::generate();
+    repository
+        .create(SnapshotRecord::template_waiting(
+            snapshot_id.clone(),
+            Some(alias.clone()),
+            SandboxResources::default(),
+        ))
+        .await?;
+
+    let (_, _, _, manifest) = write_built_artifacts(&workspace.path().join("artifacts")).await?;
+    std::fs::write(&manifest.memory.image_config_path, b"not valid json")?;
+    repository
+        .publish(
+            test_publish_metadata(snapshot_id.clone(), Some(alias.clone())),
+            manifest,
+        )
+        .await
+        .expect_err("invalid build artifacts should fail publication");
+
+    let pending = repository
+        .get(alias.as_ref())
+        .await?
+        .expect("failed publication must preserve the pending template record and alias");
+    assert_eq!(pending.id, snapshot_id);
+    assert!(pending.committed.is_none());
+    assert!(matches!(
+        pending.source,
+        SnapshotSource::Template { ref build }
+            if build.status == TemplateBuildStatus::Waiting
+    ));
+
+    repository
+        .mark_build_error(
+            &snapshot_id,
+            TemplateBuildErrorReason::new("publish failed"),
+        )
+        .await?;
+    let failed = repository
+        .get(alias.as_ref())
+        .await?
+        .expect("the preserved template build should accept its error transition");
+    assert!(matches!(
+        failed.source,
+        SnapshotSource::Template { ref build }
+            if build.status == TemplateBuildStatus::Error
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
 async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let fixture = MinioFixture::start().await?;
     let workspace = TempDir::new()?;
@@ -322,22 +379,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let snapshot_id = SnapshotId::generate();
 
     let stored = repository
-        .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id,
-                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
-                alias: None,
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
-            manifest,
-        )
+        .publish(test_publish_metadata(snapshot_id, None), manifest)
         .await?;
 
     fixture
@@ -383,19 +425,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
 
     let stored = repository
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
-                alias: Some(alias.clone()),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
+            test_publish_metadata(snapshot_id.clone(), Some(alias.clone())),
             manifest,
         )
         .await?;

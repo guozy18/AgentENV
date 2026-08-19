@@ -20,7 +20,8 @@ use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    convert_sparse_mem_to_overlaybd, restack_snapshot_overlaybd_device,
+    restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::FirecrackerInstance;
@@ -157,6 +158,14 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
         .join("managed-snapshots")
 }
 
+fn classify_after_live_mutation<T>(result: Result<T>, live_runtime_mutated: bool) -> Result<T> {
+    if live_runtime_mutated {
+        result.map_err(|error| SandboxCaptureError::terminal(error).into())
+    } else {
+        result
+    }
+}
+
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
 /// A Firecracker microVM-backed sandbox instance.
@@ -181,6 +190,10 @@ pub struct FirecrackerSandbox {
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
+    /// Parent for the next memory capture after Firecracker's compatibility
+    /// diff path consumes the dirty bitmap. Direct dirty-range capture keeps
+    /// the bitmap intact and therefore does not advance this parent.
+    consumed_memory_snapshot_config_path: Option<PathBuf>,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
     /// waits out the fallback with no notification.
@@ -453,6 +466,17 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    fn memory_snapshot_parent_config_path(&self) -> Option<&Path> {
+        self.consumed_memory_snapshot_config_path
+            .as_deref()
+            .or(match &self.launch {
+                LaunchMode::Resume(config) => {
+                    Some(config.mem_overlaybd_config.image_config_path.as_path())
+                }
+                LaunchMode::Fresh(_) => None,
+            })
+    }
+
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
         self.current_rootfs_virtual_size.context(
             "rootfs virtual size cache missing; sandbox must record the user image block-device size before snapshot; ensure start() was called before pause() or snapshot",
@@ -667,53 +691,56 @@ impl FirecrackerSandbox {
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
-                Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                Self::cleanup_failed_snapshot_dir(snapshot_dir, &err).await;
                 Err(err)
             }
         }
     }
 
     async fn snapshot_to_dir(
-        &self,
+        &mut self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
             &ConfigManager::global_config().memory_snapshot,
         );
-        let (mem_layer_path, mem_virtual_size) = self
+        let (mem_layer_path, mem_virtual_size, memory_dirty_state_consumed) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
+        let mut live_runtime_mutated = memory_dirty_state_consumed;
 
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
-            LaunchMode::Resume(config) => {
-                Some(config.mem_overlaybd_config.image_config_path.as_path())
-            }
-            LaunchMode::Fresh(_) => None,
-        };
-        let mem_image_config = build_mem_snapshot_image_config(
-            resume_mem_image_config_path,
-            &mem_layer_path,
-            snapshot_dir,
-            memory_output,
-        )
-        .await?;
-        let mem_image_config_path = snapshot_dir.join("mem_image.json");
-        tokio::fs::write(
-            &mem_image_config_path,
-            serde_json::to_vec_pretty(&mem_image_config)
-                .context("serialize mem image config for persistent dir")?,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "write mem image config to {}",
-                mem_image_config_path.display()
+        let resume_mem_image_config_path = self.memory_snapshot_parent_config_path();
+        let mem_image_config = classify_after_live_mutation(
+            build_mem_snapshot_image_config(
+                resume_mem_image_config_path,
+                &mem_layer_path,
+                snapshot_dir,
+                memory_output,
             )
-        })?;
+            .await,
+            live_runtime_mutated,
+        )?;
+        let mem_image_config_path = snapshot_dir.join("mem_image.json");
+        let mem_image_config_bytes = classify_after_live_mutation(
+            serde_json::to_vec_pretty(&mem_image_config)
+                .context("serialize mem image config for persistent dir"),
+            live_runtime_mutated,
+        )?;
+        classify_after_live_mutation(
+            tokio::fs::write(&mem_image_config_path, mem_image_config_bytes)
+                .await
+                .with_context(|| {
+                    format!(
+                        "write mem image config to {}",
+                        mem_image_config_path.display()
+                    )
+                }),
+            live_runtime_mutated,
+        )?;
 
         let mem_overlaybd_config = OverlaybdConfig {
             image_config_path: mem_image_config_path,
@@ -722,45 +749,68 @@ impl FirecrackerSandbox {
         };
 
         let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
-            let overlaybd_source = self
-                .launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => source,
-                })
-                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
-            let rootfs_runtime = self
-                .rootfs_runtime
-                .as_ref()
-                .context("overlaybd snapshot requires an active ublk device")?;
-            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
-                &rootfs_runtime.device,
-                overlaybd_source.read_only,
-                &rootfs_runtime.image_config_path,
-                snapshot_dir,
-            )
-            .await
-            .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
+            let overlaybd_source = classify_after_live_mutation(
+                self.launch
+                    .common()
+                    .ublk_config
+                    .as_ref()
+                    .map(|config| match &config.backend {
+                        UblkBackend::Overlaybd(source) => source,
+                    })
+                    .context("overlaybd snapshot requires overlaybd-backed ublk config"),
+                live_runtime_mutated,
+            )?;
+            let rootfs_runtime = classify_after_live_mutation(
+                self.rootfs_runtime
+                    .as_ref()
+                    .context("overlaybd snapshot requires an active ublk device"),
+                live_runtime_mutated,
+            )?;
+            let rootfs_image_path = classify_after_live_mutation(
+                restack_snapshot_overlaybd_rootfs(
+                    &rootfs_runtime.device,
+                    overlaybd_source.read_only,
+                    &rootfs_runtime.image_config_path,
+                    snapshot_dir,
+                )
+                .await
+                .context("snapshot overlaybd runtime state to persistent dir"),
+                live_runtime_mutated,
+            )?;
+            live_runtime_mutated |= !overlaybd_source.read_only;
+            let size = classify_after_live_mutation(
+                self.snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot"),
+                live_runtime_mutated,
+            )?;
             (rootfs_image_path, size)
         } else {
             let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
             // Preserve the writable disk state alongside the snapshot.
             let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
-            copy_cow(&current_rootfs, &rootfs_path).await?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
+            classify_after_live_mutation(
+                copy_cow(&current_rootfs, &rootfs_path).await,
+                live_runtime_mutated,
+            )?;
+            let size = classify_after_live_mutation(
+                self.snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot"),
+                live_runtime_mutated,
+            )?;
             (rootfs_path, size)
         };
-        let snapshot_extra_drives = self
-            .snapshot_extra_drives(snapshot_dir)
-            .await
-            .context("snapshot extra drives to persistent dir")?;
+        let snapshot_extra_drives = classify_after_live_mutation(
+            self.snapshot_extra_drives(snapshot_dir)
+                .await
+                .context("snapshot extra drives to persistent dir"),
+            live_runtime_mutated,
+        )?;
+        live_runtime_mutated |= self
+            .launch
+            .common()
+            .extra_drives
+            .iter()
+            .any(|drive| !drive.read_only());
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
@@ -788,15 +838,18 @@ impl FirecrackerSandbox {
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        let manifest = FirecrackerSnapshotManifest::new(
-            vm_state_path.clone(),
-            mem_overlaybd_config.image_config_path.clone(),
-            mem_virtual_size,
-            base_rootfs_path,
-            rootfs_virtual_size,
-            &snapshot_extra_drives,
-        )
-        .context("build firecracker snapshot manifest")?;
+        let manifest = classify_after_live_mutation(
+            FirecrackerSnapshotManifest::new(
+                vm_state_path.clone(),
+                mem_overlaybd_config.image_config_path.clone(),
+                mem_virtual_size,
+                base_rootfs_path,
+                rootfs_virtual_size,
+                &snapshot_extra_drives,
+            )
+            .context("build firecracker snapshot manifest"),
+            live_runtime_mutated,
+        )?;
 
         let snapshot = FirecrackerSnapshotConfig {
             common: snapshot_common,
@@ -805,6 +858,11 @@ impl FirecrackerSandbox {
             mem_virtual_size,
             managed_snapshot_root: None,
         };
+
+        if memory_dirty_state_consumed {
+            self.consumed_memory_snapshot_config_path =
+                Some(snapshot.mem_overlaybd_config.image_config_path.clone());
+        }
 
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
@@ -820,24 +878,57 @@ impl FirecrackerSandbox {
         vm_state_path: &Path,
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
-    ) -> Result<(PathBuf, u64)> {
+    ) -> Result<(PathBuf, u64, bool)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
         let firecracker_pid = self.fc_instance.pid()?;
         self.fc_instance
-            .create_state_only_snapshot(vm_state_path)
+            .create_diff_snapshot(vm_state_path, None)
             .await?;
-        // `vm_state.bin` now represents this paused VM state. Any later
-        // error aborts this direct snapshot attempt and is propagated to
-        // the lifecycle caller for recovery.
-        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-        convert_dirty_memory_to_overlaybd(
-            firecracker_pid,
-            &dirty_ranges,
-            &mem_overlaybd_dir,
-            memory_output,
-        )
-        .await
-        .context("convert dirty memory ranges to overlaybd layer")
+        // `vm_state.bin` now represents this paused VM state. Preserve errors
+        // from the direct capture/conversion path; only the optional
+        // dirty-range request gets the compatibility fallback. Firecracker's
+        // standard diff path consumes its dirty bitmap, so any failure after
+        // starting that fallback is terminal: resuming and retrying could omit
+        // pages consumed by the failed attempt.
+        match self.fc_instance.get_dirty_memory_ranges().await {
+            Ok(dirty_ranges) => {
+                let (path, size) = convert_dirty_memory_to_overlaybd(
+                    firecracker_pid,
+                    &dirty_ranges,
+                    &mem_overlaybd_dir,
+                    memory_output,
+                )
+                .await
+                .context("convert dirty memory ranges to overlaybd layer")?;
+                Ok((path, size, false))
+            }
+            Err(dirty_error) => {
+                warn!(
+                    error = %dirty_error,
+                    "dirty memory snapshot path unavailable; falling back to sparse Firecracker diff snapshot"
+                );
+                let mem_path = snapshot_dir.join("mem.bin");
+                let _ = tokio::fs::remove_file(vm_state_path).await;
+                self.fc_instance
+                    .create_diff_snapshot(vm_state_path, Some(&mem_path))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "create sparse compatibility snapshot after dirty-range failure: {}",
+                            dirty_error
+                        )
+                    })
+                    .map_err(|error| anyhow::Error::new(SandboxCaptureError::terminal(error)))?;
+                let (path, size) =
+                    convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir, memory_output)
+                        .await
+                        .context("convert sparse memory snapshot to overlaybd layer")
+                        .map_err(|error| {
+                            anyhow::Error::new(SandboxCaptureError::terminal(error))
+                        })?;
+                Ok((path, size, true))
+            }
+        }
     }
 
     /// Resume a paused sandbox in-place.
@@ -1006,9 +1097,15 @@ impl FirecrackerSandbox {
     }
 
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
-    ///
-    /// Removes the directory contents so the caller isn't left with a partially-written snapshot.
-    async fn cleanup_failed_snapshot_dir(path: &Path) {
+    /// Terminal failures may leave the live runtime dependent on this directory;
+    /// the lifecycle caller removes it only after the sandbox has stopped.
+    async fn cleanup_failed_snapshot_dir(path: &Path, error: &anyhow::Error) {
+        if error
+            .downcast_ref::<SandboxCaptureError>()
+            .is_some_and(SandboxCaptureError::is_terminal)
+        {
+            return;
+        }
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1176,6 +1273,7 @@ impl FirecrackerSandbox {
             rootfs_runtime: None,
             mem_ublk_device: None,
             mem_snapshot_image_config_path: None,
+            consumed_memory_snapshot_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
@@ -1809,21 +1907,27 @@ impl FirecrackerSandbox {
         }
 
         let mut snapped = Vec::with_capacity(extra_drives.len());
+        let mut live_runtime_restacked = false;
         for (drive, runtime) in extra_drives.iter().zip(self.extra_drive_runtimes.iter()) {
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
-                &runtime.device,
-                drive.read_only(),
-                &runtime.image_config_path,
-                &snapshot_dir.join("drives").join(drive.drive_id()),
-                "drive",
-            )
-            .await
-            .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
-            snapped.push(
+            let snapshot_image_config_path = classify_after_live_mutation(
+                restack_snapshot_overlaybd_device(
+                    &runtime.device,
+                    drive.read_only(),
+                    &runtime.image_config_path,
+                    &snapshot_dir.join("drives").join(drive.drive_id()),
+                    "drive",
+                )
+                .await
+                .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id())),
+                live_runtime_restacked,
+            )?;
+            live_runtime_restacked |= !drive.read_only();
+            snapped.push(classify_after_live_mutation(
                 drive
                     .with_image_config_path(snapshot_image_config_path)
-                    .try_with_virtual_size(runtime.actual_virtual_size)?,
-            );
+                    .try_with_virtual_size(runtime.actual_virtual_size),
+                live_runtime_restacked,
+            )?);
         }
 
         Ok(snapped)
@@ -2075,6 +2179,84 @@ mod tests {
                 "snapshot/rootfs/image.json"
             )])
         );
+    }
+
+    #[test]
+    fn captured_snapshot_preserves_live_runtime_artifacts_until_all_owners_drop() -> Result<()> {
+        let managed_base = TempDir::new()?;
+        let live_root_path = managed_base.path().join("sandbox");
+        fs::create_dir(&live_root_path)?;
+        let live_root = Arc::new(PersistentSnapshotRootGuard::new(live_root_path.clone()));
+        let snapshot_dir = live_root_path.join("snapshot");
+        fs::create_dir(&snapshot_dir)?;
+        let manifest = FirecrackerSnapshotManifest::for_test(4096, &[]);
+        let captured = FirecrackerCapturedSnapshot::new(manifest, Arc::clone(&live_root));
+
+        drop(captured);
+        assert!(snapshot_dir.exists());
+
+        let captured = FirecrackerCapturedSnapshot::new(
+            FirecrackerSnapshotManifest::for_test(4096, &[]),
+            Arc::clone(&live_root),
+        );
+        drop(live_root);
+        assert!(snapshot_dir.exists());
+        drop(captured);
+        assert!(!live_root_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn successful_live_mutation_makes_followup_errors_terminal() {
+        for (live_runtime_mutated, expected_terminal) in [(false, false), (true, true)] {
+            let error = classify_after_live_mutation::<()>(
+                Err(anyhow::anyhow!("follow-up snapshot failure")),
+                live_runtime_mutated,
+            )
+            .expect_err("injected failure should remain an error");
+            assert_eq!(
+                SandboxCaptureError::from(error).is_terminal(),
+                expected_terminal
+            );
+        }
+    }
+
+    #[test]
+    fn consumed_memory_snapshot_becomes_next_capture_parent() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        assert!(sandbox.memory_snapshot_parent_config_path().is_none());
+
+        let consumed_parent = PathBuf::from("managed-snapshots/mem_image.json");
+        sandbox.consumed_memory_snapshot_config_path = Some(consumed_parent.clone());
+
+        assert_eq!(
+            sandbox.memory_snapshot_parent_config_path(),
+            Some(consumed_parent.as_path())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_cleanup_preserves_terminal_runtime_dependencies() -> Result<()> {
+        let root = TempDir::new()?;
+        let recoverable_dir = root.path().join("recoverable");
+        fs::create_dir(&recoverable_dir)?;
+        FirecrackerSandbox::cleanup_failed_snapshot_dir(
+            &recoverable_dir,
+            &anyhow::anyhow!("recoverable failure"),
+        )
+        .await;
+        assert!(!recoverable_dir.exists());
+
+        let terminal_dir = root.path().join("terminal");
+        fs::create_dir(&terminal_dir)?;
+        let terminal_error = anyhow::Error::new(SandboxCaptureError::terminal(anyhow::anyhow!(
+            "restacked runtime"
+        )))
+        .context("snapshot overlaybd runtime state");
+        FirecrackerSandbox::cleanup_failed_snapshot_dir(&terminal_dir, &terminal_error).await;
+        assert!(terminal_dir.exists());
+        Ok(())
     }
 
     #[test]

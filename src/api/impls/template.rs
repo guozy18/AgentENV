@@ -299,7 +299,7 @@ impl Templates<()> for ApiImpl {
 
         match self
             .snapshot_manager
-            .resolve_committed_alias(&path_params.alias)
+            .resolve_template_alias(&path_params.alias)
             .await
         {
             Ok(Some(snapshot_id)) => Ok(
@@ -428,7 +428,7 @@ impl Templates<()> for ApiImpl {
 
         match self
             .snapshot_manager
-            .get(&path_params.template_id)
+            .get_template(&path_params.template_id)
             .await
         {
             Ok(Some(record)) => {
@@ -456,7 +456,11 @@ impl Templates<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdDeletePathParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
-        match self.snapshot_manager.delete(&path_params.template_id).await {
+        match self
+            .snapshot_manager
+            .delete_template(&path_params.template_id)
+            .await
+        {
             Ok(_) => {
                 Ok(TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully)
             }
@@ -475,7 +479,11 @@ impl Templates<()> for ApiImpl {
         path_params: &models::TemplatesTemplateIdGetPathParams,
         query_params: &models::TemplatesTemplateIdGetQueryParams,
     ) -> Result<TemplatesTemplateIdGetResponse, ()> {
-        let record = match self.snapshot_manager.get(&path_params.template_id).await {
+        let record = match self
+            .snapshot_manager
+            .get_template(&path_params.template_id)
+            .await
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(TemplatesTemplateIdGetResponse::Status404_NotFound(
@@ -596,7 +604,11 @@ impl Templates<()> for ApiImpl {
                 )));
             }
         };
-        let pending_record = match self.snapshot_manager.get(&path_params.template_id).await {
+        let pending_record = match self
+            .snapshot_manager
+            .get_template(&path_params.template_id)
+            .await
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(
@@ -720,44 +732,47 @@ impl Templates<()> for ApiImpl {
                     }
                 }
                 TemplateBuildStartBaseSource::Template(alias) => {
-                    let base_runnable =
-                        match api.snapshot_manager.load_runnable(alias.as_ref()).await {
-                            Ok(Some(runnable)) => runnable,
-                            Ok(None) => {
-                                warn!(
-                                    build_id = %build_id,
-                                    base_template = %alias,
-                                    reason = "base template alias not found",
-                                    "template build failed while resolving the base template"
-                                );
-                                mark_v2_build_error(
-                                    &api,
-                                    &build_id,
-                                    TemplateBuildErrorReason::new(format!(
-                                        "template alias not found: {alias}"
-                                    )),
-                                )
-                                .await;
-                                return;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    build_id = %build_id,
-                                    base_template = %alias,
-                                    error = %format_args!("{err:#}"),
-                                    "template build failed while loading the base template"
-                                );
-                                mark_v2_build_error(
-                                    &api,
-                                    &build_id,
-                                    TemplateBuildErrorReason::new(
-                                        Self::snapshot_manager_error(&err).message,
-                                    ),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
+                    let base_runnable = match api
+                        .snapshot_manager
+                        .load_template_alias_runnable(&alias)
+                        .await
+                    {
+                        Ok(Some(runnable)) => runnable,
+                        Ok(None) => {
+                            warn!(
+                                build_id = %build_id,
+                                base_template = %alias,
+                                reason = "base template alias not found",
+                                "template build failed while resolving the base template"
+                            );
+                            mark_v2_build_error(
+                                &api,
+                                &build_id,
+                                TemplateBuildErrorReason::new(format!(
+                                    "template alias not found: {alias}"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(err) => {
+                            warn!(
+                                build_id = %build_id,
+                                base_template = %alias,
+                                error = %format_args!("{err:#}"),
+                                "template build failed while loading the base template"
+                            );
+                            mark_v2_build_error(
+                                &api,
+                                &build_id,
+                                TemplateBuildErrorReason::new(
+                                    Self::snapshot_manager_error(&err).message,
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                     debug!(
                         build_id = %build_id,
                         base_template = %alias,
