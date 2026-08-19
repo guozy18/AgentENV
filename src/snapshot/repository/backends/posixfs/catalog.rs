@@ -25,6 +25,9 @@ pub struct PosixFsCatalogStore {
 #[derive(Debug)]
 pub(crate) struct PublishSession {
     pub(crate) snapshot_id: SnapshotId,
+    /// Held for the complete import/commit window so a second repository
+    /// instance cannot reconcile the staging directory while it is active.
+    _record_lock: PosixFileLockGuard,
 }
 
 #[derive(Debug)]
@@ -42,6 +45,77 @@ impl PosixFsCatalogStore {
     /// Creates a catalog store rooted at the repository's durable POSIX directory.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Removes staging directories and committed records left behind by a
+    /// crashed publisher. Pending template records are intentionally kept;
+    /// only records that claim committed artifacts but lack the final marker
+    /// are discarded.
+    pub(crate) fn reconcile_startup(&self) -> RepositoryResult<()> {
+        // A freshly configured repository has no catalog yet. Keep startup
+        // reconciliation side-effect free in that case; the first real
+        // repository operation will create the layout on demand.
+        if !PosixFsSnapshotArtifactLayout::catalog_dir(&self.root).exists() {
+            return Ok(());
+        }
+        self.ensure_layout()?;
+
+        for entry in fs::read_dir(self.snapshots_dir())
+            .map_err(|error| RepositoryError::backend("read snapshot staging directory", error))?
+        {
+            let entry = entry
+                .map_err(|error| RepositoryError::backend("read snapshot staging entry", error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| RepositoryError::backend("inspect snapshot staging entry", error))?
+                .is_dir()
+            {
+                continue;
+            }
+            let Some(id_text) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(id) = SnapshotId::parse(&id_text) else {
+                self.remove_dir_if_exists(&entry.path())?;
+                continue;
+            };
+            // A publisher may be importing large layers for a long time. Do
+            // not treat an actively locked session as an orphan.
+            if PosixFsSnapshotArtifactLayout::record_lock_path(&self.root, &id).exists() {
+                continue;
+            }
+            if !self.is_committed(&id) {
+                self.remove_dir_if_exists(&entry.path())?;
+            }
+        }
+
+        for entry in fs::read_dir(self.records_dir()).map_err(|error| {
+            RepositoryError::backend("read snapshot records during startup reconcile", error)
+        })? {
+            let entry = entry.map_err(|error| {
+                RepositoryError::backend("read snapshot record during startup reconcile", error)
+            })?;
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(record) = self.read_json::<SnapshotRecord>(&entry.path()) else {
+                continue;
+            };
+            if record.committed.is_some()
+                && !self.commit_marker_path(&record.id).exists()
+                && !PosixFsSnapshotArtifactLayout::record_lock_path(&self.root, &record.id).exists()
+            {
+                self.remove_file_if_exists(&entry.path())?;
+                if let Some(alias) = record.alias.as_ref() {
+                    let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias);
+                    if self.load_alias_target(alias)?.as_ref() == Some(&record.id) {
+                        self.remove_file_if_exists(&alias_path)?;
+                    }
+                }
+                self.remove_dir_if_exists(&self.layout(&record.id).snapshot_dir())?;
+            }
+        }
+        Ok(())
     }
 
     fn layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
@@ -63,15 +137,18 @@ impl PosixFsCatalogStore {
         snapshot_id: &SnapshotId,
     ) -> RepositoryResult<PublishSession> {
         self.ensure_layout()?;
+        let record_lock = self.acquire_record_lock(snapshot_id)?;
         let snapshot_dir = self.layout(snapshot_id).snapshot_dir();
-        fs::create_dir_all(&snapshot_dir).map_err(|error| {
-            RepositoryError::backend(
+        if let Err(error) = fs::create_dir_all(&snapshot_dir) {
+            drop(record_lock);
+            return Err(RepositoryError::backend(
                 format!("create snapshot dir '{}'", snapshot_dir.display()),
                 error,
-            )
-        })?;
+            ));
+        }
         Ok(PublishSession {
             snapshot_id: snapshot_id.clone(),
+            _record_lock: record_lock,
         })
     }
 
@@ -79,9 +156,9 @@ impl PosixFsCatalogStore {
     ///
     /// Flow:
     /// 1. acquire the alias lock when an alias is present
-    /// 2. bind the alias
-    /// 3. write the commit marker
-    /// 4. write the committed snapshot record
+    /// 2. write the committed snapshot record
+    /// 3. write the completion marker as the visibility transition
+    /// 4. bind the alias after the record is visible by id
     pub(crate) fn commit_publish(
         &self,
         session: &PublishSession,
@@ -96,7 +173,10 @@ impl PosixFsCatalogStore {
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
                 if let Some(existing) = store.load_alias_target(alias)? {
                     if existing != snapshot_id {
-                        if store.load_record_by_id_unlocked(&existing)?.is_some() {
+                        if store
+                            .load_visible_record_by_id_unlocked(&existing)?
+                            .is_some()
+                        {
                             return Err(RepositoryError::AliasConflict {
                                 alias: alias.to_string(),
                                 existing,
@@ -106,16 +186,16 @@ impl PosixFsCatalogStore {
                         store.remove_file_if_exists(&alias_path)?;
                     }
                 }
-                store.write_json(&alias_path, &snapshot_id)?;
+                store.write_record_unlocked(&record)?;
                 store.write_commit_marker(&session.snapshot_id)?;
-                store.write_committed_record_unlocked(&record)?;
+                store.write_json(&alias_path, &snapshot_id)?;
                 Ok(record)
             })
         } else {
             (|| {
                 let record = self.committed_record_unlocked(&metadata, committed.clone(), now)?;
+                self.write_record_unlocked(&record)?;
                 self.write_commit_marker(&session.snapshot_id)?;
-                self.write_committed_record_unlocked(&record)?;
                 Ok(record)
             })()
         };
@@ -180,7 +260,7 @@ impl PosixFsCatalogStore {
     pub(crate) fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         self.ensure_layout()?;
         if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
-            if let Some(record) = self.load_record_by_id_unlocked(&direct_id)? {
+            if let Some(record) = self.load_visible_record_by_id_unlocked(&direct_id)? {
                 return Ok(Some(record));
             }
         }
@@ -193,7 +273,7 @@ impl PosixFsCatalogStore {
             let Some(id) = store.load_alias_target(&alias)? else {
                 return Ok(None);
             };
-            match store.load_record_by_id_unlocked(&id)? {
+            match store.load_visible_record_by_id_unlocked(&id)? {
                 Some(record) => Ok(Some(record)),
                 None => {
                     store.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::alias_path(
@@ -238,6 +318,9 @@ impl PosixFsCatalogStore {
                 continue;
             }
             let record: SnapshotRecord = self.read_json(&entry.path())?;
+            if record.committed.is_some() && !self.is_committed(&record.id) {
+                continue;
+            }
             if Self::matches_record_filter(&record, &filter) {
                 records.push(record);
             }
@@ -292,7 +375,7 @@ impl PosixFsCatalogStore {
             let Some(id) = store.load_alias_target(&alias)? else {
                 return Ok(None);
             };
-            if store.load_record_by_id_unlocked(&id)?.is_some() {
+            if store.load_visible_record_by_id_unlocked(&id)?.is_some() {
                 return Ok(Some(id));
             }
             let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, &alias);
@@ -510,6 +593,19 @@ impl PosixFsCatalogStore {
         self.read_json(&path).map(Some)
     }
 
+    fn load_visible_record_by_id_unlocked(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        let Some(record) = self.load_record_by_id_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.committed.is_none() || self.commit_marker_path(id).exists() {
+            return Ok(Some(record));
+        }
+        Ok(None)
+    }
+
     fn load_alias_target(&self, alias: &SnapshotAlias) -> RepositoryResult<Option<SnapshotId>> {
         let path = PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias);
         if !path.exists() {
@@ -664,7 +760,14 @@ impl PosixFsCatalogStore {
         let resources = metadata.resources;
         let source = metadata.source.clone();
         if let Some(mut record) = self.load_record_by_id_unlocked(&id)? {
-            record.mark_committed(alias, resources, committed, source, now_unix_ms);
+            record.mark_committed(
+                metadata.snapshot_type,
+                alias,
+                resources,
+                committed,
+                source,
+                now_unix_ms,
+            );
             return Ok(record);
         }
 
@@ -684,6 +787,7 @@ impl PosixFsCatalogStore {
 
         Ok(SnapshotRecord {
             id,
+            snapshot_type: metadata.snapshot_type,
             alias,
             source,
             resources,
@@ -691,10 +795,6 @@ impl PosixFsCatalogStore {
             updated_at_unix_ms: now_unix_ms,
             committed: Some(committed),
         })
-    }
-
-    fn write_committed_record_unlocked(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        self.write_record_unlocked(record)
     }
 
     fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
@@ -804,6 +904,60 @@ mod tests {
                 .path(super::super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER)
                 .exists()
         );
+    }
+
+    #[test]
+    fn incomplete_committed_record_is_hidden_until_marker_and_reconciled_on_restart() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let snapshot_id = SnapshotId::generate();
+        let session = store
+            .begin_publish(&snapshot_id)
+            .expect("begin should work");
+        let metadata = SnapshotPublishMetadata {
+            id: snapshot_id.clone(),
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "sandbox".to_string(),
+            },
+            ..SnapshotPublishMetadata::mock()
+        };
+        let record = store
+            .committed_record_unlocked(&metadata, CommittedSnapshot::mock(), 1)
+            .expect("record should build");
+        store
+            .write_record_unlocked(&record)
+            .expect("record should write");
+
+        assert!(store
+            .get(&snapshot_id.to_string())
+            .expect("get should work")
+            .is_none());
+        assert!(store
+            .list(SnapshotListFilter::matches_all())
+            .expect("list should work")
+            .is_empty());
+
+        store
+            .reconcile_startup()
+            .expect("active startup reconcile should work");
+        assert!(
+            PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id)
+                .snapshot_dir()
+                .exists()
+        );
+
+        // Simulate a publisher process exiting before the completion marker
+        // is written; an active session must be preserved by reconciliation.
+        drop(session);
+        store
+            .reconcile_startup()
+            .expect("startup reconcile should work");
+        assert!(
+            !PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id)
+                .snapshot_dir()
+                .exists()
+        );
+        assert!(!PosixFsSnapshotArtifactLayout::record_path(tempdir.path(), &snapshot_id).exists());
     }
 
     fn committed_metadata(

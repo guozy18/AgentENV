@@ -97,6 +97,9 @@ pub struct Orchestrator<
     factory: F,
     persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
+    /// Per-sandbox data-plane gate. Proxy traffic holds a read guard while a
+    /// snapshot holds the write guard across freeze, capture, and resume.
+    sandbox_gates: RwLock<HashMap<SandboxId, Arc<RwLock<()>>>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -187,6 +190,7 @@ where
             factory,
             persister,
             sandboxes: RwLock::new(HashMap::new()),
+            sandbox_gates: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -745,6 +749,12 @@ where
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn proxy_lookup_for(&self, sandbox_id: &SandboxId) -> Result<ProxyLookupResult> {
         if let Some(route) = self.proxy_routes.read().await.route(sandbox_id).cloned() {
+            if let Some(metadata) = self.store.get(sandbox_id).await? {
+                if metadata.state != SandboxState::Running {
+                    debug!(state = ?metadata.state, "sandbox route exists but is not proxyable");
+                    return Ok(ProxyLookupResult::Unavailable(metadata.state));
+                }
+            }
             trace!(
                 version = route.version(),
                 "resolved running proxy target from runtime table"
@@ -773,6 +783,27 @@ where
                 ProxyLookupResult::Unavailable(metadata.state)
             }
         })
+    }
+
+    /// Acquires the data-plane read side of a sandbox lifecycle gate. The
+    /// owned guard can be held by a response body or WebSocket bridge.
+    pub(crate) async fn acquire_proxy_read(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.sandbox_gate(sandbox_id).await.read_owned().await
+    }
+
+    async fn sandbox_gate(&self, sandbox_id: &SandboxId) -> Arc<RwLock<()>> {
+        if let Some(gate) = self.sandbox_gates.read().await.get(sandbox_id).cloned() {
+            return gate;
+        }
+        let mut gates = self.sandbox_gates.write().await;
+        Arc::clone(
+            gates
+                .entry(*sandbox_id)
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
+        )
     }
 
     /// Updates the keep-alive timeout for a RUNNING sandbox.
@@ -1421,6 +1452,9 @@ where
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
         self.ensure_accepting_lifecycle_operations()?;
+
+        let snapshot_gate = self.sandbox_gate(&sandbox_id).await;
+        let _snapshot_gate = snapshot_gate.write_owned().await;
 
         info!("capturing sandbox snapshot");
         match self

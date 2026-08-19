@@ -35,6 +35,11 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            snapshot_type: Some(match record.snapshot_type {
+                crate::snapshot::SnapshotType::Local => models::SnapshotType::Local,
+                crate::snapshot::SnapshotType::Distributed => models::SnapshotType::Distributed,
+                crate::snapshot::SnapshotType::Temporal => models::SnapshotType::Temporal,
+            }),
         }
     }
 }

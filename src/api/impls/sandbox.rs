@@ -20,6 +20,7 @@ use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotType,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -1104,6 +1105,22 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
+        let snapshot_type = match body
+            .snapshot_type
+            .unwrap_or(models::SnapshotType::Distributed)
+        {
+            models::SnapshotType::Local => SnapshotType::Local,
+            models::SnapshotType::Distributed => SnapshotType::Distributed,
+            models::SnapshotType::Temporal => {
+                return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                    Self::error(
+                        400,
+                        "temporal snapshots are reserved for sandbox pause/resume; use the pause endpoint",
+                    ),
+                ));
+            }
+        };
+
         let capture = match timer
             .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
             .await
@@ -1137,6 +1154,7 @@ impl Sandboxes<()> for ApiImpl {
                 self.snapshot_manager.publish_captured(
                     SnapshotPublishMetadata {
                         id: SnapshotId::generate(),
+                        snapshot_type,
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),

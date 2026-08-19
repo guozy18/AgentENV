@@ -24,8 +24,8 @@ use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotSourceKind, SnapshotType, TemplateBuildErrorReason, TemplateBuildInfo,
+    TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
@@ -295,26 +295,25 @@ impl SnapshotRepository for OssSnapshotRepository {
                 disk_publications: disk_publications.clone(),
             };
 
-            // 5. Bind alias (if present) with conflict detection.
+            // 5. The atomic record PUT makes the completed artifact closure
+            // visible; bind the alias only after that commit point.
+            let record = self
+                .write_committed_record(
+                    metadata.id.clone(),
+                    metadata.alias.clone(),
+                    metadata.resources,
+                    committed,
+                    metadata.source.clone(),
+                    metadata.snapshot_type,
+                )
+                .await?;
+
+            // 6. Bind aliases only after the record is durable.
             if let Some(ref alias) = metadata.alias {
-                if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
-                    }
-                    return Err(e);
-                }
+                self.bind_alias(alias.as_ref(), id).await?;
             }
 
-            self.write_committed_record(
-                metadata.id.clone(),
-                metadata.alias.clone(),
-                metadata.resources,
-                committed,
-                metadata.source.clone(),
-            )
-            .await
+            Ok(record)
         }
         .await;
 
@@ -323,6 +322,29 @@ impl SnapshotRepository for OssSnapshotRepository {
             Err(error) => {
                 // Best-effort rollback. Content-addressed managed layers are intentionally left
                 // in place; they are shared across snapshots and require separate GC.
+                let record_key = OssSnapshotArtifactLayout::record_key(id);
+                if let Err(cleanup_error) = self.client.delete(&record_key).await {
+                    warn!(
+                        snapshot_id = %id,
+                        error = %cleanup_error,
+                        "failed to roll back OSS snapshot record"
+                    );
+                }
+                if let Some(alias) = metadata.alias.as_ref() {
+                    if self
+                        .load_alias_target(alias.as_ref())
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(id)
+                    {
+                        let _ = self
+                            .client
+                            .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
+                            .await;
+                    }
+                }
                 if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
                     warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after publish failure");
                 }
@@ -373,7 +395,8 @@ impl SnapshotRepository for OssSnapshotRepository {
             .await
             .map_err(|e| RepositoryError::backend("list snapshot records", e))?;
 
-        let mut records: Vec<SnapshotRecord> = stream::iter(keys)
+        let record_keys = keys.into_iter().filter(|key| key.ends_with(".json"));
+        let mut records: Vec<SnapshotRecord> = stream::iter(record_keys)
             .map(|key| async move {
                 let bytes = self.client.get_bytes(&key).await.map_err(|e| {
                     RepositoryError::backend(format!("read snapshot record '{key}'"), e)
@@ -554,10 +577,11 @@ impl OssSnapshotRepository {
         resources: crate::types::SandboxResources,
         committed: CommittedSnapshot,
         source: SnapshotPublishSource,
+        snapshot_type: SnapshotType,
     ) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
         let record = if let Some(mut record) = self.read_record(&id).await? {
-            record.mark_committed(alias, resources, committed, source, now);
+            record.mark_committed(snapshot_type, alias, resources, committed, source, now);
             record
         } else {
             let source = match source {
@@ -575,6 +599,7 @@ impl OssSnapshotRepository {
             };
             SnapshotRecord {
                 id,
+                snapshot_type,
                 alias,
                 source,
                 resources,

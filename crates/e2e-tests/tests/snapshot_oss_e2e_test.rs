@@ -151,6 +151,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
                 alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),
@@ -268,6 +269,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),
@@ -323,6 +325,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id,
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
                 alias: None,
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),
@@ -382,6 +385,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),

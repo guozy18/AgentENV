@@ -6274,12 +6274,20 @@ pub struct SandboxSnapshotRequest {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// Requested snapshot durability. Omitted requests retain legacy distributed behavior.
+    #[serde(rename = "snapshotType")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_type: Option<SnapshotType>,
 }
 
 impl SandboxSnapshotRequest {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new() -> SandboxSnapshotRequest {
-        SandboxSnapshotRequest { name: None }
+        SandboxSnapshotRequest {
+            name: None,
+            snapshot_type: None,
+        }
     }
 }
 
@@ -6292,6 +6300,9 @@ impl std::fmt::Display for SandboxSnapshotRequest {
             self.name
                 .as_ref()
                 .map(|name| ["name".to_string(), name.to_string()].join(",")),
+            self.snapshot_type.as_ref().map(|snapshot_type| {
+                ["snapshotType".to_string(), snapshot_type.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -6314,6 +6325,7 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub name: Vec<String>,
+            pub snapshot_type: Vec<SnapshotType>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6339,6 +6351,10 @@ impl std::str::FromStr for SandboxSnapshotRequest {
                     "name" => intermediate_rep.name.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "snapshotType" => intermediate_rep.snapshot_type.push(
+                        <SnapshotType as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxSnapshotRequest".to_string(),
@@ -6354,6 +6370,7 @@ impl std::str::FromStr for SandboxSnapshotRequest {
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(SandboxSnapshotRequest {
             name: intermediate_rep.name.into_iter().next(),
+            snapshot_type: intermediate_rep.snapshot_type.into_iter().next(),
         })
     }
 }
@@ -6578,6 +6595,51 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxTimeo
     }
 }
 
+/// Lifecycle and durability semantics of a snapshot.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum SnapshotType {
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "distributed")]
+    Distributed,
+    #[serde(rename = "temporal")]
+    Temporal,
+}
+
+impl validator::Validate for SnapshotType {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for SnapshotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SnapshotType::Local => write!(f, "local"),
+            SnapshotType::Distributed => write!(f, "distributed"),
+            SnapshotType::Temporal => write!(f, "temporal"),
+        }
+    }
+}
+
+impl std::str::FromStr for SnapshotType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "local" => std::result::Result::Ok(SnapshotType::Local),
+            "distributed" => std::result::Result::Ok(SnapshotType::Distributed),
+            "temporal" => std::result::Result::Ok(SnapshotType::Temporal),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotInfo {
@@ -6619,6 +6681,11 @@ pub struct SnapshotInfo {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+
+    /// Lifecycle and durability semantics of the snapshot.
+    #[serde(rename = "snapshotType")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_type: Option<SnapshotType>,
 }
 
 impl SnapshotInfo {
@@ -6641,6 +6708,7 @@ impl SnapshotInfo {
             created_at,
             updated_at,
             image_ref: None,
+            snapshot_type: None,
         }
     }
 }
@@ -6673,6 +6741,9 @@ impl std::fmt::Display for SnapshotInfo {
             self.image_ref
                 .as_ref()
                 .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
+            self.snapshot_type.as_ref().map(|snapshot_type| {
+                ["snapshotType".to_string(), snapshot_type.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -6702,6 +6773,7 @@ impl std::str::FromStr for SnapshotInfo {
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub image_ref: Vec<String>,
+            pub snapshot_type: Vec<SnapshotType>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6759,6 +6831,10 @@ impl std::str::FromStr for SnapshotInfo {
                     "imageRef" => intermediate_rep.image_ref.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "snapshotType" => intermediate_rep.snapshot_type.push(
+                        <SnapshotType as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SnapshotInfo".to_string(),
@@ -6809,6 +6885,7 @@ impl std::str::FromStr for SnapshotInfo {
                 .next()
                 .ok_or_else(|| "updatedAt missing in SnapshotInfo".to_string())?,
             image_ref: intermediate_rep.image_ref.into_iter().next(),
+            snapshot_type: intermediate_rep.snapshot_type.into_iter().next(),
         })
     }
 }

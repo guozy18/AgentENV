@@ -118,6 +118,9 @@ impl PosixFsSnapshotRepository {
         catalog_store: Arc<PosixFsCatalogStore>,
         artifact_store: Arc<PosixFsArtifactStore>,
     ) -> Self {
+        if let Err(error) = catalog_store.reconcile_startup() {
+            tracing::warn!(error = %error, "snapshot catalog startup reconciliation failed");
+        }
         Self {
             catalog_store,
             artifact_store,
@@ -373,6 +376,7 @@ mod tests {
     ) -> SnapshotRecord {
         let mut record = SnapshotRecord::mock_ready(committed);
         record.id = metadata.id;
+        record.snapshot_type = metadata.snapshot_type;
         record.alias = metadata.alias;
         record.resources = metadata.resources;
         let source = match metadata.source {

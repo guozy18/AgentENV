@@ -81,6 +81,7 @@ async fn publish_captured_snapshot_for_test(
         .publish_captured(
             SnapshotPublishMetadata {
                 id: SnapshotId::generate(),
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
                 alias: Some(SnapshotAlias::parse(alias)?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: source_sandbox_id.to_string(),

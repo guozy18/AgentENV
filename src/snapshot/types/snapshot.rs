@@ -21,6 +21,12 @@ use crate::types::{ImageConfigs, SandboxResources};
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
+    /// Lifecycle intent for this snapshot.
+    ///
+    /// The intent is persisted with the record so a node restart does not
+    /// have to infer local-vs-distributed semantics from the configured
+    /// repository backend.
+    pub snapshot_type: SnapshotType,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotPublishSource,
     pub context: CommandContext,
@@ -39,6 +45,7 @@ impl SnapshotPublishMetadata {
     pub fn mock() -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotType::Distributed,
             alias: None,
             source: SnapshotPublishSource::Template,
             context: CommandContext::default(),
@@ -55,6 +62,22 @@ impl SnapshotPublishMetadata {
             custom_extension_params: None,
         }
     }
+}
+
+/// Availability and lifecycle semantics of a committed snapshot.
+///
+/// `Temporal` is reserved for the owning sandbox pause/resume continuation;
+/// the persistent snapshot repository accepts only `Local` and
+/// `Distributed`. Keeping it in the shared model makes invalid API requests
+/// explicit instead of silently treating a temporal continuation as a
+/// reusable snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotType {
+    Local,
+    #[default]
+    Distributed,
+    Temporal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +351,12 @@ impl CommittedSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
+    /// The requested lifecycle/availability semantics.
+    ///
+    /// Older records did not carry this field; those records are the legacy
+    /// durable (distributed) form.
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotSource,
     pub resources: SandboxResources,
@@ -345,6 +374,7 @@ impl SnapshotRecord {
         let now_unix_ms = now_unix_ms();
         Self {
             id,
+            snapshot_type: SnapshotType::Distributed,
             alias,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
@@ -358,6 +388,7 @@ impl SnapshotRecord {
 
     pub fn mark_committed(
         &mut self,
+        snapshot_type: SnapshotType,
         alias: Option<SnapshotAlias>,
         resources: SandboxResources,
         committed: CommittedSnapshot,
@@ -373,6 +404,7 @@ impl SnapshotRecord {
             build.error_reason = None;
         }
         self.alias = alias;
+        self.snapshot_type = snapshot_type;
         self.resources = resources;
         self.updated_at_unix_ms = now_unix_ms;
         self.committed = Some(committed);
@@ -394,6 +426,7 @@ impl SnapshotRecord {
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotType::Distributed,
             alias: None,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo {
@@ -575,7 +608,7 @@ impl fmt::Debug for RunnableSnapshot {
 mod tests {
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        PersistedDiskImagePublication, SnapshotRecord, SnapshotType, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -609,6 +642,34 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_record_without_snapshot_type_defaults_to_distributed() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut value = serde_json::to_value(record).expect("serialize snapshot record");
+        value
+            .as_object_mut()
+            .expect("snapshot record must serialize as an object")
+            .remove("snapshot_type");
+
+        let record: SnapshotRecord =
+            serde_json::from_value(value).expect("deserialize legacy snapshot record");
+
+        assert_eq!(record.snapshot_type, SnapshotType::Distributed);
+    }
+
+    #[test]
+    fn snapshot_type_uses_stable_snake_case_values() {
+        assert_eq!(
+            serde_json::to_value(SnapshotType::Local).expect("serialize local type"),
+            serde_json::json!("local")
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapshotType>("\"distributed\"")
+                .expect("deserialize distributed type"),
+            SnapshotType::Distributed
+        );
     }
 
     #[test]

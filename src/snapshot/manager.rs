@@ -11,12 +11,12 @@ use crate::p2p::P2pTransport;
 use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
 };
-use crate::snapshot::repository::backends::build_snapshot_backend;
+use crate::snapshot::repository::backends::{build_local_snapshot_backend, build_snapshot_backend};
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord,
+    SnapshotRecord, SnapshotType,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -40,6 +40,12 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
 }
 
 #[derive(Clone)]
+struct SnapshotStore {
+    repository: Arc<dyn SnapshotRepository>,
+    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+}
+
+#[derive(Clone)]
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
 ///
 /// Durable reachability of committed snapshots is owned entirely by the
@@ -48,8 +54,8 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
-    repository: Arc<dyn SnapshotRepository>,
-    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    primary: SnapshotStore,
+    local: Option<SnapshotStore>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 }
 
@@ -57,9 +63,12 @@ impl SnapshotManager {
     /// Builds a manager using the configured repository backend.
     pub fn new(p2p_transport: Option<Arc<dyn P2pTransport>>) -> anyhow::Result<Self> {
         let (repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
-        Ok(Self::from_parts(
+        let (local_repository, local_runtime_resolver) = build_local_snapshot_backend()?;
+        Ok(Self::from_parts_with_local(
             repository,
             runtime_resolver,
+            local_repository,
+            local_runtime_resolver,
             p2p_transport,
         ))
     }
@@ -71,8 +80,32 @@ impl SnapshotManager {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
         Self {
-            repository,
-            runtime_resolver,
+            primary: SnapshotStore {
+                repository,
+                runtime_resolver,
+            },
+            local: None,
+            p2p_transport,
+        }
+    }
+
+    /// Builds a manager with an independent durable local repository.
+    pub fn from_parts_with_local(
+        repository: Arc<dyn SnapshotRepository>,
+        runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+        local_repository: Arc<dyn SnapshotRepository>,
+        local_runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+        p2p_transport: Option<Arc<dyn P2pTransport>>,
+    ) -> Self {
+        Self {
+            primary: SnapshotStore {
+                repository,
+                runtime_resolver,
+            },
+            local: Some(SnapshotStore {
+                repository: local_repository,
+                runtime_resolver: local_runtime_resolver,
+            }),
             p2p_transport,
         }
     }
@@ -81,7 +114,7 @@ impl SnapshotManager {
         &self,
         record: SnapshotRecord,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        self.repository.create(record).await
+        self.primary.repository.create(record).await
     }
 
     #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
@@ -91,6 +124,7 @@ impl SnapshotManager {
         manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let record = self
+            .primary
             .repository
             .publish(metadata.clone(), manifest.clone())
             .await?;
@@ -111,12 +145,54 @@ impl SnapshotManager {
                 feature: "publishing captured snapshots for this sandbox backend".to_string(),
             })?;
 
-        let record = self
-            .repository
-            .publish(metadata.clone(), manifest.clone())
-            .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        self.publish_captured_manifest(metadata, manifest).await
+    }
+
+    async fn publish_captured_manifest(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        match metadata.snapshot_type {
+            SnapshotType::Temporal => Err(RepositoryError::Unsupported {
+                feature: "Temporal snapshots are owned by pause/resume and are not persistent"
+                    .to_string(),
+            }),
+            SnapshotType::Local => {
+                let local = self
+                    .local
+                    .as_ref()
+                    .ok_or_else(|| RepositoryError::Unsupported {
+                        feature: "durable local snapshot repository is not configured".to_string(),
+                    })?;
+                local.repository.publish(metadata, manifest).await
+            }
+            SnapshotType::Distributed => {
+                // Commit the node-local recovery point first. Promotion reads
+                // the committed local artifacts through its resolver, so it
+                // never refreezes or recaptures the live sandbox.
+                let Some(local) = self.local.as_ref() else {
+                    return self.publish(metadata, manifest).await;
+                };
+                let mut local_metadata = metadata.clone();
+                // The local catalog records the availability that was
+                // actually committed. A Distributed intent becomes
+                // Distributed only after promotion succeeds.
+                local_metadata.snapshot_type = SnapshotType::Local;
+                let local_record = local.repository.publish(local_metadata, manifest).await?;
+                let runnable = local
+                    .runtime_resolver
+                    .resolve(Arc::new(local_record))
+                    .await
+                    .map_err(|error| {
+                        RepositoryError::backend(
+                            "resolve local snapshot for distributed promotion",
+                            error,
+                        )
+                    })?;
+                self.publish(metadata, runnable.manifest().clone()).await
+            }
+        }
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
@@ -197,23 +273,88 @@ impl SnapshotManager {
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
-        self.repository
-            .get(id_or_alias.as_ref())
-            .await
-            .with_context(|| {
-                format!(
-                    "load committed snapshot '{}' through repository",
-                    id_or_alias.as_ref()
-                )
-            })
+        let lookup = id_or_alias.as_ref();
+        match self.primary.repository.get(lookup).await {
+            Ok(Some(record)) => Ok(Some(record)),
+            Ok(None) => {
+                match self.local.as_ref() {
+                    Some(local) => local.repository.get(lookup).await.with_context(|| {
+                        format!("load local snapshot '{lookup}' through repository")
+                    }),
+                    None => Ok(None),
+                }
+            }
+            Err(primary_error) => {
+                let Some(local) = self.local.as_ref() else {
+                    return Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!("load committed snapshot '{lookup}' through repository")
+                    });
+                };
+                match local.repository.get(lookup).await {
+                    Ok(Some(record)) => {
+                        warn!(
+                            snapshot = lookup,
+                            error = %primary_error,
+                            "primary snapshot repository unavailable; using local recovery point"
+                        );
+                        Ok(Some(record))
+                    }
+                    Ok(None) => Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!("load committed snapshot '{lookup}' through repository")
+                    }),
+                    Err(local_error) => Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!(
+                            "load committed snapshot '{lookup}' through repository; local fallback failed: {local_error}"
+                        )
+                    }),
+                }
+            }
+        }
     }
 
     /// Lists snapshot records that match the given filter.
     pub async fn list(&self, filter: SnapshotListFilter) -> anyhow::Result<Vec<SnapshotRecord>> {
-        self.repository
-            .list(filter)
-            .await
-            .context("list committed snapshots through repository")
+        const CONTEXT: &str = "list committed snapshots through repository";
+        let primary = self.primary.repository.list(filter.clone()).await;
+        let Some(local) = self.local.as_ref() else {
+            return primary.context(CONTEXT);
+        };
+        let local = local.repository.list(filter).await;
+
+        match (primary, local) {
+            (Ok(mut records), Ok(local_records)) => {
+                let mut existing: HashSet<SnapshotId> =
+                    records.iter().map(|record| record.id.clone()).collect();
+                records.extend(
+                    local_records
+                        .into_iter()
+                        .filter(|record| existing.insert(record.id.clone())),
+                );
+                records.sort_by(|left, right| {
+                    right
+                        .created_at_unix_ms
+                        .cmp(&left.created_at_unix_ms)
+                        .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+                });
+                Ok(records)
+            }
+            (Ok(records), Err(error)) => {
+                warn!(
+                    error = %error,
+                    "failed to list local recovery points; returning primary snapshots"
+                );
+                Ok(records)
+            }
+            (Err(error), Ok(records)) => {
+                warn!(
+                    error = %error,
+                    "primary snapshot repository unavailable; listing local recovery points"
+                );
+                Ok(records)
+            }
+            (Err(primary_error), Err(local_error)) => Err(anyhow::Error::new(primary_error))
+                .context(format!("{CONTEXT}; local fallback failed: {local_error}")),
+        }
     }
 
     /// Deletes a snapshot by id or alias.
@@ -221,22 +362,98 @@ impl SnapshotManager {
     /// Returns `Ok(())` on success. The operation is idempotent:
     /// if the snapshot does not exist, it is still considered success.
     pub async fn delete(&self, id_or_alias: impl AsRef<str>) -> anyhow::Result<()> {
-        self.repository
-            .delete(id_or_alias.as_ref())
+        let lookup = id_or_alias.as_ref();
+        let Some(local_store) = self.local.as_ref() else {
+            return self
+                .primary
+                .repository
+                .delete(lookup)
+                .await
+                .with_context(|| format!("delete snapshot '{lookup}' through repository"));
+        };
+        let local = local_store
+            .repository
+            .get(lookup)
             .await
-            .with_context(|| {
-                format!(
-                    "delete snapshot '{}' through repository",
-                    id_or_alias.as_ref()
-                )
-            })
+            .with_context(|| format!("load local snapshot '{lookup}' before delete"))?;
+
+        match self.primary.repository.delete(lookup).await {
+            Ok(()) => {
+                if local.is_some() {
+                    local_store
+                        .repository
+                        .delete(lookup)
+                        .await
+                        .with_context(|| {
+                            format!("delete local snapshot '{lookup}' through repository")
+                        })?;
+                }
+                Ok(())
+            }
+            Err(primary_error)
+                if local
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot_type == SnapshotType::Local) =>
+            {
+                local_store
+                    .repository
+                    .delete(lookup)
+                    .await
+                    .with_context(|| {
+                        format!("delete local snapshot '{lookup}' through repository")
+                    })?;
+                warn!(
+                    snapshot = lookup,
+                    error = %primary_error,
+                    "primary snapshot repository unavailable while deleting local snapshot"
+                );
+                Ok(())
+            }
+            Err(error) => Err(anyhow::Error::new(error))
+                .with_context(|| format!("delete snapshot '{lookup}' through repository")),
+        }
     }
 
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
-        self.repository.resolve_alias(alias).await.with_context(|| {
-            format!("resolve committed snapshot alias '{alias}' through repository")
-        })
+        match self.primary.repository.resolve_alias(alias).await {
+            Ok(Some(snapshot_id)) => Ok(Some(snapshot_id)),
+            Ok(None) => match self.local.as_ref() {
+                Some(local) => local
+                    .repository
+                    .resolve_alias(alias)
+                    .await
+                    .with_context(|| {
+                        format!("resolve local snapshot alias '{alias}' through repository")
+                    }),
+                None => Ok(None),
+            },
+            Err(primary_error) => {
+                let Some(local) = self.local.as_ref() else {
+                    return Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!("resolve committed snapshot alias '{alias}' through repository")
+                    });
+                };
+                match local.repository.resolve_alias(alias).await {
+                    Ok(Some(snapshot_id)) => {
+                        warn!(
+                            alias,
+                            error = %primary_error,
+                            "primary snapshot repository unavailable; using local alias"
+                        );
+                        Ok(Some(snapshot_id))
+                    }
+                    Ok(None) => Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!("resolve committed snapshot alias '{alias}' through repository")
+                    }),
+                    Err(local_error) => Err(anyhow::Error::new(primary_error)).with_context(|| {
+                        format!(
+                            "resolve committed snapshot alias '{alias}' through repository; local fallback failed: {local_error}"
+                        )
+                    }),
+                }
+            }
+        }
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.
@@ -244,7 +461,26 @@ impl SnapshotManager {
         &self,
         snapshot: SnapshotRecord,
     ) -> anyhow::Result<RunnableSnapshot> {
-        self.runtime_resolver
+        let resolver = match self.local.as_ref() {
+            Some(local) if snapshot.snapshot_type == SnapshotType::Local => &local.runtime_resolver,
+            Some(local) => {
+                let snapshot_id = snapshot.id.to_string();
+                match self.primary.repository.get(&snapshot_id).await {
+                    Ok(Some(_)) => &self.primary.runtime_resolver,
+                    Ok(None) => &local.runtime_resolver,
+                    Err(error) => {
+                        warn!(
+                            snapshot_id = %snapshot.id,
+                            error = %error,
+                            "primary snapshot repository unavailable; resolving local recovery point"
+                        );
+                        &local.runtime_resolver
+                    }
+                }
+            }
+            None => &self.primary.runtime_resolver,
+        };
+        resolver
             .resolve(Arc::new(snapshot))
             .await
             .context("resolve committed snapshot into runnable runtime paths")
@@ -270,7 +506,7 @@ impl SnapshotManager {
         &self,
         id: &SnapshotId,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        self.repository.try_start_build(id).await
+        self.primary.repository.try_start_build(id).await
     }
 
     /// Marks one template build as failed.
@@ -279,7 +515,7 @@ impl SnapshotManager {
         id: &SnapshotId,
         reason: crate::snapshot::TemplateBuildErrorReason,
     ) -> crate::snapshot::RepositoryResult<()> {
-        self.repository.mark_build_error(id, reason).await
+        self.primary.repository.mark_build_error(id, reason).await
     }
 }
 
@@ -295,28 +531,67 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn test_manager(root: &Path) -> SnapshotManager {
+    fn test_store(
+        root: &Path,
+        name: &str,
+    ) -> (
+        Arc<dyn SnapshotRepository>,
+        Arc<dyn SnapshotRuntimeResolver>,
+    ) {
+        let cache = root.join(format!("{name}-cache"));
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            root: root.join(name),
+            cache_root: Some(cache.clone()),
+            runtime_cache_root: Some(cache.join("runtime")),
         })
         .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
+        backend.into_parts()
+    }
+
+    fn test_manager(root: &Path) -> SnapshotManager {
+        let (repository, runtime_resolver) = test_store(root, "repository");
         SnapshotManager::from_parts(repository, runtime_resolver, None)
     }
 
-    async fn seed_built_snapshot(manager: &SnapshotManager, snapshot_id: SnapshotId, alias: &str) {
-        let workspace = TempDir::new().expect("tempdir should exist");
-        let (_, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+    fn test_manager_with_local(
+        root: &Path,
+        primary_name: &str,
+    ) -> (
+        SnapshotManager,
+        Arc<dyn SnapshotRepository>,
+        Arc<dyn SnapshotRepository>,
+    ) {
+        let (primary_repository, primary_resolver) = test_store(root, primary_name);
+        let (local_repository, local_resolver) = test_store(root, "local");
+        let manager = SnapshotManager::from_parts_with_local(
+            Arc::clone(&primary_repository),
+            primary_resolver,
+            Arc::clone(&local_repository),
+            local_resolver,
+            None,
+        );
+        (manager, primary_repository, local_repository)
+    }
+
+    fn mock_manifest(root: &Path) -> FirecrackerSnapshotManifest {
+        write_mock_built_artifacts(root)
+            .expect("mock artifacts should write")
+            .2
+    }
+
+    async fn seed_built_snapshot(
+        manager: &SnapshotManager,
+        root: &Path,
+        snapshot_id: SnapshotId,
+        alias: &str,
+    ) {
         let metadata = SnapshotPublishMetadata {
             id: snapshot_id,
             alias: Some(SnapshotAlias::parse(alias).expect("alias should parse")),
             ..SnapshotPublishMetadata::mock()
         };
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, mock_manifest(root))
             .await
             .expect("seed publish should work");
     }
@@ -326,7 +601,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let manager = test_manager(tempdir.path());
         let snapshot_id = SnapshotId::generate();
-        seed_built_snapshot(&manager, snapshot_id.clone(), "managed").await;
+        seed_built_snapshot(&manager, tempdir.path(), snapshot_id.clone(), "managed").await;
 
         let resolved = manager
             .resolve_committed_alias("managed")
@@ -360,7 +635,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let manager = test_manager(tempdir.path());
         let snapshot_id = SnapshotId::generate();
-        seed_built_snapshot(&manager, snapshot_id.clone(), "runnable").await;
+        seed_built_snapshot(&manager, tempdir.path(), snapshot_id.clone(), "runnable").await;
 
         let runnable = manager
             .load_runnable("runnable")
@@ -376,19 +651,12 @@ mod tests {
     #[tokio::test]
     async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
+        let (repository, runtime_resolver) = test_store(tempdir.path(), "repository");
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
 
-        let workspace = TempDir::new().expect("tempdir should exist");
         let (rootfs_lower, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+            write_mock_built_artifacts(tempdir.path()).expect("mock artifacts should write");
         let snapshot_id = SnapshotId::generate();
         let metadata = SnapshotPublishMetadata {
             id: snapshot_id.clone(),
@@ -423,5 +691,164 @@ mod tests {
             .await
             .expect("lookup rootfs layer")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn local_recovery_point_remains_usable_when_primary_repository_is_unavailable() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let broken_primary_root = tempdir.path().join("broken-primary");
+        std::fs::write(&broken_primary_root, b"not a repository directory")
+            .expect("write broken primary root");
+        let (manager, _, local_repository) =
+            test_manager_with_local(tempdir.path(), "broken-primary");
+        let snapshot_id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse("local-fallback").expect("alias should parse");
+        local_repository
+            .publish(
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    snapshot_type: SnapshotType::Local,
+                    alias: Some(alias.clone()),
+                    ..SnapshotPublishMetadata::mock()
+                },
+                mock_manifest(tempdir.path()),
+            )
+            .await
+            .expect("local publish should commit");
+
+        let loaded = manager
+            .get(alias.as_ref())
+            .await
+            .expect("local fallback get should work")
+            .expect("local record should exist");
+        assert_eq!(loaded.id, snapshot_id);
+        assert_eq!(
+            manager
+                .resolve_committed_alias(alias.as_ref())
+                .await
+                .expect("local alias fallback should work"),
+            Some(snapshot_id.clone())
+        );
+        assert_eq!(
+            manager
+                .list(SnapshotListFilter::matches_all())
+                .await
+                .expect("local list fallback should work")
+                .len(),
+            1
+        );
+
+        let runnable = manager
+            .resolve_runnable(loaded)
+            .await
+            .expect("local runtime fallback should work");
+        assert_eq!(runnable.record().id, snapshot_id);
+        assert!(runnable.manifest().vm_state.path.exists());
+
+        manager
+            .delete(alias.as_ref())
+            .await
+            .expect("local delete should succeed during primary outage");
+        assert!(local_repository
+            .get(alias.as_ref())
+            .await
+            .expect("local lookup after delete should work")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_local_publish_does_not_touch_primary_repository() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let primary_root = tempdir.path().join("primary-file");
+        std::fs::write(&primary_root, b"primary sentinel").expect("write primary sentinel");
+        let (manager, _, _) = test_manager_with_local(tempdir.path(), "primary-file");
+        let snapshot_id = SnapshotId::generate();
+        let record = manager
+            .publish_captured_manifest(
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    snapshot_type: SnapshotType::Local,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                mock_manifest(tempdir.path()),
+            )
+            .await
+            .expect("local captured publish should work");
+
+        assert_eq!(record.id, snapshot_id);
+        assert_eq!(record.snapshot_type, SnapshotType::Local);
+        assert_eq!(
+            std::fs::read(&primary_root).expect("read primary sentinel"),
+            b"primary sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn distributed_capture_keeps_local_record_when_promotion_fails() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let primary_root = tempdir.path().join("primary-file");
+        std::fs::write(&primary_root, b"primary sentinel").expect("write primary sentinel");
+        let (manager, _, local_repository) =
+            test_manager_with_local(tempdir.path(), "primary-file");
+        let snapshot_id = SnapshotId::generate();
+        let error = manager
+            .publish_captured_manifest(
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    snapshot_type: SnapshotType::Distributed,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                mock_manifest(tempdir.path()),
+            )
+            .await
+            .expect_err("promotion should fail against an invalid primary root");
+        assert!(error.to_string().contains("create catalog dir"));
+
+        let local_record = local_repository
+            .get(&snapshot_id.to_string())
+            .await
+            .expect("local lookup should work")
+            .expect("local record should remain after promotion failure");
+        assert_eq!(local_record.snapshot_type, SnapshotType::Local);
+    }
+
+    #[tokio::test]
+    async fn distributed_capture_promotes_same_id_after_local_commit() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let (manager, primary_repository, local_repository) =
+            test_manager_with_local(tempdir.path(), "primary");
+        let snapshot_id = SnapshotId::generate();
+        let promoted = manager
+            .publish_captured_manifest(
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    snapshot_type: SnapshotType::Distributed,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                mock_manifest(tempdir.path()),
+            )
+            .await
+            .expect("distributed promotion should work");
+
+        assert_eq!(promoted.id, snapshot_id);
+        assert_eq!(promoted.snapshot_type, SnapshotType::Distributed);
+        assert_eq!(
+            local_repository
+                .get(&snapshot_id.to_string())
+                .await
+                .expect("local lookup should work")
+                .expect("local record should exist")
+                .snapshot_type,
+            SnapshotType::Local
+        );
+        assert_eq!(
+            primary_repository
+                .get(&snapshot_id.to_string())
+                .await
+                .expect("primary lookup should work")
+                .expect("primary record should exist")
+                .snapshot_type,
+            SnapshotType::Distributed
+        );
     }
 }

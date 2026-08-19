@@ -108,6 +108,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         factory,
         persister,
         sandboxes: RwLock::new(HashMap::new()),
+        sandbox_gates: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -1842,6 +1843,32 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
     )
     .await;
 
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_capture_waits_for_in_flight_data_plane_request() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "snapshot-gate")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let request_guard = orchestrator.acquire_proxy_read(&sandbox_id).await;
+    let capture_orchestrator = Arc::clone(&orchestrator);
+    let capture =
+        tokio::spawn(async move { capture_orchestrator.capture_snapshot(sandbox_id).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !capture.is_finished(),
+        "snapshot capture must wait while a data-plane request holds its read guard"
+    );
+
+    drop(request_guard);
+    let capture_result = capture.await.expect("snapshot capture task should join");
+    capture_result?;
     orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
 }

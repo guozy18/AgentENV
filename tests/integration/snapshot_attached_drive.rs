@@ -164,6 +164,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
+        snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
         alias: Some(SnapshotAlias::parse(alias)?),
         source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
             source_sandbox_id: "test-sandbox".to_string(),
