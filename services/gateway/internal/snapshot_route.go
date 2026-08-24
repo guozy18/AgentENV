@@ -48,7 +48,15 @@ func snapshotRequestOperation(r *http.Request, launchSnapshotRef string) (snapsh
 
 	escapedPath := strings.Trim(requestEscapedPath(r), "/")
 	parts := strings.Split(escapedPath, "/")
-	if len(parts) != 3 || parts[0] != "snapshots" || parts[1] == "" || parts[2] != "promote" {
+	if len(parts) != 3 || parts[1] == "" {
+		return snapshotOperationNone, ""
+	}
+	resource, err := url.PathUnescape(parts[0])
+	if err != nil || resource != "snapshots" {
+		return snapshotOperationNone, ""
+	}
+	action, err := url.PathUnescape(parts[2])
+	if err != nil || action != "promote" {
 		return snapshotOperationNone, ""
 	}
 	snapshotRef, err := url.PathUnescape(parts[1])
@@ -56,6 +64,35 @@ func snapshotRequestOperation(r *http.Request, launchSnapshotRef string) (snapsh
 		return snapshotOperationNone, ""
 	}
 	return snapshotOperationPromote, snapshotRef
+}
+
+func isSnapshotPromotionRequest(r *http.Request) bool {
+	operation, _ := snapshotRequestOperation(r, "")
+	return operation == snapshotOperationPromote
+}
+
+// Snapshot metadata is served by the control-plane API. Header-routed proxy
+// traffic is only a data-plane fallback for otherwise unmatched paths, so
+// these explicit metadata routes must retain control-plane authentication and
+// scheduling even when clients attach sandbox routing headers globally.
+func isSnapshotMetadataRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+
+	parts := strings.Split(strings.Trim(requestEscapedPath(r), "/"), "/")
+	first, err := url.PathUnescape(parts[0])
+	if err != nil || first != "snapshots" {
+		return false
+	}
+	if len(parts) == 1 {
+		return true
+	}
+	if len(parts) != 2 {
+		return false
+	}
+	id, err := url.PathUnescape(parts[1])
+	return err == nil && id != ""
 }
 
 func (s *Server) routeSnapshotRequest(

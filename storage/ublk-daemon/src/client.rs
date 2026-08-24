@@ -197,16 +197,15 @@ impl UblkDaemonClient {
             cmd.arg("--p2p-publish-url").arg(url);
         }
 
+        // pool_config is fully resolved; app_config may be a partial TOML.
         if let Some(pool_config) = config.pool_config {
-            if config.app_config.is_none() {
-                cmd.arg("--enable-pool")
-                    .arg("--pool-low-watermark")
-                    .arg(pool_config.low_watermark.to_string())
-                    .arg("--pool-high-watermark")
-                    .arg(pool_config.high_watermark.to_string())
-                    .arg("--pool-startup-prewarm")
-                    .arg(pool_config.startup_prewarm.to_string());
-            }
+            cmd.arg("--enable-pool")
+                .arg("--pool-low-watermark")
+                .arg(pool_config.low_watermark.to_string())
+                .arg("--pool-high-watermark")
+                .arg(pool_config.high_watermark.to_string())
+                .arg("--pool-startup-prewarm")
+                .arg(pool_config.startup_prewarm.to_string());
         }
 
         let mut child = cmd

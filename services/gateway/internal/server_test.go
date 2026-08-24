@@ -20,6 +20,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type stubSchedulerClient struct {
@@ -299,6 +301,149 @@ func TestGatewayLeavesDataPlaneAuthorizationToRuntime(t *testing.T) {
 
 	if recorder.Code != http.StatusUnauthorized || lookupCalls != 4 {
 		t.Fatalf("scoped token reached control plane: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+}
+
+func TestGatewayRequiresAPIKeyForSnapshotPromotionWithProxyHeaders(t *testing.T) {
+	lookupCalls := 0
+	scheduleCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			lookupCalls++
+			return nil, fmt.Errorf("snapshot promotion must not use sandbox lookup")
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return nil, fmt.Errorf("unauthenticated promotion must not reach scheduling")
+		},
+	}, time.Second, 1024)
+
+	for _, path := range []string{
+		"/snapshots/snap-1/promote",
+		"/%73napshots/snap-1/promote",
+		"/snapshots/snap-1/%70romote/",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://gateway.test"+path, nil)
+			req.Header.Set(headerE2BSandboxID, "sbx-1")
+			req.Header.Set(headerE2BTargetPort, "49983")
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+			}
+		})
+	}
+	if lookupCalls != 0 || scheduleCalls != 0 {
+		t.Fatalf("scheduler calls = lookup:%d schedule:%d, want none", lookupCalls, scheduleCalls)
+	}
+}
+
+func TestSnapshotPromotionIsNotClassifiedAsDataPlane(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	for _, path := range []string{
+		"/snapshots/snap-1/promote",
+		"/%73napshots/snap-1/promote",
+		"/snapshots/snap-1/%70romote/",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://gateway.test"+path, nil)
+			req.Header.Set(headerE2BSandboxID, "sbx-1")
+			req.Header.Set(headerE2BTargetPort, "49983")
+			if server.isSandboxDataPlaneRequest(req) {
+				t.Fatal("snapshot promotion was classified as data-plane")
+			}
+			if !isSnapshotPromotionRequest(req) {
+				t.Fatal("request was not recognized as snapshot promotion")
+			}
+		})
+	}
+}
+
+func TestGatewayRequiresAPIKeyForSnapshotMetadataWithProxyHeaders(t *testing.T) {
+	lookupCalls := 0
+	scheduleCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			lookupCalls++
+			return nil, fmt.Errorf("snapshot metadata must not use sandbox lookup")
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return nil, fmt.Errorf("unauthenticated snapshot metadata must not reach scheduling")
+		},
+	}, time.Second, 1024)
+
+	for _, path := range []string{"/snapshots", "/snapshots/snap-1", "/%73napshots", "/%73napshots/snap-1"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test"+path, nil)
+			req.Header.Set(headerE2BSandboxID, "sbx-1")
+			req.Header.Set(headerE2BTargetPort, "49983")
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+			}
+		})
+	}
+
+	if lookupCalls != 0 || scheduleCalls != 0 {
+		t.Fatalf("scheduler calls = lookup:%d schedule:%d, want none", lookupCalls, scheduleCalls)
+	}
+}
+
+func TestSnapshotMetadataWithProxyHeadersUsesSchedule(t *testing.T) {
+	lookupCalls := 0
+	scheduleCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			lookupCalls++
+			return nil, fmt.Errorf("snapshot metadata must not use sandbox lookup")
+		},
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return nil, status.Error(codes.Unavailable, "scheduler unavailable")
+		},
+	}, time.Second, 1024)
+
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/snapshots/snap-1", nil)
+	req.Header.Set(headerAPIKey, testAPIKey)
+	req.Header.Set(headerE2BSandboxID, "sbx-1")
+	req.Header.Set(headerE2BTargetPort, "49983")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if lookupCalls != 0 || scheduleCalls != 1 {
+		t.Fatalf("scheduler calls = lookup:%d schedule:%d, want lookup:0 schedule:1", lookupCalls, scheduleCalls)
+	}
+}
+
+func TestSnapshotMetadataIsNotClassifiedAsDataPlaneWithProxyHeaders(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	for _, path := range []string{"/snapshots", "/snapshots/snap-1", "/snapshots/team%2Fsnap%3Av1", "/snapshots/", "/%73napshots", "/%73napshots/snap-1"} {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test"+path, nil)
+		req.Header.Set(headerE2BSandboxID, "sbx-1")
+		req.Header.Set(headerE2BTargetPort, "49983")
+		if server.isSandboxDataPlaneRequest(req) {
+			t.Fatalf("%s was classified as data-plane", path)
+		}
+		if !isSnapshotMetadataRequest(req) {
+			t.Fatalf("%s was not recognized as snapshot metadata", path)
+		}
+	}
+}
+
+func TestSnapshotMetadataHostRouteRemainsDataPlane(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/snapshots/snap-1", nil)
+	req.Host = "49983-0191f4d0-7b2a-7c11-9c2d-0123456789ab.sandbox-proxy.example.invalid"
+	if !server.isSandboxDataPlaneRequest(req) {
+		t.Fatal("host-routed snapshot metadata was not classified as data-plane")
 	}
 }
 

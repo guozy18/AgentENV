@@ -8,7 +8,7 @@ use futures::{stream, StreamExt};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 
-use super::p2p::SnapshotP2pArtifact;
+use super::p2p::{fixed_artifact_key, SnapshotP2pArtifact};
 use super::types::{now_unix_ms, SNAPSHOT_ARTIFACT_LAYOUT};
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
@@ -268,7 +268,7 @@ impl SnapshotManager {
         record: SnapshotRecord,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let snapshot_id = record.id.clone();
-        let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
+        let guard = self.lifecycle_locks.acquire(&snapshot_id).await;
 
         // Re-read under the per-snapshot lock so a retry observes a promotion
         // completed by an earlier request instead of replaying its rollback.
@@ -281,6 +281,7 @@ impl SnapshotManager {
                 reason: format!("canonical snapshot '{snapshot_id}' disappeared during promotion"),
             })?;
         if record.snapshot_type == SnapshotType::Distributed {
+            drop(guard);
             self.cleanup_local_recovery_copy(&snapshot_id).await;
             return Ok(record);
         }
@@ -302,6 +303,10 @@ impl SnapshotManager {
                 error => error,
             })?;
 
+        // Canonical promotion is complete. P2P publication is a best-effort
+        // acceleration path and must not extend the per-snapshot lifecycle
+        // lock across potentially slow local imports or scheduler RPCs.
+        drop(guard);
         self.publish_p2p_artifacts(&promoted, runnable.manifest())
             .await;
         drop(runnable);
@@ -686,6 +691,33 @@ impl SnapshotManager {
             .await;
     }
 
+    async fn unpublish_snapshot_p2p_artifacts(&self, snapshot_id: &SnapshotId) {
+        let Some(transport) = self.p2p_transport.as_ref() else {
+            return;
+        };
+
+        // VM state and the Firecracker manifest use snapshot-scoped keys.
+        // They are safe to reclaim without a global layer reference index;
+        // managed digest/UUID keys are shared by multiple snapshots and must
+        // remain advertised until a separate reference-aware GC exists.
+        stream::iter([
+            SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+        ])
+        .for_each_concurrent(2, |name| async move {
+            let key = fixed_artifact_key(snapshot_id, name);
+            if let Err(error) = transport.unpublish(&key).await {
+                warn!(
+                    %snapshot_id,
+                    %key,
+                    %error,
+                    "failed to unpublish deleted snapshot artifact from P2P"
+                );
+            }
+        })
+        .await;
+    }
+
     /// Loads a snapshot record by id or alias.
     pub async fn get(
         &self,
@@ -783,28 +815,35 @@ impl SnapshotManager {
             Self::ensure_local_delete_is_supported(&record)?;
         }
         let snapshot_id = record.id.clone();
-        let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
-        let Some(record) = self
-            .primary
-            .repository
-            .get_for_delete(&snapshot_id.to_string())
-            .await
-            .with_context(|| format!("re-read {resource} '{snapshot_id}' before delete"))?
-        else {
-            return Ok(());
+        let deleted = {
+            let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
+            let Some(record) = self
+                .primary
+                .repository
+                .get_for_delete(&snapshot_id.to_string())
+                .await
+                .with_context(|| format!("re-read {resource} '{snapshot_id}' before delete"))?
+            else {
+                return Ok(());
+            };
+            if expected_source.is_some_and(|source| record.source.kind() != source) {
+                return Ok(());
+            }
+            if expected_source.is_none() {
+                Self::ensure_local_delete_is_supported(&record)?;
+            }
+            self.primary
+                .repository
+                .delete_by_id(&snapshot_id)
+                .await
+                .with_context(|| {
+                    format!("delete {delete_resource} '{snapshot_id}' through repository")
+                })?
         };
-        if expected_source.is_some_and(|source| record.source.kind() != source) {
-            return Ok(());
+        if deleted {
+            self.unpublish_snapshot_p2p_artifacts(&snapshot_id).await;
         }
-        if expected_source.is_none() {
-            Self::ensure_local_delete_is_supported(&record)?;
-        }
-        self.primary
-            .repository
-            .delete_by_id(&snapshot_id)
-            .await
-            .with_context(|| format!("delete {delete_resource} '{snapshot_id}' through repository"))
-            .map(|_| ())
+        Ok(())
     }
 
     fn ensure_local_delete_is_supported(record: &SnapshotRecord) -> anyhow::Result<()> {
@@ -865,6 +904,11 @@ impl SnapshotManager {
                         })
                     })?;
                 if canonical.snapshot_type == SnapshotType::Distributed {
+                    // The canonical state is now immutable Distributed metadata;
+                    // remote resolution follows the same path as an initially
+                    // Distributed request and must not hold the lifecycle lock
+                    // across potentially slow OSS/P2P work.
+                    drop(_guard);
                     return self.resolve_distributed_runtime(canonical).await;
                 }
                 self.resolve_local_runtime(canonical)
@@ -1278,7 +1322,80 @@ mod tests {
         assert!(p2p
             .lookup(&rootfs_layer_key)
             .await
-            .expect("lookup rootfs layer")
+            .expect("lookup shared rootfs layer")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_unpublishes_snapshot_scoped_p2p_artifacts() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: tempdir.path().join("repository"),
+            cache_root: Some(tempdir.path().join("runtime-cache")),
+            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+        })
+        .expect("posix backend");
+        let (repository, runtime_resolver) = backend.into_parts();
+        let p2p = Arc::new(MockTransport::default());
+        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
+
+        let workspace = TempDir::new().expect("workspace should exist");
+        let (rootfs_lower, _, manifest) =
+            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+        let rootfs_layer_digest = crate::digest::FileDigest::describe(&rootfs_lower)
+            .await
+            .expect("describe rootfs lower");
+        let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
+        let snapshot_id = SnapshotId::generate();
+        manager
+            .publish(
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    ..SnapshotPublishMetadata::mock()
+                },
+                manifest,
+            )
+            .await
+            .expect("publish should commit");
+
+        let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        let manifest_key =
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
+        assert!(p2p
+            .lookup(&vm_state_key)
+            .await
+            .expect("lookup vm state")
+            .is_some());
+        assert!(p2p
+            .lookup(&manifest_key)
+            .await
+            .expect("lookup manifest")
+            .is_some());
+        assert!(p2p
+            .lookup(&rootfs_layer_key)
+            .await
+            .expect("lookup shared rootfs layer")
+            .is_some());
+
+        manager
+            .delete(snapshot_id.to_string())
+            .await
+            .expect("delete should commit");
+
+        assert!(p2p
+            .lookup(&vm_state_key)
+            .await
+            .expect("lookup deleted vm state")
+            .is_none());
+        assert!(p2p
+            .lookup(&manifest_key)
+            .await
+            .expect("lookup deleted manifest")
+            .is_none());
+        assert!(p2p
+            .lookup(&rootfs_layer_key)
+            .await
+            .expect("lookup shared rootfs layer after delete")
             .is_some());
     }
 

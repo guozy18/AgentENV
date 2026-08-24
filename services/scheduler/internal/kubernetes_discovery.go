@@ -124,8 +124,13 @@ func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
 }
 
 func (d *KubernetesDiscovery) Run(ctx context.Context) error {
-	go d.endpointSliceInformer.Run(ctx.Done())
-	go d.podInformer.Run(ctx.Done())
+	// Own the informer lifetime for this discovery attempt.  Cache sync can
+	// time out before the parent context is cancelled; without a child context,
+	// a retry would leave the failed attempt's watches running indefinitely.
+	informerCtx, cancelInformers := context.WithCancel(ctx)
+	defer cancelInformers()
+	go d.endpointSliceInformer.Run(informerCtx.Done())
+	go d.podInformer.Run(informerCtx.Done())
 
 	syncCtx, cancelSync := context.WithTimeout(ctx, kubernetesDiscoveryCacheSyncTimeout)
 	defer cancelSync()

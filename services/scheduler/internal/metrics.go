@@ -109,6 +109,14 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "GetNode"
 	case "UnregisterNode":
 		return "UnregisterNode"
+	case "ListP2pPeers":
+		return "ListP2PPeers"
+	case "RecordP2pArtifact":
+		return "RecordP2PArtifact"
+	case "ForgetP2pArtifact":
+		return "ForgetP2PArtifact"
+	case "LookupP2pArtifact":
+		return "LookupP2PArtifact"
 	default:
 		return ""
 	}

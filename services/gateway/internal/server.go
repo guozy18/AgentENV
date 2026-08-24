@@ -210,6 +210,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
+	} else if isSnapshotPromotionRequest(r) {
+		// Snapshot promotion is a control-plane operation even when callers
+		// include data-plane routing headers. Keep it on the scheduled path so
+		// snapshot placement can bind Local snapshots to their owner node.
+		routeSource = routeSourceSchedule
+	} else if isSnapshotMetadataRequest(r) {
+		// Snapshot metadata is a control-plane API even when callers include
+		// data-plane routing headers. Do not resolve a sandbox owner for it.
+		routeSource = routeSourceSchedule
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -906,7 +915,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		return false
 	}
 
-	return !isSandboxControlPlaneRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
+	return !isSandboxControlPlaneRequest(r) && !isSnapshotPromotionRequest(r) && !isSnapshotMetadataRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

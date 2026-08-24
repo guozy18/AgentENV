@@ -49,6 +49,13 @@ func TestSnapshotRequestOperation(t *testing.T) {
 			wantOperation: snapshotOperationPromote,
 			wantRef:       "team/snap:v1",
 		},
+		{
+			name:          "escaped promotion static segments",
+			method:        http.MethodPost,
+			target:        "/%73napshots/snap-1/%70romote/",
+			wantOperation: snapshotOperationPromote,
+			wantRef:       "snap-1",
+		},
 		{name: "snapshot get", method: http.MethodGet, target: "/snapshots/snap-1", wantOperation: snapshotOperationNone},
 		{name: "snapshot capture", method: http.MethodPost, target: "/sandboxes/sbx-1/snapshots", wantOperation: snapshotOperationNone},
 		{name: "nested promotion path", method: http.MethodPost, target: "/snapshots/a/b/promote", wantOperation: snapshotOperationNone},
@@ -500,6 +507,62 @@ func TestLocalSnapshotPromotionRoutesToOwner(t *testing.T) {
 	}
 	if got := <-ownerPath; got != "/snapshots/snap-1/promote" {
 		t.Fatalf("owner path = %q", got)
+	}
+}
+
+func TestLocalSnapshotPromotionWithProxyHeadersStillRoutesToOwner(t *testing.T) {
+	placementRequests := make(chan struct{}, 1)
+	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != snapshotPlacementPath {
+			t.Errorf("metadata node received unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		placementRequests <- struct{}{}
+		_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
+	}))
+	defer metadataNode.Close()
+
+	ownerPath := make(chan string, 1)
+	ownerNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ownerPath <- r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ownerNode.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL}}, nil
+		},
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			t.Fatal("snapshot promotion must not use sandbox lookup")
+			return nil, nil
+		},
+		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+			if req.GetNodeId() != "node-b" {
+				t.Fatalf("GetNode owner = %q, want node-b", req.GetNodeId())
+			}
+			return observedNodeResponse("node-b", ownerNode.URL, schedulerv1.NodeStatus_NODE_STATUS_READY), nil
+		},
+	}, time.Second, 1024)
+
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/snapshots/snap-1/promote", nil)
+	req.Header.Set(headerAPIKey, testAPIKey)
+	req.Header.Set(headerE2BSandboxID, "sbx-1")
+	req.Header.Set(headerE2BTargetPort, "49983")
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%q", resp.Code, resp.Body.String())
+	}
+	select {
+	case <-placementRequests:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot placement lookup was not attempted")
+	}
+	if got := <-ownerPath; got != "/snapshots/snap-1/promote" {
+		t.Fatalf("owner path = %q, want promotion path", got)
 	}
 }
 
