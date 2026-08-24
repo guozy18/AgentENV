@@ -11,7 +11,7 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
-    UblkDaemonClient, UblkDaemonSpawnConfig,
+    SourceStateStrategy, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -355,12 +355,16 @@ impl UblkDeviceManager {
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+        source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let client = self.require_client()?;
         let mut metric =
             MetricGuard::operation(UBLK_OPERATION_DURATION, "create_runtime_overlaybd");
         let created = client
-            .create_overlaybd_runtime_device(request)
+            .create_overlaybd_runtime_device_with_source_state_strategy(
+                request,
+                source_state_strategy,
+            )
             .await
             .context("create overlaybd runtime device via daemon");
         metric.finish(&created);
@@ -445,6 +449,16 @@ impl UblkDeviceManager {
                 })
             }
         }
+    }
+
+    /// Flush a live OverlayBD image before preserving its mutable upper.
+    pub(crate) async fn sync_for_checkpoint(&self, device: &UblkDevice) -> Result<()> {
+        let client = self.require_client()?;
+        let dev_id = device.dev_id;
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "sync_checkpoint");
+        let result = client.sync_for_checkpoint(dev_id).await;
+        metric.finish(&result);
+        result.with_context(|| format!("sync overlaybd device {dev_id} for checkpoint"))
     }
 
     /// Gracefully shut down the daemon process.

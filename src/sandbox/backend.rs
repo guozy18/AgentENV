@@ -35,6 +35,15 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     /// The orchestrator only carries this value to the image-liveness layer; it
     /// does not interpret the backend-specific artifact identities inside it.
     fn runtime_artifacts(&self) -> RuntimeArtifactSet;
+
+    /// Whether a successfully resumed runtime owns an independent copy of all
+    /// files under the persisted paused artifact root. The conservative
+    /// default keeps those files because legacy snapshot-backed runtimes may
+    /// continue reading them after resume.
+    fn artifacts_are_independent_after_resume(&self) -> bool {
+        false
+    }
+
     /// Effective envd control-plane port persisted with the paused runtime, when available.
     fn control_plane_port(&self) -> Option<u16> {
         None

@@ -39,6 +39,10 @@ pub enum DaemonRequest {
         known_source_virtual_size: Option<u64>,
         #[serde(default)]
         allow_shrink: bool,
+        /// Whether source-owned runtime state is referenced directly or
+        /// adopted into the new runtime directory first.
+        #[serde(default)]
+        source_state_strategy: SourceStateStrategy,
     },
     Delete {
         dev_id: u32,
@@ -46,6 +50,10 @@ pub enum DaemonRequest {
     RestackSnapshot {
         dev_id: u32,
         output_layer_path: PathBuf,
+    },
+    /// Flush a live image while excluding concurrent image I/O.
+    SyncForCheckpoint {
+        dev_id: u32,
     },
     /// Query daemon capabilities (e.g., dynamic resize support).
     GetFeatures,
@@ -76,6 +84,20 @@ pub enum DaemonRequest {
 
 fn default_runtime_upper_mode() -> UpperMode {
     UpperMode::LogStructured
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStateStrategy {
+    /// Preserve the historical behavior: the runtime config directly
+    /// references local state already present in the source config.
+    #[default]
+    Reuse,
+    /// Adopt source-owned local lowers and reflink or copy the source upper
+    /// into the new runtime directory. The source continuation must remain
+    /// quiesced for the entire request; a writable source must already contain
+    /// a valid upper.
+    Clone,
 }
 
 const fn default_resize_timeout_secs() -> u64 {
@@ -310,6 +332,7 @@ mod tests {
             requested_virtual_size: Some(8192),
             known_source_virtual_size: Some(8192),
             allow_shrink: true,
+            source_state_strategy: SourceStateStrategy::Clone,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -323,6 +346,7 @@ mod tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                source_state_strategy,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -332,6 +356,7 @@ mod tests {
                 assert_eq!(requested_virtual_size, Some(8192));
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(allow_shrink);
+                assert_eq!(source_state_strategy, SourceStateStrategy::Clone);
             }
             _ => panic!("unexpected variant"),
         }
@@ -350,8 +375,13 @@ mod tests {
         }"#;
         let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
         match decoded {
-            DaemonRequest::CreateOverlaybdRuntimeDevice { allow_shrink, .. } => {
+            DaemonRequest::CreateOverlaybdRuntimeDevice {
+                allow_shrink,
+                source_state_strategy,
+                ..
+            } => {
                 assert!(!allow_shrink);
+                assert_eq!(source_state_strategy, SourceStateStrategy::Reuse);
             }
             other => panic!("unexpected request: {other:?}"),
         }

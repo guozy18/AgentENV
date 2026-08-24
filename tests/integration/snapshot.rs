@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
-    SandboxLaunchConfig,
+    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerPausedState,
+    FirecrackerSandbox, ProcessOpts, SandboxBackend, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
@@ -68,6 +68,26 @@ async fn assert_guest_path_absent(sandbox: &FirecrackerSandbox, path: &str) -> R
         "guest path {path} unexpectedly exists: {}",
         output.stderr
     );
+    Ok(())
+}
+
+async fn assert_guest_process_env(
+    sandbox: &FirecrackerSandbox,
+    pid: u32,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let expected = format!("{key}={value}");
+    let command = format!(
+        "test -r /proc/{pid}/environ && tr '\\000' '\\n' < /proc/{pid}/environ | grep -Fqx '{expected}'"
+    );
+    let output = sandbox.run_command("sh", &["-c", &command]).await?;
+    if output.exit_code != 0 {
+        bail!(
+            "guest process {pid} lost environment entry {expected}: {}",
+            output.stderr
+        );
+    }
     Ok(())
 }
 
@@ -400,7 +420,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
         children.push(child);
     }
 
-    let paused_original = original.pause().await?;
+    let paused_original = original.capture_immutable_checkpoint().await?;
     original.stop().await?;
 
     // RunnableSnapshot holds the shared repository lease through the
@@ -432,6 +452,121 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     )
     .await?;
     resumed_original.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn temporal_runtime_can_publish_an_independent_reusable_snapshot() -> Result<()> {
+    const TOKEN_ENV: &str = "AGENTENV_TEMPORAL_REUSABLE_TOKEN";
+    const BEFORE_PATH: &str = "/tmp/agentenv-temporal-reusable-before.txt";
+    const AFTER_PATH: &str = "/tmp/agentenv-temporal-reusable-after.txt";
+
+    common::setup().await;
+    let store = tempdir()?;
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+
+    let mut sandbox_config = common::default_sandbox_config()?;
+    sandbox_config.vcpu_count = 1;
+    sandbox_config.mem_size_mib = 128;
+    let mut source = FirecrackerSandbox::new(sandbox_config)?;
+    source.start().await?;
+
+    let alias = unique_alias_for_test("temporal_reusable");
+    let token = format!("token-{alias}");
+    let process = source
+        .start_process(
+            "sleep",
+            &["1000000"],
+            &ProcessOpts::new().with_envs(HashMap::from([(TOKEN_ENV.to_string(), token.clone())])),
+        )
+        .await?;
+    let pid = process.pid();
+    write_guest_file(&source, BEFORE_PATH, "before").await?;
+
+    let artifact_root = store.path().join("temporal-paused-artifacts");
+    let paused_state = SandboxBackend::pause(&mut source, Some(&artifact_root)).await?;
+    let encoded = paused_state.encode()?;
+    source.stop().await?;
+    drop(process);
+    drop(paused_state);
+
+    let decoded = FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
+    let mut source = FirecrackerSandbox::from_snapshot_config(decoded.snapshot_config())?;
+    source.start().await?;
+    drop(decoded);
+    tokio::fs::remove_dir_all(&artifact_root)
+        .await
+        .with_context(|| {
+            format!(
+                "remove consumed temporal artifacts {}",
+                artifact_root.display()
+            )
+        })?;
+
+    write_guest_file(&source, AFTER_PATH, "after").await?;
+    let sync = source.run_command("sync", &[]).await?;
+    if sync.exit_code != 0 {
+        bail!("sync Temporal source files failed: {}", sync.stderr);
+    }
+    let expected_files = HashMap::from([
+        (BEFORE_PATH.to_string(), "before".to_string()),
+        (AFTER_PATH.to_string(), "after".to_string()),
+    ]);
+
+    let captured = SandboxBackend::snapshot(&mut source).await?;
+    let firecracker_capture = captured
+        .downcast_ref::<FirecrackerCapturedSnapshot>()
+        .context("expected Firecracker captured snapshot")?;
+    let memory_image = overlaybd::config::load_image_config(
+        &firecracker_capture.manifest().memory.image_config_path,
+    )?;
+    assert_eq!(
+        memory_image.lowers.len(),
+        1,
+        "capturing a Temporal runtime should seal its complete memory into one immutable lower"
+    );
+    assert!(
+        !overlaybd::config::validate_upper_config(&memory_image.upper)?,
+        "published reusable memory must not retain a writable upper"
+    );
+
+    let source_sandbox_id = SandboxId::new();
+    let snapshot =
+        publish_captured_snapshot_for_test(&snapshot_manager, &alias, source_sandbox_id, captured)
+            .await?;
+
+    assert_guest_process_env(&source, pid, TOKEN_ENV, &token).await?;
+    assert_expected_files(&source, &expected_files).await?;
+
+    let runnable = snapshot_manager.resolve_runnable(snapshot.clone()).await?;
+    let launch_config = SandboxLaunchConfig {
+        sandbox_id: SandboxId::new(),
+        snapshot_id: runnable.record().id.to_string(),
+        env_vars: None,
+        network: None,
+        extra_mmds: serde_json::Map::new(),
+        custom_extension_params: None,
+        envd_access_token: None,
+    };
+    let mut child = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+    child.start().await?;
+    assert_guest_process_env(&child, pid, TOKEN_ENV, &token).await?;
+    let drop_caches = child
+        .run_command("sh", &["-c", "sync && echo 3 > /proc/sys/vm/drop_caches"])
+        .await?;
+    if drop_caches.exit_code != 0 {
+        bail!(
+            "drop child page cache before reusable snapshot verification failed: {}",
+            drop_caches.stderr
+        );
+    }
+    assert_expected_files(&child, &expected_files).await?;
+
+    child.stop().await?;
+    source.stop().await?;
+    drop(runnable);
+    drop(snapshot);
+    snapshot_manager.delete(&alias).await?;
     Ok(())
 }
 
@@ -612,7 +747,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     let ScenarioSandboxRuntime::Running(mut sandbox) = scenario.runtime else {
                         unreachable!("candidate must be running");
                     };
-                    let paused = sandbox.pause().await?;
+                    let paused = sandbox.capture_immutable_checkpoint().await?;
                     sandbox.stop().await?;
                     if scenario.captures > 0 {
                         scenario.ever_paused_after_capture = true;

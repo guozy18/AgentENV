@@ -10,6 +10,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -393,6 +394,20 @@ impl UblkDaemonClient {
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
     ) -> Result<OverlaybdRuntimeDevice> {
+        self.create_overlaybd_runtime_device_with_source_state_strategy(
+            request,
+            SourceStateStrategy::Reuse,
+        )
+        .await
+    }
+
+    /// Create an OverlayBD runtime while explicitly choosing whether
+    /// source-owned lowers and a writable upper are reused or adopted.
+    pub async fn create_overlaybd_runtime_device_with_source_state_strategy(
+        &self,
+        request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+        source_state_strategy: SourceStateStrategy,
+    ) -> Result<OverlaybdRuntimeDevice> {
         let request = DaemonRequest::CreateOverlaybdRuntimeDevice {
             source_image_config: request.source_image_config.to_path_buf(),
             global_config: request.global_config.to_path_buf(),
@@ -402,6 +417,7 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
+            source_state_strategy,
         };
         match self
             .call(request, self.inner.runtime_device_timeout)
@@ -483,6 +499,21 @@ impl UblkDaemonClient {
                 bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for restack snapshot: {other:?}"),
+        }
+    }
+
+    /// Flush a live image after its owning VM has stopped issuing I/O.
+    pub async fn sync_for_checkpoint(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::SyncForCheckpoint { dev_id };
+        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: checkpoint sync dev_id={dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: checkpoint sync dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for checkpoint sync: {other:?}"),
         }
     }
 

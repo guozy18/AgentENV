@@ -458,7 +458,7 @@ mod tests {
 
     fn paused_state(root: &Path) -> Arc<dyn PausedSandboxState> {
         std::fs::create_dir_all(root).expect("create test artifact root");
-        Arc::new(MockSnapshot)
+        Arc::new(MockSnapshot::default())
     }
 
     fn test_persister(root: &Path) -> FileBackedSandboxPersister {

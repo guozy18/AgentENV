@@ -157,7 +157,7 @@ let output = sandbox.run_command("echo", &["hello"]).await?;
 assert_eq!(output.exit_code, 0);
 println!("{}", output.stdout);
 
-let snapshot = sandbox.pause().await?;
+let snapshot = sandbox.capture_immutable_checkpoint().await?;
 sandbox.stop().await?;
 
 let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
@@ -385,7 +385,7 @@ sandbox.start().await?;
 let output = sandbox.run_command("echo", &["hello"]).await?;
 assert_eq!(output.exit_code, 0);
 
-let snapshot = sandbox.pause().await?;
+let snapshot = sandbox.capture_immutable_checkpoint().await?;
 sandbox.stop().await?;
 
 let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
@@ -432,7 +432,7 @@ resumed_sandbox.stop().await?;
   - Creating a snapshot, resuming, creating a second snapshot.
   - Dropping the first snapshot handle.
   - Resuming from the second snapshot and verifying disk state.
-  - Also tests `pause_to_dir` with snapshot-owned inherited layer adoption.
+  - Also tests `capture_immutable_checkpoint_to_dir` with snapshot-owned inherited layer adoption.
 
 - `microvm_can_access_internet`
   Confirms guest networking works before and after snapshot resume.

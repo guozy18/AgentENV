@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
-    UblkDaemonClient,
+    SourceStateStrategy, UblkDaemonClient,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -345,6 +345,7 @@ mod client_tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                source_state_strategy,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -354,9 +355,13 @@ mod client_tests {
                 assert_eq!(requested_virtual_size, None);
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(!allow_shrink);
+                let dev_id = match source_state_strategy {
+                    SourceStateStrategy::Reuse => 11,
+                    SourceStateStrategy::Clone => 12,
+                };
                 DaemonResponse::OverlaybdRuntimeDeviceCreated {
-                    dev_id: 11,
-                    device_path: PathBuf::from("/dev/ublkb11"),
+                    dev_id,
+                    device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
                     actual_virtual_size: 8192,
                     runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
                 }
@@ -368,17 +373,18 @@ mod client_tests {
         .await;
 
         let client = server.client();
+        let request = || CreateOverlaybdRuntimeDeviceRequest {
+            source_image_config: Path::new("/src/image.json"),
+            global_config: Path::new("/global.json"),
+            runtime_dir: Path::new("/work/overlaybd"),
+            read_only: false,
+            runtime_upper_mode: UpperMode::Sparse,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(8192),
+            allow_shrink: false,
+        };
         let device = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::Sparse,
-                requested_virtual_size: None,
-                known_source_virtual_size: Some(8192),
-                allow_shrink: false,
-            })
+            .create_overlaybd_runtime_device(request())
             .await
             .unwrap();
         assert_eq!(device.dev_id, 11);
@@ -388,6 +394,16 @@ mod client_tests {
             device.runtime_image_config_path,
             PathBuf::from("/work/overlaybd/image.json")
         );
+
+        let cloned = client
+            .create_overlaybd_runtime_device_with_source_state_strategy(
+                request(),
+                SourceStateStrategy::Clone,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cloned.dev_id, 12);
+        assert_eq!(cloned.device_path, PathBuf::from("/dev/ublkb12"));
     }
 
     #[tokio::test]
@@ -710,6 +726,7 @@ mod client_tests {
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
+                DaemonRequest::SyncForCheckpoint { .. } => DaemonResponse::Ok,
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -742,8 +759,9 @@ mod client_tests {
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
+        client.sync_for_checkpoint(17).await.unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -755,6 +773,9 @@ mod client_tests {
 
         assert!(requests[2].contains("RestackSnapshot"));
         assert!(requests[2].contains("40"));
+
+        assert!(requests[3].contains("SyncForCheckpoint"));
+        assert!(requests[3].contains("17"));
         assert!(requests[2].contains("output"));
     }
 }

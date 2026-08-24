@@ -231,7 +231,8 @@ fn bench_snapshot_creation_inner(
                 prepare(&rt, &sandbox).unwrap();
 
                 let start = std::time::Instant::now();
-                let _snapshot = rt.block_on(async { sandbox.pause().await.unwrap() });
+                let _snapshot =
+                    rt.block_on(async { sandbox.capture_immutable_checkpoint().await.unwrap() });
                 total += start.elapsed();
 
                 rt.block_on(async {
@@ -266,7 +267,7 @@ fn bench_snapshot_creation_1gmem(c: &mut Criterion) {
 
 async fn prepare_snapshot() -> Result<agentenv::sandbox::FirecrackerSnapshotConfig> {
     let mut sandbox = setup_sandbox().await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     sandbox.stop().await?;
     Ok(snapshot)
 }
@@ -459,7 +460,7 @@ fn default_snapshot_creation_inner(
         prepare(rt, &sandbox)?;
 
         let start = std::time::Instant::now();
-        rt.block_on(async { sandbox.pause().await })?;
+        rt.block_on(async { sandbox.capture_immutable_checkpoint().await })?;
         samples.push(start.elapsed());
 
         rt.block_on(async {
