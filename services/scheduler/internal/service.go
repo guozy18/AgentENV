@@ -18,14 +18,14 @@ import (
 type Service struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger        *zap.Logger
-	nodes         NodeRegistry
+	nodes         *AtomicNodeRegistry
 	strategy      Strategy
 	store         BindingStore
-	artifacts     ArtifactStore
+	artifacts     *InMemoryArtifactStore
 	resourceLimit *config.NodeResourceLimit
 }
 
-func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
+func NewService(logger *zap.Logger, nodes *AtomicNodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -55,7 +55,7 @@ func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {
 	}
 }
 
-func WithArtifactStore(store ArtifactStore) ServiceOption {
+func WithArtifactStore(store *InMemoryArtifactStore) ServiceOption {
 	return func(s *Service) {
 		s.artifacts = store
 	}
@@ -181,7 +181,8 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 	if strings.TrimSpace(node.ID) == "" || strings.TrimSpace(node.Endpoint) == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and endpoint are required")
 	}
-	if !s.isKnownNode(node) {
+	knownNode, known := s.nodes.Resolve(node.ID)
+	if !known || knownNode.Endpoint != node.Endpoint {
 		s.logger.Warn("scheduler rejected assignment for unknown node",
 			zap.String("sandbox_id", req.GetSandboxId()),
 			zap.String("node_id", node.ID),
@@ -220,6 +221,20 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 				zap.String("node_id", nodeID),
 			)
 			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+		}
+		if errors.Is(err, ErrStaleServiceInstance) {
+			s.logger.Warn("scheduler rejected stale service instance heartbeat",
+				zap.String("node_id", nodeID),
+				zap.String("service_instance_id", serviceInstanceID),
+			)
+			return nil, status.Error(codes.FailedPrecondition, "stale service instance")
+		}
+		if errors.Is(err, ErrServiceInstanceMismatch) {
+			s.logger.Warn("scheduler rejected heartbeat for unexpected discovered service instance",
+				zap.String("node_id", nodeID),
+				zap.String("service_instance_id", serviceInstanceID),
+			)
+			return nil, status.Error(codes.FailedPrecondition, "service instance mismatch")
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
@@ -370,8 +385,4 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	s.artifacts.ForgetNode(nodeID)
 
 	return &schedulerv1.UnregisterNodeResponse{}, nil
-}
-
-func (s *Service) isKnownNode(node Node) bool {
-	return s.nodes.Contains(node)
 }

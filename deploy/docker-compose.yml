@@ -17,7 +17,8 @@ x-agentenv-base: &agentenv-base
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
     # Runtime assets are baked into the image by `server --setup-only`; compose
-    # persists committed snapshots and deployment secrets across restarts.
+    # persists canonical metadata/artifacts and deployment secrets across
+    # restarts. Each runtime node adds its own node-local closure volume below.
     - agentenv-snapshot-store:/workspace/env/snapshot-store
     - agentenv-auth:/workspace/env/secrets
   devices:
@@ -92,6 +93,13 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-a
+    # Keep node-local snapshot closures physically isolated per owner node;
+    # only the canonical snapshot store above is shared by the cluster.
+    volumes:
+      - /dev:/dev
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+      - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-snapshot-local-store-a:/workspace/env/snapshot-local-store
 
   agentenv-b:
     <<: *agentenv-base
@@ -99,7 +107,16 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-b
+    # Keep node-local snapshot closures physically isolated per owner node;
+    # only the canonical snapshot store above is shared by the cluster.
+    volumes:
+      - /dev:/dev
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+      - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-snapshot-local-store-b:/workspace/env/snapshot-local-store
 
 volumes:
   agentenv-auth:
   agentenv-snapshot-store:
+  agentenv-snapshot-local-store-a:
+  agentenv-snapshot-local-store-b:

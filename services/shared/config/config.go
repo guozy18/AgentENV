@@ -120,14 +120,14 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
-		d, err := parseSchedulerDuration(parsed.ReportTTL, "scheduler.report_ttl")
+		d, err := parseDuration(parsed.ReportTTL, "scheduler.report_ttl")
 		if err != nil {
 			return err
 		}
 		s.ReportTTL = d
 	}
 	if len(bytes.TrimSpace(parsed.BindingTTL)) > 0 {
-		d, err := parseSchedulerDuration(parsed.BindingTTL, "scheduler.binding_ttl")
+		d, err := parseDuration(parsed.BindingTTL, "scheduler.binding_ttl")
 		if err != nil {
 			return err
 		}
@@ -137,7 +137,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, error) {
+func parseDuration(raw json.RawMessage, field string) (time.Duration, error) {
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
 		d, parseErr := time.ParseDuration(strings.TrimSpace(asString))
@@ -208,7 +208,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 
 	if len(bytes.TrimSpace(parsed.RequestTimeout)) > 0 {
-		d, err := parseGatewayRequestTimeout(parsed.RequestTimeout)
+		d, err := parseDuration(parsed.RequestTimeout, "gateway.request_timeout")
 		if err != nil {
 			return err
 		}
@@ -216,24 +216,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
-}
-
-func parseGatewayRequestTimeout(raw json.RawMessage) (time.Duration, error) {
-	var asString string
-	if err := json.Unmarshal(raw, &asString); err == nil {
-		d, parseErr := time.ParseDuration(strings.TrimSpace(asString))
-		if parseErr != nil {
-			return 0, fmt.Errorf("gateway.request_timeout must be a duration string like \"30s\": %w", parseErr)
-		}
-		return d, nil
-	}
-
-	var asNumber json.Number
-	if err := json.Unmarshal(raw, &asNumber); err == nil {
-		return 0, fmt.Errorf("gateway.request_timeout must be a duration string like \"30s\", got numeric value %s", asNumber.String())
-	}
-
-	return 0, errors.New("gateway.request_timeout must be a duration string like \"30s\"")
 }
 
 type Config struct {

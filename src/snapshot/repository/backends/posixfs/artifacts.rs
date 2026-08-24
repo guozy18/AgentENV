@@ -1,13 +1,13 @@
 use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use overlaybd::dense_export;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
+use super::super::common::{overlaybd_layer_uuid, write_dense_overlaybd_layer_to_file_blocking};
 use super::layout::PosixFsSnapshotArtifactLayout;
+use super::{persist_atomic_file, sync_dir};
 use crate::digest::{self, FileDigest};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::{
@@ -16,6 +16,7 @@ use crate::snapshot::{
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
+#[derive(Clone)]
 pub struct PosixFsArtifactStore {
     root: PathBuf,
 }
@@ -23,10 +24,6 @@ pub struct PosixFsArtifactStore {
 impl PosixFsArtifactStore {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self { root }
-    }
-
-    fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
-        PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -46,7 +43,7 @@ impl PosixFsArtifactStore {
         snapshot_id: &SnapshotId,
         manifest: &FirecrackerSnapshotManifest,
     ) -> RepositoryResult<CollectedBuiltArtifacts> {
-        let committed_layout = self.committed_layout(snapshot_id);
+        let committed_layout = PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id);
 
         self.copy_local_artifact(
             committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
@@ -71,13 +68,10 @@ impl PosixFsArtifactStore {
                     layers: rootfs_layers,
                     read_only: drive.read_only,
                     virtual_size: drive.virtual_size,
-                    mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                    mount_path: crate::sandbox::normalize_mount_path_or_default(
                         &drive.drive_id,
                         drive.mount_path.clone(),
-                    )
-                    .unwrap_or_else(|_| {
-                        crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                    }),
+                    ),
                     sub_path: drive.sub_path.clone(),
                 })
             })
@@ -107,12 +101,41 @@ impl PosixFsArtifactStore {
         }
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|error| RepositoryError::backend("serialize firecracker manifest", error))?;
-        fs::write(&destination, bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write firecracker manifest '{}'", destination.display()),
-                error,
-            )
-        })?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve parent dir for firecracker manifest '{}'",
+                    destination.display()
+                ),
+                source: None,
+            })?;
+        match fs::read(&destination) {
+            Ok(existing) if existing == bytes => {
+                // Retrying a rename whose directory sync failed should repair
+                // that durability boundary without replacing immutable data.
+                sync_dir(parent)?;
+                return Ok(());
+            }
+            Ok(existing) => {
+                return Err(RepositoryError::IntegrityMismatch {
+                    artifact: format!(
+                        "committed firecracker manifest at '{}'",
+                        destination.display()
+                    ),
+                    expected: digest::sha256_digest(&existing),
+                    actual: digest::sha256_digest(&bytes),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read firecracker manifest '{}'", destination.display()),
+                    error,
+                ));
+            }
+        }
+        persist_atomic_file(parent, &destination, &bytes, "firecracker manifest")?;
         Ok(())
     }
 
@@ -136,9 +159,46 @@ impl PosixFsArtifactStore {
         fs::create_dir_all(parent).map_err(|error| {
             RepositoryError::backend(format!("create artifact dir '{}'", parent.display()), error)
         })?;
-        if !same_file(&source_metadata, &destination)? {
-            hard_link_or_copy_file_with_sha256(source, &destination)?;
-            sync_dir(parent)?;
+        match fs::metadata(&destination) {
+            Ok(destination_metadata) => {
+                let same_inode = source_metadata.dev() == destination_metadata.dev()
+                    && source_metadata.ino() == destination_metadata.ino();
+                if !same_inode {
+                    let expected =
+                        FileDigest::describe_blocking(&destination).map_err(|error| {
+                            RepositoryError::backend(
+                                format!("describe committed artifact '{}'", destination.display()),
+                                error,
+                            )
+                        })?;
+                    let actual = FileDigest::describe_blocking(source).map_err(|error| {
+                        RepositoryError::backend(
+                            format!("describe retry artifact '{}'", source.display()),
+                            error,
+                        )
+                    })?;
+                    if expected != actual {
+                        return Err(RepositoryError::IntegrityMismatch {
+                            artifact: format!("committed artifact at '{}'", destination.display()),
+                            expected: format!("{} ({} bytes)", expected.sha256, expected.size),
+                            actual: format!("{} ({} bytes)", actual.sha256, actual.size),
+                        });
+                    }
+                }
+                // The prior copy may have reached rename/link but failed its
+                // directory sync. Re-sync while preserving the existing name.
+                sync_dir(parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hard_link_or_copy_file_with_sha256(source, &destination)?;
+                sync_dir(parent)?;
+            }
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read artifact metadata '{}'", destination.display()),
+                    error,
+                ));
+            }
         }
         let destination_metadata = fs::metadata(&destination).map_err(|error| {
             RepositoryError::backend(
@@ -302,6 +362,10 @@ impl PosixFsArtifactStore {
                 ));
             }
         }
+        // The dense file is fsynced before rename; sync the containing
+        // directory as well so the immutable managed-layer name survives a
+        // crash before the catalog record is published.
+        sync_dir(&destination_parent)?;
 
         Ok(crate::snapshot::ManagedLayer {
             digest: descriptor.digest,
@@ -510,38 +574,51 @@ impl PosixFsArtifactStore {
     }
 }
 
-fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
-    read_overlaybd_layer_uuid(source)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
-}
-
-fn same_file(source_metadata: &fs::Metadata, destination: &Path) -> RepositoryResult<bool> {
-    match fs::metadata(destination) {
-        Ok(destination_metadata) => Ok(source_metadata.dev() == destination_metadata.dev()
-            && source_metadata.ino() == destination_metadata.ino()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(RepositoryError::backend(
-            format!(
-                "read destination artifact metadata '{}'",
-                destination.display()
-            ),
-            error,
-        )),
-    }
-}
-
 fn hard_link_or_copy_file_with_sha256(source: &Path, destination: &Path) -> RepositoryResult<()> {
     match fs::hard_link(source, destination) {
         Ok(()) => {
             finalize_hard_linked_file(destination)?;
             return Ok(());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(RepositoryError::backend(
+                format!(
+                    "refuse to replace existing committed artifact '{}'",
+                    destination.display()
+                ),
+                error,
+            ));
+        }
         Err(_) => {}
     }
-    copy_file_with_sha256(source, destination)
+    let parent = destination
+        .parent()
+        .ok_or_else(|| RepositoryError::Backend {
+            message: format!(
+                "resolve parent dir for artifact '{}'",
+                destination.display()
+            ),
+            source: None,
+        })?;
+    let temp = NamedTempFile::new_in(parent).map_err(|error| {
+        RepositoryError::backend(
+            format!("create temp artifact next to '{}'", destination.display()),
+            error,
+        )
+    })?;
+    copy_file_with_sha256(source, temp.path())?;
+    let temp_path = temp.path().to_path_buf();
+    temp.persist_noclobber(destination).map_err(|error| {
+        RepositoryError::backend(
+            format!(
+                "persist artifact temp '{}' -> '{}'",
+                temp_path.display(),
+                destination.display()
+            ),
+            error.error,
+        )
+    })?;
+    Ok(())
 }
 
 fn hard_link_or_copy_managed_layer(
@@ -609,14 +686,6 @@ fn finalize_hard_linked_file(path: &Path) -> RepositoryResult<()> {
         .map_err(|error| {
             RepositoryError::backend(format!("sync hard-linked file '{}'", path.display()), error)
         })?;
-    Ok(())
-}
-
-fn sync_dir(path: &Path) -> RepositoryResult<()> {
-    fs::File::open(path)
-        .map_err(|error| RepositoryError::backend(format!("open '{}'", path.display()), error))?
-        .sync_all()
-        .map_err(|error| RepositoryError::backend(format!("sync '{}'", path.display()), error))?;
     Ok(())
 }
 
@@ -716,7 +785,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::layout::{managed_layer_file_name, PosixFsSnapshotArtifactLayout};
-    use super::PosixFsArtifactStore;
+    use super::{hard_link_or_copy_file_with_sha256, PosixFsArtifactStore};
     use crate::digest::FileDigest;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
@@ -922,6 +991,23 @@ mod tests {
                 .path()
                 .join("managed-layers")
                 .join(managed_layer_file_name(&built.memory_layers[0].digest)),
+        );
+    }
+
+    #[test]
+    fn fixed_artifact_copy_refuses_to_replace_an_existing_name() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let source = tempdir.path().join("source");
+        let destination = tempdir.path().join("destination");
+        fs::write(&source, b"new bytes").expect("source should write");
+        fs::write(&destination, b"committed bytes").expect("destination should write");
+
+        hard_link_or_copy_file_with_sha256(&source, &destination)
+            .expect_err("fixed artifact copy must not replace an existing destination");
+
+        assert_eq!(
+            fs::read(destination).expect("destination should remain readable"),
+            b"committed bytes"
         );
     }
 

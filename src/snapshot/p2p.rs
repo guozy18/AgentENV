@@ -11,9 +11,7 @@ use uuid::Uuid;
 use bytes::Bytes;
 
 use crate::overlaybd::{layer_key_from_digest, layer_key_from_uuid, LayerMetadata};
-use crate::p2p::{
-    P2pArtifactKey, P2pPublishMode, P2pPublishRequest, P2pPublishSource, P2pTransport,
-};
+use crate::p2p::{P2pArtifactKey, P2pPublishRequest, P2pPublishSource, P2pTransport};
 use crate::snapshot::SnapshotId;
 
 const SNAPSHOT_P2P_KEY_PREFIX: &str = "snapshot/v1";
@@ -22,23 +20,32 @@ const SNAPSHOT_P2P_KEY_PREFIX: &str = "snapshot/v1";
 pub(crate) struct SnapshotP2pArtifact {
     pub(crate) key: P2pArtifactKey,
     pub(crate) source: P2pPublishSource,
-    publish_mode: P2pPublishMode,
     metadata: serde_json::Value,
 }
 
 impl SnapshotP2pArtifact {
+    fn from_parts(
+        key: P2pArtifactKey,
+        source: P2pPublishSource,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            key,
+            source,
+            metadata,
+        }
+    }
+
     pub(crate) fn fixed(
         snapshot_id: &SnapshotId,
         name: impl AsRef<str>,
         source: impl Into<PathBuf>,
     ) -> Self {
-        let source = source.into();
-        Self {
-            key: fixed_artifact_key(snapshot_id, name),
-            source: P2pPublishSource::Path(source),
-            publish_mode: P2pPublishMode::Copy,
-            metadata: serde_json::Value::Null,
-        }
+        Self::from_parts(
+            fixed_artifact_key(snapshot_id, name),
+            P2pPublishSource::Path(source.into()),
+            serde_json::Value::Null,
+        )
     }
 
     pub(crate) fn bytes(
@@ -46,12 +53,11 @@ impl SnapshotP2pArtifact {
         name: impl AsRef<str>,
         source: impl Into<Bytes>,
     ) -> Self {
-        Self {
-            key: fixed_artifact_key(snapshot_id, name),
-            source: P2pPublishSource::Bytes(source.into()),
-            publish_mode: P2pPublishMode::Copy,
-            metadata: serde_json::Value::Null,
-        }
+        Self::from_parts(
+            fixed_artifact_key(snapshot_id, name),
+            P2pPublishSource::Bytes(source.into()),
+            serde_json::Value::Null,
+        )
     }
 
     pub(crate) fn content_addressed_overlaybd_layer(
@@ -62,23 +68,13 @@ impl SnapshotP2pArtifact {
         let sha256 = sha256.into();
         let key = layer_key_from_digest(&sha256);
         let metadata = LayerMetadata::from_digest(sha256, Some(size), None).to_value();
-        Self {
-            key,
-            source: P2pPublishSource::Path(source.into()),
-            publish_mode: P2pPublishMode::Copy,
-            metadata,
-        }
+        Self::from_parts(key, P2pPublishSource::Path(source.into()), metadata)
     }
 
     pub(crate) fn uuid_overlaybd_layer(source: impl Into<PathBuf>, uuid: Uuid, size: u64) -> Self {
         let key = layer_key_from_uuid(&uuid);
         let metadata = LayerMetadata::from_uuid(uuid, Some(size)).to_value();
-        Self {
-            key,
-            source: P2pPublishSource::Path(source.into()),
-            publish_mode: P2pPublishMode::Copy,
-            metadata,
-        }
+        Self::from_parts(key, P2pPublishSource::Path(source.into()), metadata)
     }
 
     pub(crate) fn local_overlaybd_layers(
@@ -166,7 +162,6 @@ impl SnapshotP2pArtifact {
         let request = match &self.source {
             P2pPublishSource::Path(source) => {
                 P2pPublishRequest::file(self.key.clone(), source.clone())
-                    .with_publish_mode(self.publish_mode)
             }
             P2pPublishSource::Bytes(bytes) => {
                 P2pPublishRequest::bytes(self.key.clone(), bytes.clone())
@@ -284,7 +279,6 @@ mod tests {
             SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &HashSet::new());
 
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].publish_mode, P2pPublishMode::Copy);
         assert_eq!(
             artifacts[0].key,
             "overlaybd-layer/v1/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

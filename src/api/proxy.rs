@@ -304,17 +304,17 @@ async fn proxy_request(
 ) -> Response<Body> {
     let is_websocket_request = is_websocket_upgrade_request(request.headers());
     let (parts, body) = request.into_parts();
-    let resolved =
+    let (resolved, proxy_gate) =
         match resolve_proxy_request(api_impl, &forward_path, &parts, is_websocket_request).await {
             Ok(resolved) => resolved,
             Err(error) => return proxy_error_response(&error),
         };
 
     if is_websocket_request {
-        return proxy_websocket_request(websocket_upgrade, parts, resolved).await;
+        return proxy_websocket_request(websocket_upgrade, parts, resolved, proxy_gate).await;
     }
 
-    proxy_http_request(api_impl, parts, body, resolved).await
+    proxy_http_request(api_impl, parts, body, resolved, proxy_gate).await
 }
 
 fn strip_proxy_prefix(path: &str) -> &str {
@@ -419,6 +419,7 @@ async fn proxy_http_request(
     mut parts: http::request::Parts,
     body: Body,
     resolved: ResolvedProxyRequest,
+    proxy_gate: tokio::sync::OwnedRwLockReadGuard<()>,
 ) -> Response<Body> {
     let ResolvedProxyRequest {
         sandbox_id,
@@ -512,7 +513,7 @@ async fn proxy_http_request(
         }
     };
 
-    map_upstream_response(upstream_response)
+    map_upstream_response(upstream_response, proxy_gate)
 }
 
 fn track_request_body_activity(body: Body) -> (Body, watch::Receiver<()>) {
@@ -594,6 +595,7 @@ async fn proxy_websocket_request(
     websocket_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     mut parts: http::request::Parts,
     resolved: ResolvedProxyRequest,
+    proxy_gate: tokio::sync::OwnedRwLockReadGuard<()>,
 ) -> Response<Body> {
     let websocket_upgrade = match websocket_upgrade {
         Ok(websocket_upgrade) => websocket_upgrade,
@@ -684,6 +686,7 @@ async fn proxy_websocket_request(
     remove_hop_by_hop_headers(&mut upstream_headers);
 
     let mut response = websocket_upgrade.on_upgrade(move |socket| async move {
+        let _proxy_gate = proxy_gate;
         bridge_websocket_streams(socket, upstream_websocket, sandbox_id_for_bridge).await;
     });
 
@@ -714,9 +717,23 @@ async fn resolve_proxy_request(
     proxy_path: &str,
     parts: &http::request::Parts,
     is_websocket_request: bool,
-) -> Result<ResolvedProxyRequest, ProxyRequestError> {
+) -> Result<(ResolvedProxyRequest, tokio::sync::OwnedRwLockReadGuard<()>), ProxyRequestError> {
     let sandbox_id = parse_sandbox_id_header(&parts.headers)?;
     let target_port = parse_target_port_header(&parts.headers)?;
+    let proxy_gate = match api_impl
+        .orchestrator()
+        .acquire_proxy_read(&sandbox_id)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(OrchestratorError::SandboxNotFound(_)) => {
+            return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
+        }
+        Err(error) => {
+            warn!(sandbox_id = %sandbox_id, %error, "failed to acquire sandbox proxy gate");
+            return Err(ProxyRequestError::InternalServerError);
+        }
+    };
 
     let mut auto_resume_attempted = false;
     let target = loop {
@@ -775,11 +792,14 @@ async fn resolve_proxy_request(
     }
     .map_err(|_| ProxyRequestError::InvalidUpstreamUri)?;
 
-    Ok(ResolvedProxyRequest {
-        sandbox_id,
-        upstream_uri,
-        original_host: parts.headers.get(header::HOST).cloned(),
-    })
+    Ok((
+        ResolvedProxyRequest {
+            sandbox_id,
+            upstream_uri,
+            original_host: parts.headers.get(header::HOST).cloned(),
+        },
+        proxy_gate,
+    ))
 }
 
 async fn try_auto_resume(
@@ -1085,12 +1105,21 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
-fn map_upstream_response(response: Response<Incoming>) -> Response<Body> {
+fn map_upstream_response(
+    response: Response<Incoming>,
+    proxy_gate: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     // Mirror the request-side filtering on the way back so connection-scoped
     // headers from the upstream do not leak through this proxy hop.
     remove_hop_by_hop_headers(&mut parts.headers);
-    Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
+    let body = body.map_err(axum::Error::new).map_frame(move |frame| {
+        // Capture the owned gate in the body stream so long-lived streaming
+        // requests keep the read side until the forwarded response closes.
+        let _keep_gate = &proxy_gate;
+        frame
+    });
+    Response::from_parts(parts, Body::new(body))
 }
 
 async fn bridge_websocket_streams(
@@ -1881,6 +1910,16 @@ mod tests {
         assert_ne!(
             get_status(&app, "/metrics", &[]).await,
             StatusCode::UNAUTHORIZED
+        );
+
+        let placement_path = "/internal/snapshots/placement";
+        assert_eq!(
+            get_status(&app, placement_path, &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(&app, placement_path, &[(API_KEY_HEADER, TEST_API_KEY)]).await,
+            StatusCode::BAD_REQUEST
         );
 
         let sandbox_id = SandboxId::new().to_string();

@@ -19,7 +19,8 @@ use crate::orchestrator::{
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    CommandContext, RepositoryError, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotType,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -32,6 +33,14 @@ use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
+}
+
+fn reusable_snapshot_launch_error_response(error: models::Error) -> SandboxesPostResponse {
+    match error.code {
+        400 => SandboxesPostResponse::Status400_BadRequest(error),
+        503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
+        _ => SandboxesPostResponse::Status500_ServerError(error),
+    }
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -76,12 +85,20 @@ impl From<OrchestratorError> for models::Error {
 impl From<SandboxState> for models::SandboxState {
     fn from(state: SandboxState) -> Self {
         match state {
-            SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Snapshotting
-            | SandboxState::Forking => Self::Paused,
+            SandboxState::Pausing | SandboxState::Paused => Self::Paused,
             _ => Self::Running,
         }
+    }
+}
+
+fn internal_states_for_api_state(state: models::SandboxState) -> Vec<SandboxState> {
+    match state {
+        models::SandboxState::Running => vec![
+            SandboxState::Running,
+            SandboxState::Snapshotting,
+            SandboxState::Forking,
+        ],
+        models::SandboxState::Paused => vec![SandboxState::Pausing, SandboxState::Paused],
     }
 }
 
@@ -593,7 +610,7 @@ impl Sandboxes<()> for ApiImpl {
         query_params: &models::SandboxesGetQueryParams,
     ) -> Result<SandboxesGetResponse, ()> {
         let filter = SandboxListFilter {
-            states: Some(vec![SandboxState::Running]),
+            states: Some(internal_states_for_api_state(models::SandboxState::Running)),
             excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
         };
@@ -635,9 +652,8 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(err) => {
                 warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(reusable_snapshot_launch_error_response(error));
             }
         };
 
@@ -1145,6 +1161,14 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
+        let snapshot_type = match body
+            .snapshot_type
+            .unwrap_or(models::SnapshotType::Distributed)
+        {
+            models::SnapshotType::Local => SnapshotType::Local,
+            models::SnapshotType::Distributed => SnapshotType::Distributed,
+        };
+
         let capture = match timer
             .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
             .await
@@ -1178,6 +1202,8 @@ impl Sandboxes<()> for ApiImpl {
                 self.snapshot_manager.publish_captured(
                     SnapshotPublishMetadata {
                         id: SnapshotId::generate(),
+                        snapshot_type,
+                        owner_node_id: None,
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),
@@ -1197,16 +1223,26 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                let error =
+                let error = if matches!(
+                    err,
+                    RepositoryError::Backend { .. }
+                        | RepositoryError::Unavailable { .. }
+                        | RepositoryError::ConcurrentModification { .. }
+                ) {
+                    Self::reusable_snapshot_error(&err)
+                } else {
                     Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
                         warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
                         Self::error(500, err.to_string())
-                    });
-                return Ok(Self::client_or_server_response(
-                    error,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
-                ));
+                    })
+                };
+                return Ok(match error.code {
+                    400 => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                    503 => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status503_ServiceUnavailable(error)
+                    }
+                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                });
             }
         };
 
@@ -1349,10 +1385,7 @@ impl Sandboxes<()> for ApiImpl {
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, ()> {
         let states = if query_params.state.len() == 1 {
-            Some(vec![match query_params.state[0] {
-                models::SandboxState::Running => SandboxState::Running,
-                models::SandboxState::Paused => SandboxState::Paused,
-            }])
+            Some(internal_states_for_api_state(query_params.state[0]))
         } else {
             // Only two states are supported. If multiple states are provided,
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
@@ -1418,6 +1451,66 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_transitions_do_not_report_the_sandbox_as_paused() {
+        for (internal, api) in [
+            (SandboxState::Snapshotting, models::SandboxState::Running),
+            (SandboxState::Forking, models::SandboxState::Running),
+            (SandboxState::Pausing, models::SandboxState::Paused),
+        ] {
+            assert_eq!(models::SandboxState::from(internal), api);
+        }
+
+        assert_eq!(
+            internal_states_for_api_state(models::SandboxState::Running),
+            vec![
+                SandboxState::Running,
+                SandboxState::Snapshotting,
+                SandboxState::Forking,
+            ]
+        );
+        assert_eq!(
+            internal_states_for_api_state(models::SandboxState::Paused),
+            vec![SandboxState::Pausing, SandboxState::Paused]
+        );
+    }
+
+    #[test]
+    fn reusable_snapshot_request_rejects_temporal_type() {
+        let request = serde_json::from_value::<models::SandboxSnapshotRequest>(
+            serde_json::json!({ "snapshotType": "temporal" }),
+        );
+
+        assert!(request.is_err());
+    }
+
+    #[test]
+    fn reusable_snapshot_request_omission_keeps_distributed_default() {
+        let request =
+            serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({}))
+                .expect("request should deserialize");
+
+        assert_eq!(
+            request
+                .snapshot_type
+                .unwrap_or(models::SnapshotType::Distributed),
+            models::SnapshotType::Distributed
+        );
+    }
+
+    #[test]
+    fn reusable_snapshot_launch_invalid_reference_is_a_bad_request() {
+        let error =
+            ApiImpl::reusable_snapshot_error(&crate::snapshot::RepositoryError::InvalidRequest {
+                reason: "invalid snapshot alias".to_string(),
+            });
+
+        assert!(matches!(
+            reusable_snapshot_launch_error_response(error),
+            SandboxesPostResponse::Status400_BadRequest(error) if error.code == 400
+        ));
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

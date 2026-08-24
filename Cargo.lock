@@ -200,6 +200,7 @@ dependencies = [
  "agentenv",
  "agentenv-test-support",
  "anyhow",
+ "aws-sdk-s3",
  "overlaybd",
  "serde_json",
  "sha2 0.10.9",

@@ -91,10 +91,6 @@ func (r *statusRecorder) statusCode() int {
 	return r.status
 }
 
-func (r *statusRecorder) setRouteSource(source routeSource) {
-	r.routeSource = source
-}
-
 func (r *statusRecorder) routeSourceLabel() string {
 	if r.routeSource == "" {
 		return "unknown"
@@ -102,13 +98,9 @@ func (r *statusRecorder) routeSourceLabel() string {
 	return string(r.routeSource)
 }
 
-type routeSourceRecorder interface {
-	setRouteSource(routeSource)
-}
-
 func setGatewayRouteSource(w http.ResponseWriter, source routeSource) {
-	if recorder, ok := w.(routeSourceRecorder); ok {
-		recorder.setRouteSource(source)
+	if recorder, ok := w.(*statusRecorder); ok {
+		recorder.routeSource = source
 	}
 }
 

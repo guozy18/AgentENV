@@ -404,6 +404,13 @@ POSIX filesystem-backed snapshot repository configuration. This section is used 
 |-----|------|---------|-------------|
 | `snapshot_store` | string | `"$AENV_HOME/snapshot-store"` | Root directory for durable committed snapshot repository state. Relative explicit paths are resolved against the config file directory. |
 
+For a multi-node deployment, this path must be backed by one shared filesystem
+with cross-node locking, atomic rename, directory durability, and
+read-after-write guarantees. Keep `$AENV_HOME/snapshot-local-store` and the
+other runtime directories node-local; sharing the whole `$AENV_HOME` breaks
+Local snapshot ownership isolation. A CAS-capable OSS backend is the safer
+alternative when those POSIX guarantees are not available.
+
 Environment variable overrides:
 
 - `AENV_SNAPSHOT_STORE`
@@ -414,7 +421,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `endpoint` | string | none | OSS endpoint URL, for example `"https://oss-cn-hangzhou.aliyuncs.com"` |
+| `endpoint` | string | none | CAS-capable S3-compatible endpoint URL, for example `"https://minio.example.com:9000"` |
 | `bucket` | string | none | OSS bucket name used for committed snapshot state |
 | `prefix` | string | empty | Optional object key prefix under the bucket |
 | `credential_process` | string | unset | External command used to fetch OSS credentials. Use a plain executable-plus-args form without shell expansion, pipes, or command substitution so it behaves consistently across AgentENV and overlaybd credential consumers |
@@ -442,6 +449,12 @@ bucket = "agentenv-snapshots"
 region = "auto"
 addressing_style = "virtual"
 ```
+- Reusable snapshot catalog writes use `If-None-Match`/ETag compare-and-swap and
+  require strong read-after-write behavior for catalog objects. They fail
+  closed when the backend cannot prove those conditions. Alibaba Cloud's
+  native `*.aliyuncs.com`/`*.aliyun-inc.com` endpoints are not currently
+  supported for this metadata path; use a verified S3-compatible CAS backend
+  (such as MinIO) until a native OSS conditional implementation is available.
 
 Other path override:
 

@@ -231,10 +231,15 @@ p2p_enabled = true
 # [backend.posix_fs]
 # snapshot_store = "/mnt/aenv-snapshots"
 
-# OSS requires an endpoint, bucket, region, and either credential_process or
-# static credentials. credential_process takes precedence over static values.
+# Reusable snapshot metadata mutations require a CAS-capable S3-compatible
+# endpoint with strong read-after-write behavior for catalog objects (for
+# example, MinIO); the current OpenDAL S3 path deliberately fails closed for
+# Alibaba's native OSS endpoint until a native conditional protocol is
+# implemented. OSS requires an endpoint, bucket, region, and either
+# credential_process or static credentials. credential_process takes precedence
+# over static values.
 # [backend.oss]
-# endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
+# endpoint = "https://minio.example.com:9000"
 # bucket = "agentenv-snapshots"
 # region = "cn-beijing"
 # Bucket addressing style: "virtual" or "path". Leave unset to use
@@ -357,5 +362,6 @@ interval_secs = 5
 node_id = "node-a"
 # Logical cluster UUID.
 cluster_id = "00000000-0000-0000-0000-000000000000"
-# Identifier for this service instance.
-service_instance_id = "service-instance-a"
+# Leave the service instance identifier unset so each process receives a fresh
+# UUIDv7. Set AENV_SERVICE_INSTANCE_ID only when an external supervisor owns
+# process identity (Kubernetes supplies the Pod UID in the DaemonSet).

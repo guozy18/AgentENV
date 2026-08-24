@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::errors::RepositoryResult;
+use super::errors::{RepositoryError, RepositoryResult};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
-    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    RunnableSnapshot, SnapshotId, SnapshotLifecycle, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all snapshot records,
-/// including pending template builds and committed snapshots.
+/// When all fields are `None`, the filter matches all publicly visible
+/// snapshot records, including pending template builds and committed
+/// snapshots. Hidden Preparing/Deleting identities are available only through
+/// [`SnapshotRepository::list_recovery_candidates`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotListFilter {
     /// Match aliases that start with this prefix.
@@ -74,6 +76,58 @@ impl SnapshotListFilter {
             }),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn matches(&self, record: &SnapshotRecord) -> bool {
+        if let Some(alias_prefix) = self.alias_prefix.as_deref() {
+            match record.alias.as_ref() {
+                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(ids) = self.snapshot_ids.as_ref() {
+            if !ids.iter().any(|id| id == &record.id) {
+                return false;
+            }
+        }
+
+        if let Some(id_or_alias) = self.snapshot_id_or_alias.as_deref() {
+            if record.id.to_string() != id_or_alias
+                && record
+                    .alias
+                    .as_ref()
+                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
+            {
+                return false;
+            }
+        }
+
+        if let Some(source_sandbox_id) = self.source_sandbox_id.as_deref() {
+            match &record.source {
+                SnapshotSource::Sandbox {
+                    source_sandbox_id: record_source_sandbox_id,
+                } if record_source_sandbox_id == source_sandbox_id => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(sources) = self.sources.as_ref() {
+            if !sources.contains(&record.source.kind()) {
+                return false;
+            }
+        }
+
+        if let Some(statuses) = self.template_statuses.as_ref() {
+            let SnapshotSource::Template { build } = &record.source else {
+                return false;
+            };
+            if !statuses.contains(&build.status) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -141,11 +195,99 @@ pub trait SnapshotRepository: Send + Sync {
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord>;
 
+    /// Materializes backend-owned remote lowers that a node-local capture
+    /// cannot represent by reference. Implementations may replace transient
+    /// config paths with local copies before the local repository imports them.
+    ///
+    /// The default is sufficient for repositories whose capture inputs are
+    /// already local. A backend must fail closed when it cannot make a
+    /// captured memory closure local; returning a record with a dangling
+    /// remote-only memory layer would make Local recovery non-runnable.
+    async fn prepare_local_capture(
+        &self,
+        _manifest: &mut FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<()> {
+        Ok(())
+    }
+
+    /// Commits an already materialized logical record without importing its bytes.
+    ///
+    /// This is the canonical metadata commit used for Local snapshots: the
+    /// node-local POSIX store has already committed the immutable artifact
+    /// closure, while this repository owns public identity, alias, lifecycle,
+    /// and placement. Implementations must keep Preparing records hidden and
+    /// make the alias and Ready record visible as one recoverable operation.
+    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+
+    /// Loads an exact record, including a hidden Preparing record.
+    ///
+    /// Public callers use [`Self::get`]. This exact read exists for metadata
+    /// commit recovery and must never interpret UUID text as an alias.
+    async fn get_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>;
+
+    /// Loads an exact snapshot record only when its committed artifact closure
+    /// is publicly runnable.
+    ///
+    /// Unlike [`Self::get_record`], this read excludes hidden lifecycle states,
+    /// records without committed artifacts, and backend-specific records whose
+    /// visibility/commit marker is missing. Lifecycle reconciliation should use
+    /// [`Self::get_record`] for hidden-state inspection and
+    /// [`Self::get_recovery_record`] when it needs to validate a committed
+    /// closure.
+    async fn get_committed_record(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        Ok(self
+            .get_record(id)
+            .await?
+            .filter(|record| record.is_ready() && record.committed.is_some()))
+    }
+
+    /// Loads an exact record whose immutable closure is committed and visible
+    /// to recovery, including hidden Preparing lifecycle states.
+    ///
+    /// This is intentionally separate from [`Self::get_committed_record`]:
+    /// public runnable reads must require `Ready`, while startup reconciliation
+    /// must be able to finish a metadata commit after a crash that persisted a
+    /// Preparing record after the closure and its commit marker were durable.
+    async fn get_recovery_record(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        Ok(self.get_record(id).await?.filter(|record| {
+            record.committed.is_some()
+                && matches!(
+                    record.lifecycle,
+                    SnapshotLifecycle::Preparing | SnapshotLifecycle::Ready
+                )
+        }))
+    }
+
     /// Loads one snapshot record by repository id or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
 
+    /// Loads the exact identity selected for a delete, including hidden
+    /// Preparing/Deleting records. The returned ID must be used for the
+    /// subsequent delete so an alias cannot be rebound to a different
+    /// identity between lookup and cleanup.
+    async fn get_for_delete(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get(id_or_alias).await
+    }
+
     /// Lists snapshot records matching the provided filter.
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+
+    /// Lists records that may need node-local recovery reconciliation.
+    ///
+    /// Public listing intentionally hides Preparing/Deleting identities. A
+    /// node-local recovery store must still be able to discover those hidden
+    /// records after a crash so an interrupted purge or metadata commit can
+    /// converge. Backends that do not expose a separate local recovery store
+    /// may use the public list as a conservative default.
+    async fn list_recovery_candidates(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
+        self.list(SnapshotListFilter::matches_all()).await
+    }
 
     /// Deletes one snapshot record by repository id or alias.
     ///
@@ -155,6 +297,40 @@ pub trait SnapshotRepository: Send + Sync {
     /// For committed records, implementations should also remove per-snapshot committed artifacts and
     /// any alias binding that still points at the deleted id.
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
+
+    /// Deletes exactly one snapshot id without interpreting its UUID text as an alias.
+    ///
+    /// This is required when a manager has already resolved a cross-repository identity: aliases
+    /// are allowed to look like UUIDs, so routing the id back through [`Self::delete`] could delete
+    /// an unrelated alias target in a repository where that id is absent.
+    /// Returns whether an exact identity existed and its delete lifecycle was
+    /// completed. Backends may retain a hidden terminal tombstone after
+    /// physical artifacts are removed to fence stale writers.
+    async fn delete_by_id(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
+        Err(RepositoryError::Unsupported {
+            feature: "deleting a snapshot by exact id".to_string(),
+        })
+    }
+
+    /// Purges a node-local recovery closure after its canonical metadata has
+    /// moved to Distributed or otherwise made the local copy unnecessary.
+    ///
+    /// This is deliberately distinct from [`Self::delete_by_id`]: canonical
+    /// repositories may retain a terminal identity tombstone to fence stale
+    /// writers, while a node-local recovery store must release the physical
+    /// record so it cannot block a later local recovery publication.
+    async fn purge_by_id(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
+        Err(RepositoryError::Unsupported {
+            feature: "purging a node-local snapshot closure".to_string(),
+        })
+    }
+
+    /// Reclaims repository-owned managed layers that no committed closure references.
+    /// Repositories without a local managed-layer store may treat this as a
+    /// no-op; the manager uses it only for node-local recovery maintenance.
+    async fn gc_unreferenced_artifacts(&self) -> RepositoryResult<usize> {
+        Ok(0)
+    }
 
     /// Resolves a human-readable alias to the current snapshot id.
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;

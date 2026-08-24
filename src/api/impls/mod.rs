@@ -75,6 +75,10 @@ impl ApiImpl {
         Arc::clone(&self.image_resolver)
     }
 
+    pub(crate) fn snapshot_manager(&self) -> Arc<SnapshotManager> {
+        Arc::clone(&self.snapshot_manager)
+    }
+
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.
@@ -110,6 +114,8 @@ impl ApiImpl {
             RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
                 Self::error(409, err.to_string())
             }
+            RepositoryError::Unavailable { .. }
+            | RepositoryError::ConcurrentModification { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
         }
@@ -123,6 +129,37 @@ impl ApiImpl {
             Self::repository_error(repo_err)
         } else {
             Self::internal_error(err.as_ref())
+        }
+    }
+
+    /// Maps failures on reusable-snapshot paths where the configured
+    /// repository is the canonical metadata authority. A backend access
+    /// failure means the service cannot prove identity, alias, or placement,
+    /// so callers must retry instead of treating node-local state as truth.
+    fn reusable_snapshot_error(err: &RepositoryError) -> models::Error {
+        match err {
+            RepositoryError::Backend { .. }
+            | RepositoryError::Unavailable { .. }
+            | RepositoryError::ConcurrentModification { .. } => Self::error(503, err.to_string()),
+            _ => Self::repository_error(err),
+        }
+    }
+
+    fn reusable_snapshot_manager_error(err: &AnyhowError) -> models::Error {
+        if let Some(repo_err) = err
+            .chain()
+            .find_map(|error| error.downcast_ref::<RepositoryError>())
+        {
+            Self::reusable_snapshot_error(repo_err)
+        } else {
+            Self::internal_error(err.as_ref())
+        }
+    }
+
+    fn snapshot_promotion_error(err: &RepositoryError) -> models::Error {
+        match err {
+            RepositoryError::InvalidRequest { .. } => Self::error(409, err.to_string()),
+            _ => Self::reusable_snapshot_error(err),
         }
     }
 

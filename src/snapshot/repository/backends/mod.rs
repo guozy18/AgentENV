@@ -72,6 +72,30 @@ pub fn build_snapshot_backend(
     }
 }
 
+/// Builds the durable node-local POSIX repository used for sandbox recovery
+/// points. It is deliberately independent of the configured publication
+/// backend, so an OSS outage cannot prevent a local snapshot from committing.
+pub(crate) fn build_local_snapshot_backend() -> Result<(
+    Arc<dyn SnapshotRepository>,
+    Arc<dyn SnapshotRuntimeResolver>,
+)> {
+    let config = ConfigManager::global_config();
+    let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
+    let root = config.home_path.join("snapshot-local-store");
+    let cache_root = root.join("cache");
+    let cache = LocalArtifactCache::new(cache_root.clone(), None)?;
+    Ok(PosixFsBackend::from_parts(
+        PosixFsBackendConfig {
+            root: root.clone(),
+            cache_root: Some(cache_root),
+            runtime_cache_root: Some(root.join("runtime")),
+        },
+        overlaybd_layers,
+        cache,
+    )
+    .into_parts())
+}
+
 pub(crate) fn shared_runtime_cache_root() -> PathBuf {
     ConfigManager::global_config()
         .snapshot

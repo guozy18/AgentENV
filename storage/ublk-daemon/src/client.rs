@@ -459,7 +459,12 @@ impl UblkDaemonClient {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await.map_err(|error| {
+            RestackSnapshotTerminalFailure::new(format!(
+                "daemon: restack snapshot dev_id={dev_id} ended without a response; live-state mutation outcome is unknown: {error:#}"
+            ))
+        })?;
+        match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
                 data_stat,

@@ -2,12 +2,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use overlaybd::config::{DownloadConfig, LayerConfig};
+use overlaybd::config::LayerConfig;
 
-use super::layout::PosixFsSnapshotArtifactLayout;
+use super::catalog::{PosixFileLockGuard, PosixFsCatalogStore};
+use super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
+use super::run_repository_blocking;
 use crate::image::cache::OverlaybdLayerStore;
-use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
+use crate::snapshot::artifact_cache::{CacheHandle, LocalArtifactCache};
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
+use crate::snapshot::repository::validate_attached_drive_virtual_size;
 use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, load_firecracker_manifest_from_path, materialize_image_config_error,
     runtime_image_cache_key, RuntimeImageMaterializer,
@@ -31,7 +34,11 @@ struct MaterializeSpec<'a> {
     cache_key: &'a str,
     artifact_prefix: &'a str,
     allow_empty_layers: bool,
-    download: Option<DownloadConfig>,
+}
+
+struct PosixRuntimeArtifactLease {
+    _cache_handles: Vec<CacheHandle>,
+    _repository_lock: PosixFileLockGuard,
 }
 
 impl PosixFsRuntimeResolver {
@@ -63,7 +70,21 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is not ready", snapshot.id),
                 })?;
+        let repository_root = self.repository_root.clone();
+        let repository_lock =
+            run_repository_blocking("acquire POSIX runtime artifact lease", move || {
+                PosixFsCatalogStore::new(repository_root).acquire_repository_shared_lock()
+            })
+            .await?;
         let snapshot_id = snapshot.id.clone();
+        let commit_marker = self
+            .snapshot_layout(&snapshot_id)
+            .path(POSIXFS_SNAPSHOT_COMMIT_MARKER);
+        if !commit_marker.exists() {
+            return Err(RepositoryError::Unavailable {
+                reason: format!("snapshot '{}' is missing its commit marker", snapshot_id),
+            });
+        }
         let vm_state_path = self.snapshot_vm_state_path(&snapshot_id)?;
         let committed_manifest = self
             .load_committed_firecracker_manifest(&snapshot_id)
@@ -79,13 +100,12 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
                 &committed.rootfs_layers,
                 &self
                     .image_materializer
-                    .rootfs_image_config_path(&snapshot.id),
+                    .rootfs_image_config_path_with_namespace(&snapshot.id, None),
                 MaterializeSpec {
                     label: &rootfs_label,
                     cache_key: &rootfs_cache_key,
                     artifact_prefix: "rootfs_layer",
                     allow_empty_layers: false,
-                    download: None,
                 },
                 &mut handles,
             )
@@ -100,12 +120,11 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
-        // Runtime artifacts are protected by the sandbox start-window lease (over
-        // local-only commits) + the orchestrator running set; the resolved-handle
-        // needs no separate local image ref pin.
-        let cache_lease: Arc<dyn RuntimeArtifactLease> =
-            Arc::new(CacheArtifactLease { _handles: handles });
-        let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, cache_lease);
+        let artifact_lease: Arc<RuntimeArtifactLease> = Arc::new(PosixRuntimeArtifactLease {
+            _cache_handles: handles,
+            _repository_lock: repository_lock,
+        });
+        let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, artifact_lease);
         Ok(runnable)
     }
 }
@@ -156,14 +175,7 @@ impl PosixFsRuntimeResolver {
                     mount_path,
                     sub_path,
                 } => {
-                    if *virtual_size == 0 {
-                        return Err(RepositoryError::InvalidRequest {
-                            reason: format!(
-                                "attached drive '{}' virtual_size must be non-zero",
-                                drive_id
-                            ),
-                        });
-                    }
+                    validate_attached_drive_virtual_size(drive_id, *virtual_size)?;
                     let label = format!(
                         "attached drive '{}' for snapshot '{}'",
                         drive_id, snapshot_id
@@ -177,13 +189,16 @@ impl PosixFsRuntimeResolver {
                             layers,
                             &self
                                 .image_materializer
-                                .drive_image_config_path(snapshot_id, drive_id),
+                                .drive_image_config_path_with_namespace(
+                                    snapshot_id,
+                                    drive_id,
+                                    None,
+                                ),
                             MaterializeSpec {
                                 label: &label,
                                 cache_key: &cache_key,
                                 artifact_prefix: "rootfs_layer",
                                 allow_empty_layers: false,
-                                download: None,
                             },
                             handles,
                         )
@@ -193,13 +208,10 @@ impl PosixFsRuntimeResolver {
                         image_config_path,
                         read_only: *read_only,
                         virtual_size: *virtual_size,
-                        mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                        mount_path: crate::sandbox::normalize_mount_path_or_default(
                             drive_id,
                             mount_path.clone(),
-                        )
-                        .unwrap_or_else(|_| {
-                            crate::sandbox::ExtraDrive::default_mount_path(drive_id)
-                        }),
+                        ),
                         sub_path: sub_path.clone(),
                     });
                 }
@@ -243,12 +255,12 @@ impl PosixFsRuntimeResolver {
             });
         }
 
-        let download = spec.download.clone();
         let handle = self
             .cache
-            .ensure_cached_at(spec.cache_key, destination.to_path_buf(), |dest| {
-                let download = download.clone();
-                async move {
+            .ensure_cached_at(
+                spec.cache_key,
+                destination.to_path_buf(),
+                |dest| async move {
                     let path = self
                         .image_materializer
                         .materialize_image_config(
@@ -256,7 +268,7 @@ impl PosixFsRuntimeResolver {
                             &dest,
                             spec.label,
                             None,
-                            download,
+                            None,
                             |index, layer| async move {
                                 self.resolve_local_managed_layer(
                                     index,
@@ -276,8 +288,8 @@ impl PosixFsRuntimeResolver {
                                 error,
                             ))
                         })
-                }
-            })
+                },
+            )
             .await
             .map_err(|error| materialize_image_config_error(spec.label, error))?;
         let path = handle.path().to_path_buf();
@@ -299,7 +311,7 @@ impl PosixFsRuntimeResolver {
     ) -> RepositoryResult<PathBuf> {
         let destination = self
             .image_materializer
-            .memory_image_config_path(snapshot_id);
+            .memory_image_config_path_with_namespace(snapshot_id, None);
         let label = format!("memory for snapshot '{snapshot_id}'");
         let cache_key = runtime_image_cache_key(snapshot_id, "memory/image.json");
         let layers = snapshot
@@ -316,7 +328,6 @@ impl PosixFsRuntimeResolver {
                 cache_key: &cache_key,
                 artifact_prefix: "memory_layer",
                 allow_empty_layers: true,
-                download: None,
             },
             handles,
         )
@@ -378,7 +389,6 @@ mod tests {
                     cache_key: "runtime/test/rootfs/image.json",
                     artifact_prefix: "rootfs_layer",
                     allow_empty_layers: false,
-                    download: None,
                 },
                 &mut handles,
             )

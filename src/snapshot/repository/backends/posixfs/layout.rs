@@ -35,6 +35,10 @@ impl PosixFsSnapshotArtifactLayout {
         Self::catalog_dir(root).join("records")
     }
 
+    pub(super) fn repository_lock_path(root: &Path) -> PathBuf {
+        Self::catalog_dir(root).join("repository.lock")
+    }
+
     pub(super) fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
         Self::aliases_dir(root).join(alias.to_string())
     }

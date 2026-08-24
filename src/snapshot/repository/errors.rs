@@ -5,6 +5,35 @@ use crate::snapshot::types::SnapshotId;
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
+pub(crate) fn validate_artifact_namespace(namespace: Option<&str>) -> RepositoryResult<()> {
+    let Some(namespace) = namespace else {
+        return Ok(());
+    };
+    if namespace.is_empty()
+        || namespace.len() > 128
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RepositoryError::InvalidRequest {
+            reason: "snapshot artifact namespace is invalid".to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_attached_drive_virtual_size(
+    drive_id: &str,
+    virtual_size: u64,
+) -> RepositoryResult<()> {
+    if virtual_size != 0 {
+        return Ok(());
+    }
+    Err(RepositoryError::InvalidRequest {
+        reason: format!("attached drive '{drive_id}' virtual_size must be non-zero"),
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("invalid repository request: {reason}")]
@@ -23,6 +52,9 @@ pub enum RepositoryError {
         new_id: SnapshotId,
     },
 
+    #[error("concurrent snapshot catalog modification: {resource}")]
+    ConcurrentModification { resource: String },
+
     #[error("artifact not found: {artifact}")]
     ArtifactNotFound { artifact: String },
 
@@ -38,6 +70,9 @@ pub enum RepositoryError {
 
     #[error("unsupported operation: {feature}")]
     Unsupported { feature: String },
+
+    #[error("snapshot unavailable: {reason}")]
+    Unavailable { reason: String },
 
     #[error("backend error: {message}")]
     Backend {

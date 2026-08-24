@@ -1,5 +1,6 @@
 pub(crate) mod acr;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,7 +8,40 @@ use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::dense_export;
 use overlaybd::index_file::CommitArgs;
+use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use overlaybd::virtual_file::VirtualFile;
+
+use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::snapshot::repository::{
+    validate_attached_drive_virtual_size, RepositoryError, RepositoryResult,
+};
+
+/// Validates the attached-drive identity and persisted virtual-size contract
+/// shared by every snapshot repository backend.
+pub(crate) fn validate_attached_drives(
+    manifest: &FirecrackerSnapshotManifest,
+) -> RepositoryResult<()> {
+    let mut drive_ids = HashSet::with_capacity(manifest.attached_drives.len());
+    for drive in &manifest.attached_drives {
+        if !drive_ids.insert(drive.drive_id.as_str()) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "duplicate attached drive id in publish request: {}",
+                    drive.drive_id
+                ),
+            });
+        }
+        validate_attached_drive_virtual_size(&drive.drive_id, drive.virtual_size)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
+    read_overlaybd_layer_uuid(source)
+        .ok()
+        .filter(|uuid| !uuid.is_nil())
+        .map(|uuid| uuid.to_string())
+}
 
 pub(crate) async fn write_dense_overlaybd_layer_to_file(
     source: &Path,

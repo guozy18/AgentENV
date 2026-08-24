@@ -97,11 +97,10 @@ impl FirecrackerSnapshotManifest {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: Some(drive.virtual_size),
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::sandbox::normalize_mount_path_or_default(
                     &drive.drive_id,
                     drive.mount_path.clone(),
-                )
-                .unwrap_or_else(|_| ExtraDrive::default_mount_path(&drive.drive_id)),
+                ),
                 sub_path: drive.sub_path.clone(),
             })
             .collect()

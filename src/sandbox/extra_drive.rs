@@ -278,6 +278,12 @@ pub fn normalize_mount_path_for_drive(drive_id: &str, mount_path: PathBuf) -> Re
     Ok(mount_path)
 }
 
+/// Compatibility fallback for persisted attached-drive metadata.
+pub(crate) fn normalize_mount_path_or_default(drive_id: &str, mount_path: PathBuf) -> PathBuf {
+    normalize_mount_path_for_drive(drive_id, mount_path)
+        .unwrap_or_else(|_| ExtraDrive::default_mount_path(drive_id))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DriveMount {
     pub(crate) drive_id: String,
@@ -488,6 +494,14 @@ mod tests {
         .expect_err("reserved mount path should fail");
 
         assert!(err.to_string().contains("reserved path"));
+    }
+
+    #[test]
+    fn persisted_invalid_mount_path_falls_back_to_default() {
+        assert_eq!(
+            normalize_mount_path_or_default("data", PathBuf::from("/proc/data")),
+            Path::new("/mnt/data")
+        );
     }
 
     #[test]

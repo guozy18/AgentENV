@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes as ReqwestBytes;
 use reqwest::header::{
-    HeaderValue, AUTHORIZATION, CONTENT_TYPE, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE,
+    HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE,
 };
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
@@ -123,9 +123,6 @@ pub(crate) enum AcrClientError {
     #[error("ACR registry rejected push/pull credentials: {message}")]
     PermissionDenied { message: String },
 
-    #[error("ACR manifest already exists for tag '{tag}'")]
-    ManifestExists { tag: String },
-
     #[error("transient ACR registry error: {message}")]
     Transient { message: String },
 
@@ -163,23 +160,50 @@ impl AcrClient {
         })
     }
 
-    pub(crate) async fn ensure_manifest_absent(
+    /// Returns the digest currently bound to an image tag, if any.
+    ///
+    /// Registries normally expose `Docker-Content-Digest` on HEAD. Some
+    /// compatible registries omit it, so fall back to GET and hash the exact
+    /// manifest bytes before making an idempotency decision. A missing tag is
+    /// represented as `None`; all other non-success responses remain errors.
+    pub(crate) async fn manifest_digest(
         &self,
         manifest_url: &str,
         repository: &str,
-        tag: &str,
-    ) -> Result<(), AcrClientError> {
+    ) -> Result<Option<String>, AcrClientError> {
         let response = self
             .send_with_retries(Method::HEAD, manifest_url, repository, None)
             .await?;
         match response.status() {
-            StatusCode::OK => Err(AcrClientError::ManifestExists {
-                tag: tag.to_string(),
-            }),
-            StatusCode::NOT_FOUND => Ok(()),
-            status if status.is_success() => Err(AcrClientError::ManifestExists {
-                tag: tag.to_string(),
-            }),
+            StatusCode::NOT_FOUND => Ok(None),
+            status if status.is_success() => {
+                if let Some(digest) = response
+                    .headers()
+                    .get("Docker-Content-Digest")
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|digest| !digest.is_empty())
+                {
+                    return Ok(Some(digest.to_string()));
+                }
+
+                let response = self
+                    .send_with_retries(Method::GET, manifest_url, repository, None)
+                    .await?;
+                match response.status() {
+                    StatusCode::NOT_FOUND => Ok(None),
+                    status if status.is_success() => {
+                        let bytes =
+                            response
+                                .bytes()
+                                .await
+                                .map_err(|error| AcrClientError::Transient {
+                                    message: format!("read ACR manifest body: {error}"),
+                                })?;
+                        Ok(Some(digest::sha256_digest(&bytes)))
+                    }
+                    status => Err(status_error(status, "read ACR image manifest")),
+                }
+            }
             status => Err(status_error(status, "check ACR manifest existence")),
         }
     }
@@ -518,7 +542,15 @@ impl AcrClient {
         auth_header: Option<String>,
     ) -> Result<reqwest::Response, AcrClientError> {
         validate_https_url_str(url, "ACR registry request", &self.options)?;
+        let reads_manifest =
+            (method == Method::GET || method == Method::HEAD) && url.contains("/manifests/");
         let mut request = self.http.request(method, url);
+        if reads_manifest {
+            // Prevent a registry from content-negotiating the tag into a
+            // different manifest representation whose body hash would not
+            // match the stored OCI manifest digest.
+            request = request.header(ACCEPT, OCI_IMAGE_MANIFEST_MEDIA_TYPE);
+        }
         if let Some(auth_header) = auth_header {
             request = request.header(AUTHORIZATION, auth_header);
         }
@@ -655,12 +687,7 @@ impl AcrClient {
 
 impl From<AcrClientError> for RepositoryError {
     fn from(error: AcrClientError) -> Self {
-        match error {
-            AcrClientError::ManifestExists { tag } => RepositoryError::InvalidRequest {
-                reason: format!("ACR snapshot tag '{tag}' already exists"),
-            },
-            other => RepositoryError::backend("ACR snapshot export", other),
-        }
+        RepositoryError::backend("ACR snapshot export", error)
     }
 }
 
@@ -1096,6 +1123,7 @@ pub(super) mod tests {
         blob_head_429s_remaining: usize,
         manifest_exists: bool,
         omit_manifest_digest: bool,
+        manifest_body: Vec<u8>,
     }
 
     impl FakeState {
@@ -1122,6 +1150,7 @@ pub(super) mod tests {
             .route("/upload/session", patch(upload_chunk))
             .route("/upload/session", put(upload_complete))
             .route("/v2/ns/repo/manifests/{reference}", head(manifest_head))
+            .route("/v2/ns/repo/manifests/{reference}", get(manifest_get))
             .route("/v2/ns/repo/manifests/{reference}", put(manifest_put))
             .route("/v2/ns/repo/manifests/{reference}", delete(manifest_delete))
             .with_state(state);
@@ -1304,7 +1333,28 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
     ) -> impl IntoResponse {
         authorized_or_challenge(&headers, &state, |state| {
             if state.manifest_exists {
-                AxumStatusCode::OK.into_response()
+                let mut response_headers = AxumHeaderMap::new();
+                if !state.omit_manifest_digest && !state.manifest_body.is_empty() {
+                    response_headers.insert(
+                        "Docker-Content-Digest",
+                        HeaderValue::from_str(&crate::digest::sha256_digest(&state.manifest_body))
+                            .expect("digest header should be valid"),
+                    );
+                }
+                (AxumStatusCode::OK, response_headers).into_response()
+            } else {
+                AxumStatusCode::NOT_FOUND.into_response()
+            }
+        })
+    }
+
+    async fn manifest_get(
+        State(state): State<Arc<Mutex<FakeState>>>,
+        headers: AxumHeaderMap,
+    ) -> impl IntoResponse {
+        authorized_or_challenge(&headers, &state, |state| {
+            if state.manifest_exists {
+                (AxumStatusCode::OK, state.manifest_body.clone()).into_response()
             } else {
                 AxumStatusCode::NOT_FOUND.into_response()
             }
@@ -1317,12 +1367,16 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
         body: Bytes,
     ) -> impl IntoResponse {
         authorized_or_challenge(&headers, &state, |state| {
-            state.manifest_puts.push(body.to_vec());
+            let body = body.to_vec();
+            state.manifest_puts.push(body.clone());
+            state.manifest_exists = true;
+            state.manifest_body = body.clone();
             let mut headers = AxumHeaderMap::new();
             if !state.omit_manifest_digest {
                 headers.insert(
                     "Docker-Content-Digest",
-                    HeaderValue::from_static("sha256:manifest"),
+                    HeaderValue::from_str(&crate::digest::sha256_digest(&body))
+                        .expect("digest header should be valid"),
                 );
             }
             (AxumStatusCode::CREATED, headers).into_response()
@@ -1594,19 +1648,47 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
     }
 
     #[tokio::test]
-    async fn ensure_manifest_absent_rejects_overwrite() {
+    async fn manifest_digest_uses_head_header_and_get_body_fallback() {
+        let manifest = br#"{"schemaVersion":2}"#.to_vec();
+        let expected = digest::sha256_digest(&manifest);
         let state = Arc::new(Mutex::new(FakeState {
             manifest_exists: true,
+            manifest_body: manifest.clone(),
             ..FakeState::default()
         }));
+        let base = fake_server(Arc::clone(&state)).await;
+        let client = client();
+
+        assert_eq!(
+            client
+                .manifest_digest(&manifest_url(&base, "tag"), "ns/repo")
+                .await
+                .unwrap(),
+            Some(expected.clone())
+        );
+
+        state.lock().unwrap().omit_manifest_digest = true;
+        assert_eq!(
+            client
+                .manifest_digest(&manifest_url(&base, "tag"), "ns/repo")
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_digest_returns_none_for_missing_tag() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
         let base = fake_server(state).await;
 
-        assert!(matches!(
+        assert_eq!(
             client()
-                .ensure_manifest_absent(&manifest_url(&base, "tag"), "ns/repo", "tag")
-                .await,
-            Err(AcrClientError::ManifestExists { .. })
-        ));
+                .manifest_digest(&manifest_url(&base, "tag"), "ns/repo")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1638,7 +1720,7 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
             .put_manifest(&manifest_url(&base, "tag"), "ns/repo", b"manifest".to_vec())
             .await
             .unwrap();
-        assert_eq!(digest, "sha256:manifest");
+        assert_eq!(digest, crate::digest::sha256_digest(b"manifest"));
         assert_eq!(
             state.lock().unwrap().manifest_puts,
             vec![b"manifest".to_vec()]

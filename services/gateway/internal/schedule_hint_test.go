@@ -1,11 +1,23 @@
 package gateway
 
 import (
+	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+func sandboxRequestBodyOfSize(t *testing.T, size int) string {
+	t.Helper()
+	prefix := `{"templateID":"tmpl","pad":"`
+	suffix := `"}`
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("sandbox body size %d is too small", size)
+	}
+	return prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix
+}
 
 func newHintRequest(t *testing.T, method, target, body string) *http.Request {
 	t.Helper()
@@ -25,9 +37,12 @@ func newHintRequest(t *testing.T, method, target, body string) *http.Request {
 func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	r := newHintRequest(t, http.MethodPost, "/sandboxes", `{"templateID":"tmpl"}`)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want %q", snapshotRef, "tmpl")
 	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint, got %v", hint)
@@ -50,9 +65,12 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 	const reqBody = `{"image":"ubuntu:24.04","cpuCount":4,"memoryMB":2048,"attachedDrives":[{"source":{"image":"data:v1"}},{"source":{"image":"cache:v2"}}]}`
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	cold := hint.GetNewColdSandbox()
 	if cold == nil {
@@ -83,15 +101,18 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 
 func TestBuildScheduleHintTrailingSlash(t *testing.T) {
 
-	hint, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", ""))
+	hint, snapshotRef, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", `{"templateID":"tmpl"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
 	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint for trailing slash, got %v", hint)
 	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want %q", snapshotRef, "tmpl")
+	}
 
-	hint, err = buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes-cold/", `{"image":"img"}`))
+	hint, snapshotRef, err = buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes-cold/", `{"image":"img"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
 	}
@@ -114,14 +135,195 @@ func TestBuildScheduleHintNoHint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			hint, err := buildScheduleHint(newHintRequest(t, tc.method, tc.target, ""))
+			hint, snapshotRef, err := buildScheduleHint(newHintRequest(t, tc.method, tc.target, ""))
 			if err != nil {
 				t.Fatalf("buildScheduleHint returned error: %v", err)
 			}
 			if hint != nil {
 				t.Fatalf("expected nil hint, got %v", hint)
 			}
+			if snapshotRef != "" {
+				t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
+			}
 		})
+	}
+}
+
+func TestBuildScheduleHintNewSandboxRejectsInvalidBody(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing templateID", body: `{"metadata":{"team":"alpha"}}`},
+		{name: "empty templateID", body: `{"templateID":" "}`},
+		{name: "malformed JSON", body: `{"templateID":`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes", tc.body))
+			if err == nil {
+				t.Fatal("expected invalid sandbox body error")
+			}
+		})
+	}
+}
+
+func TestBuildScheduleHintNewSandboxOversizedBodyBuffersAndExtractsHint(t *testing.T) {
+	reqBody := `{"templateID":"tmpl","pad":"` + strings.Repeat("a", maxHintBodyBytes) + `"}`
+	r := newHintRequest(t, http.MethodPost, "/sandboxes", reqBody)
+
+	hint, snapshotRef, err := buildScheduleHint(r)
+	if err != nil {
+		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
+	}
+	if hint.GetNewSandbox() == nil {
+		t.Fatalf("expected new_sandbox hint, got %v", hint)
+	}
+	if r.ContentLength != int64(len(reqBody)) {
+		t.Fatalf("content length = %d, want %d", r.ContentLength, len(reqBody))
+	}
+	defer r.Body.Close()
+
+	body, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		t.Fatalf("read restored body failed: %v", readErr)
+	}
+	if string(body) != reqBody {
+		t.Fatalf("restored body length = %d, want %d", len(body), len(reqBody))
+	}
+}
+
+func TestBuildScheduleHintOversizedBodyAllowsReferenceBeyondInspectionBudget(t *testing.T) {
+	templateID := strings.Repeat("t", maxHintBodyBytes+1)
+	reqBody := `{"templateID":"` + templateID + `","pad":"` + strings.Repeat("a", maxHintBodyBytes) + `"}`
+	if len(reqBody) >= maxNewSandboxBodyBytes {
+		t.Fatalf("test body unexpectedly exceeds request limit: %d", len(reqBody))
+	}
+
+	r := newHintRequest(t, http.MethodPost, "/sandboxes", reqBody)
+	hint, snapshotRef, err := buildScheduleHint(r)
+	if err != nil {
+		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	defer r.Body.Close()
+	if hint.GetNewSandbox() == nil {
+		t.Fatalf("expected new_sandbox hint, got %v", hint)
+	}
+	if snapshotRef != templateID {
+		t.Fatalf("snapshot reference length = %d, want %d", len(snapshotRef), len(templateID))
+	}
+}
+
+func TestBuildScheduleHintNewSandboxBodyBounds(t *testing.T) {
+	t.Run("memory boundary", func(t *testing.T) {
+		r := newHintRequest(t, http.MethodPost, "/sandboxes", sandboxRequestBodyOfSize(t, maxHintBodyBytes))
+		_, snapshotRef, err := buildScheduleHint(r)
+		if err != nil {
+			t.Fatalf("buildScheduleHint returned error: %v", err)
+		}
+		defer r.Body.Close()
+		if snapshotRef != "tmpl" {
+			t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
+		}
+		if _, ok := r.Body.(*bufferedBody); ok {
+			t.Fatal("body at the in-memory boundary must not be buffered")
+		}
+	})
+
+	t.Run("buffer boundary", func(t *testing.T) {
+		r := newHintRequest(t, http.MethodPost, "/sandboxes", sandboxRequestBodyOfSize(t, maxNewSandboxBodyBytes))
+		_, snapshotRef, err := buildScheduleHint(r)
+		if err != nil {
+			t.Fatalf("buildScheduleHint returned error: %v", err)
+		}
+		body, ok := r.Body.(*bufferedBody)
+		if !ok {
+			t.Fatalf("request body type = %T, want *bufferedBody", r.Body)
+		}
+		defer body.Close()
+		if snapshotRef != "tmpl" {
+			t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
+		}
+		if body.Len() != maxNewSandboxBodyBytes {
+			t.Fatalf("buffer size = %d, want %d", body.Len(), maxNewSandboxBodyBytes)
+		}
+		if got := len(sandboxBodyBufferSlots); got != 1 {
+			t.Fatalf("held buffer slots = %d, want 1", got)
+		}
+	})
+
+	t.Run("unknown content length", func(t *testing.T) {
+		r := newHintRequest(t, http.MethodPost, "/sandboxes", sandboxRequestBodyOfSize(t, maxHintBodyBytes+1))
+		r.ContentLength = -1
+		r.TransferEncoding = []string{"chunked"}
+		_, snapshotRef, err := buildScheduleHint(r)
+		if err != nil {
+			t.Fatalf("buildScheduleHint returned error: %v", err)
+		}
+		defer r.Body.Close()
+		if snapshotRef != "tmpl" {
+			t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
+		}
+		if _, ok := r.Body.(*bufferedBody); !ok {
+			t.Fatalf("request body type = %T, want *bufferedBody", r.Body)
+		}
+	})
+}
+
+func TestBuildScheduleHintNewSandboxRejectsWhenBufferCapacityIsExhausted(t *testing.T) {
+	for range cap(sandboxBodyBufferSlots) {
+		sandboxBodyBufferSlots <- struct{}{}
+	}
+	defer func() {
+		for range cap(sandboxBodyBufferSlots) {
+			<-sandboxBodyBufferSlots
+		}
+	}()
+
+	r := newHintRequest(t, http.MethodPost, "/sandboxes", sandboxRequestBodyOfSize(t, maxHintBodyBytes+1))
+	defer r.Body.Close()
+	if _, _, err := buildScheduleHint(r); !errors.Is(err, errSandboxBodyBufferBusy) {
+		t.Fatalf("buildScheduleHint error = %v, want %v", err, errSandboxBodyBufferBusy)
+	}
+}
+
+func TestBuildScheduleHintOversizedInvalidBodyReleasesBuffer(t *testing.T) {
+	r := newHintRequest(
+		t,
+		http.MethodPost,
+		"/sandboxes",
+		`{"templateID":"tmpl","pad":"`+strings.Repeat("x", maxHintBodyBytes)+`"`,
+	)
+	defer r.Body.Close()
+	if _, _, err := buildScheduleHint(r); err == nil {
+		t.Fatal("expected malformed oversized body error")
+	}
+	if got := len(sandboxBodyBufferSlots); got != 0 {
+		t.Fatalf("held buffer slots after parse failure = %d, want 0", got)
+	}
+}
+
+func TestBufferedBodyCloseReleasesSlotOnce(t *testing.T) {
+	released := 0
+	body := &bufferedBody{
+		Reader:  bytes.NewReader([]byte("body")),
+		release: func() { released++ },
+	}
+	if got, err := io.ReadAll(body); err != nil || string(got) != "body" {
+		t.Fatalf("read buffered body = %q, err=%v", got, err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("close buffered body: %v", err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("second close buffered body: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("buffer slot released %d times, want once", released)
 	}
 }
 
@@ -160,12 +362,15 @@ func TestParseNewColdSandboxHint(t *testing.T) {
 
 func TestCaptureRequestBodyNil(t *testing.T) {
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", "")
-	body, err := captureRequestBody(r)
+	body, oversized, err := captureRequestBody(r)
 	if err != nil {
 		t.Fatalf("captureRequestBody returned error: %v", err)
 	}
 	if body != nil {
 		t.Fatalf("expected nil body, got %q", string(body))
+	}
+	if oversized {
+		t.Fatal("empty body must not be oversized")
 	}
 }
 
@@ -179,9 +384,12 @@ func TestBuildScheduleHintColdSandboxOversizedBodyStreams(t *testing.T) {
 	}
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	cold := hint.GetNewColdSandbox()
 	if cold == nil {

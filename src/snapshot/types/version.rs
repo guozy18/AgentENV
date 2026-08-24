@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::sandbox::{FirecrackerSandbox, SandboxExecutor};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRuntimeVersions {
     pub kernel_version: String,
     pub firecracker_version: String,

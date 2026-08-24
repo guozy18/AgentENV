@@ -5,6 +5,11 @@ import schedulerv1 "agentenv/services/api/proto"
 type Node struct {
 	ID       string `json:"node_id"`
 	Endpoint string `json:"endpoint"`
+	// ServiceInstanceID is discovery-owned identity for the serving node
+	// process (the Kubernetes Pod UID). It is intentionally omitted from the
+	// public scheduler Node proto; the scheduler uses it only to fence
+	// heartbeats from a replaced Pod.
+	ServiceInstanceID string `json:"-"`
 }
 
 // RichNode combines discovery identity with observed runtime state.

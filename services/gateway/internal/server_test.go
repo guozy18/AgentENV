@@ -792,98 +792,81 @@ func TestSandboxIDFromHeadersOnResponse(t *testing.T) {
 	}
 }
 
-func TestExtractSandboxIDFromResponse(t *testing.T) {
-	id, ok := extractSandboxIDFromResponse([]byte(`{"sandboxID":"sbx-123"}`))
-	if !ok || id != "sbx-123" {
-		t.Fatalf("expected sandbox id to be extracted, got %q (ok=%v)", id, ok)
+func TestExtractSandboxIDsFromResponse(t *testing.T) {
+	if got := extractSandboxIDsFromResponse([]byte(`{"sandboxID":"sbx-123"}`)); !equalStrings(got, []string{"sbx-123"}) {
+		t.Fatalf("single response ids = %#v, want [sbx-123]", got)
 	}
-	ids := extractSandboxIDsFromResponse([]byte(`{"sandboxes":[{"sandboxID":"sbx-1"},{"sandboxID":"sbx-2"}]}`))
-	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
-		t.Fatalf("expected batch sandbox ids, got %#v", ids)
+	if got := extractSandboxIDsFromResponse([]byte(`{"sandboxes":[{"sandboxID":"sbx-1"},{"sandboxID":"sbx-2"}]}`)); !equalStrings(got, []string{"sbx-1", "sbx-2"}) {
+		t.Fatalf("batch response ids = %#v, want [sbx-1 sbx-2]", got)
 	}
 }
 
-func TestUpstreamTargetPath(t *testing.T) {
+func TestUpstreamTargetPaths(t *testing.T) {
 	tests := []struct {
 		name        string
 		routeSource routeSource
-		path        string
-		want        string
+		decodedPath string
+		escapedPath string
+		wantDecoded string
+		wantEscaped string
 	}{
 		{
 			name:        "header route prefixes /proxy",
 			routeSource: routeSourceHeader,
-			path:        "/sandboxes/sbx-1/files",
-			want:        "/proxy/sandboxes/sbx-1/files",
+			decodedPath: "/sandboxes/sbx-1/files",
+			escapedPath: "/sandboxes/sbx-1/files",
+			wantDecoded: "/proxy/sandboxes/sbx-1/files",
+			wantEscaped: "/proxy/sandboxes/sbx-1/files",
 		},
 		{
 			name:        "host route prefixes /proxy",
 			routeSource: routeSourceHost,
-			path:        "/readyz",
-			want:        "/proxy/readyz",
+			decodedPath: "/readyz",
+			escapedPath: "/readyz",
+			wantDecoded: "/proxy/readyz",
+			wantEscaped: "/proxy/readyz",
 		},
 		{
 			name:        "header route root path",
 			routeSource: routeSourceHeader,
-			path:        "/",
-			want:        "/proxy/",
+			decodedPath: "/",
+			escapedPath: "/",
+			wantDecoded: "/proxy/",
+			wantEscaped: "/proxy/",
 		},
 		{
 			name:        "path route unchanged",
 			routeSource: routeSourcePath,
-			path:        "/sandboxes/sbx-1/pause",
-			want:        "/sandboxes/sbx-1/pause",
+			decodedPath: "/sandboxes/sbx-1/pause",
+			escapedPath: "/sandboxes/sbx-1/pause",
+			wantDecoded: "/sandboxes/sbx-1/pause",
+			wantEscaped: "/sandboxes/sbx-1/pause",
 		},
 		{
 			name:        "schedule route unchanged",
 			routeSource: routeSourceSchedule,
-			path:        "/sandboxes",
-			want:        "/sandboxes",
+			decodedPath: "/sandboxes",
+			escapedPath: "/sandboxes",
+			wantDecoded: "/sandboxes",
+			wantEscaped: "/sandboxes",
 		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := upstreamTargetPath(tc.routeSource, tc.path)
-			if got != tc.want {
-				t.Fatalf("upstreamTargetPath(%q, %q) = %q, want %q", string(tc.routeSource), tc.path, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestUpstreamTargetEscapedPath(t *testing.T) {
-	tests := []struct {
-		name        string
-		routeSource routeSource
-		path        string
-		want        string
-	}{
 		{
-			name:        "header route prefixes /proxy",
+			name:        "encoded path keeps independent representations",
 			routeSource: routeSourceHeader,
-			path:        "/sandboxes/a%2Fb/%2525",
-			want:        "/proxy/sandboxes/a%2Fb/%2525",
-		},
-		{
-			name:        "host route prefixes /proxy",
-			routeSource: routeSourceHost,
-			path:        "/api/foo%2Fbar",
-			want:        "/proxy/api/foo%2Fbar",
-		},
-		{
-			name:        "path route unchanged",
-			routeSource: routeSourcePath,
-			path:        "/sandboxes/a%2Fb/%2525",
-			want:        "/sandboxes/a%2Fb/%2525",
+			decodedPath: "/sandboxes/a/b/%",
+			escapedPath: "/sandboxes/a%2Fb/%2525",
+			wantDecoded: "/proxy/sandboxes/a/b/%",
+			wantEscaped: "/proxy/sandboxes/a%2Fb/%2525",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := upstreamTargetEscapedPath(tc.routeSource, tc.path)
-			if got != tc.want {
-				t.Fatalf("upstreamTargetEscapedPath(%q, %q) = %q, want %q", string(tc.routeSource), tc.path, got, tc.want)
+			gotDecoded, gotEscaped := upstreamTargetPaths(tc.routeSource, tc.decodedPath, tc.escapedPath)
+			if gotDecoded != tc.wantDecoded || gotEscaped != tc.wantEscaped {
+				t.Fatalf("upstreamTargetPaths(%q, %q, %q) = (%q, %q), want (%q, %q)",
+					string(tc.routeSource), tc.decodedPath, tc.escapedPath,
+					gotDecoded, gotEscaped, tc.wantDecoded, tc.wantEscaped)
 			}
 		})
 	}
@@ -1370,8 +1353,7 @@ func TestRequestContextForProxy(t *testing.T) {
 		}
 		routingCtx, cancelRouting := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancelRouting()
-		ctx, cancel := requestContextForProxy(req, routingCtx, true)
-		defer cancel()
+		ctx := requestContextForProxy(req, routingCtx, true)
 		if req.Context() != ctx {
 			t.Fatal("expected streaming request to reuse original context")
 		}
@@ -1384,8 +1366,7 @@ func TestRequestContextForProxy(t *testing.T) {
 		}
 		routingCtx, cancelRouting := context.WithTimeout(context.Background(), 5*time.Millisecond)
 		defer cancelRouting()
-		ctx, cancel := requestContextForProxy(req, routingCtx, false)
-		defer cancel()
+		ctx := requestContextForProxy(req, routingCtx, false)
 		if routingCtx != ctx {
 			t.Fatal("expected non-streaming request to share routing context")
 		}
@@ -1405,8 +1386,7 @@ func TestRequestContextNotCanceledWhenStreamingCancelCalled(t *testing.T) {
 	}
 	routingCtx, cancelRouting := context.WithTimeout(context.Background(), time.Second)
 	defer cancelRouting()
-	ctx, cancel := requestContextForProxy(req, routingCtx, true)
-	cancel()
+	ctx := requestContextForProxy(req, routingCtx, true)
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("streaming cancel function should be no-op, got context err: %v", err)
 	}
@@ -1857,6 +1837,11 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == snapshotPlacementPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"snapshotType":"distributed"}`))
+			return
+		}
 		payload, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("read upstream request body failed: %v", err)
@@ -1901,7 +1886,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"template":"base"}`))
+	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"templateID":"base"}`))
 	if err != nil {
 		t.Fatalf("build request failed: %v", err)
 	}
@@ -1945,8 +1930,8 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	if upstreamReq.contentType != "application/json" {
 		t.Fatalf("upstream content type = %q, want %q", upstreamReq.contentType, "application/json")
 	}
-	if upstreamReq.body != `{"template":"base"}` {
-		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"template":"base"}`)
+	if upstreamReq.body != `{"templateID":"base"}` {
+		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"templateID":"base"}`)
 	}
 	if upstreamReq.forwardedHost != "gateway.test" {
 		t.Fatalf("X-Forwarded-Host = %q, want %q", upstreamReq.forwardedHost, "gateway.test")

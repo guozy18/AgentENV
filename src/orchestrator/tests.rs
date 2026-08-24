@@ -72,6 +72,10 @@ async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<Test
     .expect("in-memory orchestrator should not fail to construct")
 }
 
+fn has_sandbox_gate(orchestrator: &TestOrchestrator, sandbox_id: &SandboxId) -> bool {
+    orchestrator.sandbox_gates.contains_key(sandbox_id)
+}
+
 fn make_orchestrator_without_background<S: MetadataStore + 'static>(
     store: S,
 ) -> Arc<TestOrchestrator<S>> {
@@ -108,6 +112,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         factory,
         persister,
         sandboxes: RwLock::new(HashMap::new()),
+        sandbox_gates: DashMap::new(),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -852,6 +857,15 @@ async fn proxy_target_for_only_returns_running_routes() {
         .await;
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
+        None
+    );
+
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
         Some(target)
     );
 }
@@ -862,6 +876,10 @@ async fn restore_proxy_route_republishes_running_target() {
     let sandbox_id = SandboxId::new();
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 77));
 
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
     orchestrator
         .upsert_proxy_route(sandbox_id, target.clone())
         .await;
@@ -902,6 +920,9 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
 
+    orchestrator
+        .upsert_proxy_route(sandbox_id, ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 43)))
+        .await;
     orchestrator
         .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
         .await
@@ -1569,6 +1590,7 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
 #[tokio::test]
 async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     setup();
+    let persister = RecordingPersister::default();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Pause,
@@ -1576,8 +1598,11 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
             message: "restack succeeded but snapshot staging failed".to_string(),
         },
     );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -1601,6 +1626,13 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::DeleteRecordAndArtifacts,
+        ]
+    );
     Ok(())
 }
 
@@ -1721,6 +1753,45 @@ async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
         created.resources.memory_mib,
     )
     .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_persistence_and_resume_failure_cleans_artifacts() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    persister.fail_next(RecordingCall::PersistPaused);
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "pause-cleanup")]))
+        .await?
+        .id;
+
+    orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("failed persistence and recovery should fail the pause");
+
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::PersistPaused,
+            RecordingCall::DeleteRecordAndArtifacts,
+        ]
+    );
     Ok(())
 }
 
@@ -1870,6 +1941,34 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
 }
 
 #[tokio::test]
+async fn snapshot_capture_waits_for_in_flight_data_plane_request() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "snapshot-gate")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let request_guard = orchestrator.acquire_proxy_read(&sandbox_id).await?;
+    let capture_orchestrator = Arc::clone(&orchestrator);
+    let capture =
+        tokio::spawn(async move { capture_orchestrator.capture_snapshot(sandbox_id).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !capture.is_finished(),
+        "snapshot capture must wait while a data-plane request holds its read guard"
+    );
+
+    drop(request_guard);
+    let capture_result = capture.await.expect("snapshot capture task should join");
+    capture_result?;
+    assert!(has_sandbox_gate(&orchestrator, &sandbox_id));
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
+    Ok(())
+}
+
+#[tokio::test]
 async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_retry() -> Result<()>
 {
     setup();
@@ -1963,6 +2062,30 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn capture_snapshot_for_missing_sandbox_does_not_create_a_gate() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+
+    let err = orchestrator
+        .capture_snapshot(sandbox_id)
+        .await
+        .expect_err("capture_snapshot should reject a missing sandbox");
+    assert!(matches!(err, OrchestratorError::SandboxNotFound(id) if id == sandbox_id));
+    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
+
+    let gate_error = match orchestrator.acquire_proxy_read(&sandbox_id).await {
+        Ok(_) => panic!("a missing sandbox must not acquire a proxy gate"),
+        Err(error) => error,
+    };
+    assert!(matches!(gate_error, OrchestratorError::SandboxNotFound(id) if id == sandbox_id));
+    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
+
     Ok(())
 }
 

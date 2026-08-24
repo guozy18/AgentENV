@@ -8,7 +8,7 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{SnapshotId, SnapshotRecord};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -35,6 +35,10 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            snapshot_type: Some(match record.snapshot_type {
+                crate::snapshot::SnapshotType::Local => models::SnapshotType::Local,
+                crate::snapshot::SnapshotType::Distributed => models::SnapshotType::Distributed,
+            }),
         }
     }
 }
@@ -44,6 +48,14 @@ fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(unix_ms as u64)
     } else {
         UNIX_EPOCH - Duration::from_millis(unix_ms.unsigned_abs())
+    }
+}
+
+fn snapshot_get_error_response(error: models::Error) -> SnapshotsSnapshotIdGetResponse {
+    match error.code {
+        400 => SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error),
+        503 => SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error),
+        _ => SnapshotsSnapshotIdGetResponse::Status500_ServerError(error),
     }
 }
 
@@ -82,9 +94,12 @@ impl Snapshots<()> for ApiImpl {
         {
             Ok(summaries) => summaries,
             Err(err) => {
-                return Ok(SnapshotsGetResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    SnapshotsGetResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    SnapshotsGetResponse::Status500_ServerError(error)
+                });
             }
         };
 
@@ -127,12 +142,12 @@ impl Snapshots<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, ()> {
-        match self.snapshot_manager.get(&path_params.snapshot_id).await {
-            // Scope this endpoint to sandbox-sourced snapshots so it stays
-            // consistent with the list API, which only exposes
-            // `SnapshotSourceKind::Sandbox` records. Template records are
-            // surfaced through the template APIs instead.
-            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => Ok(
+        match self
+            .snapshot_manager
+            .get_sandbox_snapshot(&path_params.snapshot_id)
+            .await
+        {
+            Ok(Some(record)) => Ok(
                 SnapshotsSnapshotIdGetResponse::Status200_SuccessfullyReturnedTheSnapshot(
                     models::SnapshotInfo::from(record),
                 ),
@@ -143,9 +158,47 @@ impl Snapshots<()> for ApiImpl {
                     format!("snapshot '{}' not found", path_params.snapshot_id),
                 ),
             )),
-            Err(err) => Ok(SnapshotsSnapshotIdGetResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
+            Err(err) => Ok(snapshot_get_error_response(
+                Self::reusable_snapshot_manager_error(&err),
             )),
+        }
+    }
+
+    async fn snapshots_snapshot_id_promote_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdPromotePostPathParams,
+    ) -> Result<SnapshotsSnapshotIdPromotePostResponse, ()> {
+        match self
+            .snapshot_manager
+            .promote(&path_params.snapshot_id)
+            .await
+        {
+            Ok(Some(record)) => Ok(
+                SnapshotsSnapshotIdPromotePostResponse::Status200_SnapshotIsAvailableAsDistributed(
+                    models::SnapshotInfo::from(record),
+                ),
+            ),
+            Ok(None) => Ok(SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(
+                Self::error(
+                    404,
+                    format!("snapshot '{}' not found", path_params.snapshot_id),
+                ),
+            )),
+            Err(error) => {
+                let error = Self::snapshot_promotion_error(&error);
+                Ok(match error.code {
+                    404 => SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(error),
+                    409 => SnapshotsSnapshotIdPromotePostResponse::Status409_Conflict(error),
+                    503 => {
+                        SnapshotsSnapshotIdPromotePostResponse::Status503_ServiceUnavailable(error)
+                    }
+                    _ => SnapshotsSnapshotIdPromotePostResponse::Status500_ServerError(error),
+                })
+            }
         }
     }
 }
@@ -184,5 +237,38 @@ mod tests {
         assert_eq!(info.image_ref, None);
         let serialized = serde_json::to_value(&info).expect("serialize SnapshotInfo");
         assert!(serialized.get("imageRef").is_none());
+    }
+
+    #[test]
+    fn promotion_invalid_transition_is_reported_as_conflict() {
+        let error =
+            ApiImpl::snapshot_promotion_error(&crate::snapshot::RepositoryError::InvalidRequest {
+                reason: "record changed during promotion".to_string(),
+            });
+
+        assert_eq!(error.code, 409);
+    }
+
+    #[test]
+    fn snapshot_get_invalid_reference_is_reported_as_bad_request() {
+        let error =
+            ApiImpl::reusable_snapshot_error(&crate::snapshot::RepositoryError::InvalidRequest {
+                reason: "invalid snapshot alias".to_string(),
+            });
+
+        assert!(matches!(
+            snapshot_get_error_response(error),
+            SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error) if error.code == 400
+        ));
+    }
+
+    #[test]
+    fn promotion_repository_outage_is_reported_as_unavailable() {
+        let error = ApiImpl::snapshot_promotion_error(&crate::snapshot::RepositoryError::Backend {
+            message: "metadata authority is offline".to_string(),
+            source: None,
+        });
+
+        assert_eq!(error.code, 503);
     }
 }

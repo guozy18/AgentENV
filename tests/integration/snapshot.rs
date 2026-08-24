@@ -81,6 +81,8 @@ async fn publish_captured_snapshot_for_test(
         .publish_captured(
             SnapshotPublishMetadata {
                 id: SnapshotId::generate(),
+                snapshot_type: agentenv::snapshot::SnapshotType::Distributed,
+                owner_node_id: None,
                 alias: Some(SnapshotAlias::parse(alias)?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: source_sandbox_id.to_string(),
@@ -401,14 +403,17 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     let paused_original = original.pause().await?;
     original.stop().await?;
 
+    // RunnableSnapshot holds the shared repository lease through the
+    // Firecracker/ublk start window. All children are fully started above, so
+    // release those launch leases before deleting the source records.
+    drop(first_runnable);
+    drop(second_runnable);
     snapshot_manager.delete(&first_alias).await?;
     snapshot_manager.delete(&second_alias).await?;
     for child in &mut children {
         child.stop().await?;
     }
     drop(children);
-    drop(first_runnable);
-    drop(second_runnable);
     drop(first_snapshot);
     drop(second_snapshot);
 

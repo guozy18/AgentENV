@@ -17,13 +17,6 @@ type BindingStore interface {
 	ReconcileNode(node Node, sandboxIDs []string, now time.Time) error
 }
 
-type ArtifactStore interface {
-	Record(clusterID string, backend string, key string, nodeID string)
-	Forget(clusterID string, backend string, key string, nodeID string)
-	Lookup(clusterID string, backend string, key string) []string
-	ForgetNode(nodeID string)
-}
-
 type bindingRecord struct {
 	node      Node
 	expiresAt time.Time

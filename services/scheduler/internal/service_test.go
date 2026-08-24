@@ -182,12 +182,17 @@ func TestRecordAssignmentRejectsUnknownNode(t *testing.T) {
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
-	_, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
-		SandboxId: "sbx-1",
-		Node:      (&Node{ID: "node-x", Endpoint: "http://node-x"}).ToProto(),
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("expected invalid argument, got %v", err)
+	for _, node := range []Node{
+		{ID: "node-x", Endpoint: "http://node-x"},
+		{ID: "node-a", Endpoint: "http://stale-node-a"},
+	} {
+		_, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
+			SandboxId: "sbx-1",
+			Node:      node.ToProto(),
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("expected invalid argument for node %v, got %v", node, err)
+		}
 	}
 }
 
@@ -317,6 +322,51 @@ func TestHeartbeatRebuildsSandboxBindings(t *testing.T) {
 		if got := resp.GetNode().GetNodeId(); got != "node-a" {
 			t.Fatalf("lookup %s returned node %q, want %q", sandboxID, got, "node-a")
 		}
+	}
+}
+
+func TestHeartbeatRejectsStaleServiceInstanceWithoutReconcilingBindings(t *testing.T) {
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+
+	if _, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-old",
+		SandboxIds:        []string{"old-sandbox"},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}); err != nil {
+		t.Fatalf("old heartbeat failed: %v", err)
+	}
+	if _, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-new",
+		SandboxIds:        []string{"new-sandbox"},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}); err != nil {
+		t.Fatalf("new heartbeat failed: %v", err)
+	}
+
+	if _, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-old",
+		SandboxIds:        []string{"old-sandbox"},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected stale heartbeat to fail with failed precondition, got %v", err)
+	}
+
+	if _, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "new-sandbox"}); err != nil {
+		t.Fatalf("new sandbox binding should remain, got %v", err)
+	}
+	if _, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "old-sandbox"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("stale heartbeat must not restore old sandbox binding, got %v", err)
 	}
 }
 
@@ -670,6 +720,32 @@ func TestHeartbeatRejectsUnknownNode(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestServiceHeartbeatRejectsServiceInstanceNotMatchingDiscovery(t *testing.T) {
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{{
+			ID:                "node-a",
+			Endpoint:          "http://node-a",
+			ServiceInstanceID: "pod-uid-current",
+		}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+
+	_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "pod-uid-old",
+		SandboxIds:        []string{"old-sandbox"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected failed precondition for mismatched discovered instance, got %v", err)
+	}
+	if _, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "old-sandbox"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("mismatched heartbeat must not create a binding, got %v", err)
 	}
 }
 

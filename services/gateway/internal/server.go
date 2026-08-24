@@ -218,6 +218,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	ownerBound := false
 
 	if hasSandbox {
 		rpcStart := time.Now()
@@ -229,16 +230,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		node = resp.GetNode()
 	} else {
-		hint, err := buildScheduleHint(r)
+		hint, launchSnapshotRef, err := buildScheduleHint(r)
 		if err != nil {
-			// this only happens it cannot read request body, so the request cannot continue
 			s.logger.Warn("Fatal error when building schedule hint",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Error(err),
 			)
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			switch {
+			case errors.Is(err, errNewSandboxBodyTooLarge):
+				http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			case errors.Is(err, errSandboxBodyBufferBusy):
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			default:
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
 			return
+		}
+		if body, ok := r.Body.(*bufferedBody); ok {
+			// ReverseProxy closes forwarded request bodies, but failures before
+			// proxying (for example Scheduler or placement errors) must also
+			// release the bounded body buffer.
+			defer body.Close()
 		}
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
@@ -250,6 +263,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+
+		operation, snapshotRef := snapshotRequestOperation(r, launchSnapshotRef)
+		if operation != snapshotOperationNone {
+			routedNode, routedOwnerBound, routingErr := s.routeSnapshotRequest(
+				routingCtx,
+				r,
+				node,
+				operation,
+				snapshotRef,
+			)
+			if routingErr != nil {
+				s.logger.Warn("snapshot routing failed",
+					zap.String("method", r.Method),
+					zap.String("path", r.URL.Path),
+					zap.String("snapshot_ref", snapshotRef),
+					zap.Error(routingErr),
+				)
+				if routingErr.statusCode == http.StatusUnauthorized {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				s.writeJSON(w, routingErr.statusCode, struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				}{
+					Code:    routingErr.statusCode,
+					Message: routingErr.message,
+				})
+				return
+			}
+			node = routedNode
+			ownerBound = routedOwnerBound
+		}
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -261,16 +307,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("upstream_endpoint", node.GetEndpoint()),
 	)
 
-	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
-	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
+	decodedPath, escapedPath := upstreamTargetPaths(
+		routeSource,
+		r.URL.Path,
+		requestEscapedPath(r),
+	)
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		if ownerBound {
+			http.Error(w, "snapshot owner unavailable", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		}
 		return
 	}
 
-	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
-	defer cancelUpstream()
+	upstreamCtx := requestContextForProxy(r, routingCtx, longLived)
 
 	s.proxyRequest(
 		w,
@@ -282,6 +334,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
+			ownerBound:       ownerBound,
 		},
 	)
 }
@@ -308,6 +361,7 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	ownerBound       bool
 }
 
 func (s *Server) proxyRequest(
@@ -369,6 +423,23 @@ func (s *Server) proxyRequest(
 				return
 			}
 
+			var proxyErr *gatewayResponseError
+			if errors.As(err, &proxyErr) {
+				http.Error(rw, proxyErr.message, proxyErr.statusCode)
+				return
+			}
+
+			if options.ownerBound {
+				s.logger.Warn("snapshot owner proxy request failed",
+					zap.Error(err),
+					zap.String("node", node.GetNodeId()),
+					zap.String("path", proxyReq.URL.Path),
+					zap.String("target", upstreamURL.String()),
+				)
+				http.Error(rw, "snapshot owner unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
 				s.logger.Warn("proxy request timed out",
 					zap.Error(err),
@@ -377,12 +448,6 @@ func (s *Server) proxyRequest(
 					zap.String("target", upstreamURL.String()),
 				)
 				http.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
-				return
-			}
-
-			var proxyErr *proxyResponseError
-			if errors.As(err, &proxyErr) {
-				http.Error(rw, proxyErr.message, proxyErr.statusCode)
 				return
 			}
 
@@ -406,13 +471,16 @@ func isStreamInputProxyRequest(r *http.Request) bool {
 	return r.Method == http.MethodPost && r.URL.Path == "/process.Process/StreamInput"
 }
 
-type proxyResponseError struct {
+// gatewayResponseError carries an HTTP response status while preserving the
+// underlying cause for gateway logs. It is shared by gateway handlers so their
+// error representations cannot drift.
+type gatewayResponseError struct {
 	statusCode int
 	message    string
 	cause      error
 }
 
-func (e *proxyResponseError) Error() string {
+func (e *gatewayResponseError) Error() string {
 	if e.cause != nil {
 		return e.cause.Error()
 	}
@@ -430,7 +498,7 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 
 	body, truncated, err := readBodyWithLimit(resp.Body, s.maxRespSize)
 	if err != nil {
-		return &proxyResponseError{
+		return &gatewayResponseError{
 			statusCode: http.StatusBadGateway,
 			message:    "failed to read upstream response",
 			cause:      err,
@@ -442,7 +510,7 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 			zap.Int64("upstream_content_length", resp.ContentLength),
 			zap.String("content_type", resp.Header.Get("Content-Type")),
 		)
-		return &proxyResponseError{
+		return &gatewayResponseError{
 			statusCode: http.StatusBadGateway,
 			message:    "upstream response too large",
 		}
@@ -569,10 +637,7 @@ func targetPortFromHeaders(h http.Header) (string, bool) {
 
 func sandboxIDFromPath(path string) (string, bool) {
 	const marker = "/sandboxes/"
-	rest, found := strings.CutPrefix(path, marker)
-	if !found {
-		_, rest, found = strings.Cut(path, marker)
-	}
+	_, rest, found := strings.Cut(path, marker)
 	if !found {
 		return "", false
 	}
@@ -637,26 +702,14 @@ func (s *Server) logHostRoutingHeaderConflicts(r *http.Request, route *hostRoute
 	)
 }
 
-func isDataPlaneRouteSource(routeSource routeSource) bool {
-	return routeSource == routeSourceHeader || routeSource == routeSourceHost
-}
-
-// upstreamTargetPath returns the path to use when forwarding to the upstream
-// node. Requests routed via sandbox proxy host or routing headers are forwarded
-// to the /proxy sub-tree on the upstream, while control-plane and scheduled
-// requests are forwarded as-is.
-func upstreamTargetPath(routeSource routeSource, originalPath string) string {
-	if isDataPlaneRouteSource(routeSource) {
-		return "/proxy" + originalPath
+// upstreamTargetPaths applies the data-plane prefix to both path
+// representations together. The decoded and escaped forms must remain
+// independent so encoded path segments (for example %2F) are preserved.
+func upstreamTargetPaths(routeSource routeSource, decodedPath string, escapedPath string) (string, string) {
+	if routeSource == routeSourceHeader || routeSource == routeSourceHost {
+		return "/proxy" + decodedPath, "/proxy" + escapedPath
 	}
-	return originalPath
-}
-
-func upstreamTargetEscapedPath(routeSource routeSource, originalEscapedPath string) string {
-	if isDataPlaneRouteSource(routeSource) {
-		return "/proxy" + originalEscapedPath
-	}
-	return originalEscapedPath
+	return decodedPath, escapedPath
 }
 
 func joinUpstream(endpoint string, path string, escapedPath string, rawQuery string) (string, error) {
@@ -734,11 +787,11 @@ func setXForwardedFor(h http.Header, remoteAddr string) {
 	h.Set("X-Forwarded-For", host)
 }
 
-func requestContextForProxy(r *http.Request, routingCtx context.Context, streaming bool) (context.Context, context.CancelFunc) {
+func requestContextForProxy(r *http.Request, routingCtx context.Context, streaming bool) context.Context {
 	if streaming {
-		return r.Context(), func() {}
+		return r.Context()
 	}
-	return routingCtx, func() {}
+	return routingCtx
 }
 
 func isStreamingRequest(r *http.Request) bool {
@@ -775,14 +828,6 @@ func headerContainsToken(h http.Header, name string, want string) bool {
 		}
 	}
 	return false
-}
-
-func extractSandboxIDFromResponse(body []byte) (string, bool) {
-	ids := extractSandboxIDsFromResponse(body)
-	if len(ids) == 0 {
-		return "", false
-	}
-	return ids[0], true
 }
 
 func extractSandboxIDsFromResponse(body []byte) []string {
