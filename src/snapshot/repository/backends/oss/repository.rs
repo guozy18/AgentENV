@@ -1975,22 +1975,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_publish_identity_ignores_attempt_creation_time_but_not_backing() {
-        let mut winner = local_record();
-        winner.snapshot_type = SnapshotType::Distributed;
-        winner.owner_node_id = None;
-        let mut loser = winner.clone();
-        loser.created_at_unix_ms += 10;
-        loser.updated_at_unix_ms += 10;
-        assert!(winner.same_logical_identity(&loser));
-        assert!(!winner.same_stable_identity(&loser));
-
-        loser.snapshot_type = SnapshotType::Local;
-        loser.owner_node_id = Some("node-a".to_string());
-        assert!(!winner.same_logical_identity(&loser));
-    }
-
-    #[test]
     fn legacy_record_without_lifecycle_is_ready() {
         let record = local_record();
         let mut value = serde_json::to_value(record).expect("serialize record");

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use super::super::shared_runtime_cache_root;
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
+use super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
+use super::persist_atomic_file;
 use super::run_repository_blocking;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
@@ -13,7 +15,7 @@ use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::backends::common::validate_attached_drives;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryResult, SnapshotListFilter};
+use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
@@ -100,6 +102,155 @@ impl PosixFsBackend {
         Arc<dyn SnapshotRuntimeResolver>,
     ) {
         (self.repository, self.runtime_resolver)
+    }
+
+    pub(crate) fn local_from_parts(
+        root: std::path::PathBuf,
+        runtime_cache_root: std::path::PathBuf,
+        store: Arc<dyn OverlaybdLayerStore>,
+        cache: Arc<LocalArtifactCache>,
+    ) -> (
+        Arc<PosixFsLocalArtifactStore>,
+        Arc<dyn SnapshotRuntimeResolver>,
+    ) {
+        let artifact_store = Arc::new(PosixFsLocalArtifactStore::new(root.clone()));
+        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =
+            Arc::new(PosixFsRuntimeResolver::new_without_repository_lock(
+                root,
+                runtime_cache_root,
+                store,
+                cache,
+            ));
+        (artifact_store, runtime_resolver)
+    }
+}
+
+#[derive(Clone)]
+/// Node-local physical snapshot artifacts without a metadata catalog.
+///
+/// The configured primary repository owns the canonical `SnapshotRecord`.
+/// This store only writes fixed files, managed layers, and a commit marker;
+/// the marker makes the closure visible to the local runtime resolver.
+pub(crate) struct PosixFsLocalArtifactStore {
+    root: std::path::PathBuf,
+    artifact_store: PosixFsArtifactStore,
+}
+
+impl PosixFsLocalArtifactStore {
+    pub(crate) fn new(root: std::path::PathBuf) -> Self {
+        Self {
+            artifact_store: PosixFsArtifactStore::new(root.clone()),
+            root,
+        }
+    }
+
+    pub(crate) async fn commit(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<CommittedSnapshot> {
+        let store = self.clone();
+        run_repository_blocking("publish local snapshot artifacts", move || {
+            metadata
+                .validate()
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+            validate_attached_drives(&manifest)?;
+            let built = store
+                .artifact_store
+                .import_built_artifacts(&metadata.id, &manifest);
+            let built = match built {
+                Ok(built) => built,
+                Err(error) => {
+                    store.remove_snapshot_dir(&metadata.id);
+                    return Err(error);
+                }
+            };
+            let committed = PosixFsSnapshotRepository::committed_snapshot(&metadata, built);
+            let layout = PosixFsSnapshotArtifactLayout::new(&store.root, &metadata.id);
+            let marker = layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER);
+            let parent = marker.parent().ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve local snapshot marker parent '{}',",
+                    marker.display()
+                ),
+                source: None,
+            })?;
+            persist_atomic_file(parent, &marker, b"ready\n", "local snapshot commit marker")?;
+            Ok(committed)
+        })
+        .await
+    }
+
+    pub(crate) fn commit_marker(&self, id: &SnapshotId) -> std::path::PathBuf {
+        PosixFsSnapshotArtifactLayout::new(&self.root, id).path(POSIXFS_SNAPSHOT_COMMIT_MARKER)
+    }
+
+    pub(crate) fn has_committed(&self, id: &SnapshotId) -> bool {
+        self.commit_marker(id).is_file()
+    }
+
+    pub(crate) async fn purge(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+        let root = self.root.clone();
+        let id = id.clone();
+        run_repository_blocking("purge local snapshot artifacts", move || {
+            let path = PosixFsSnapshotArtifactLayout::new(&root, &id).snapshot_dir();
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(RepositoryError::backend(
+                    format!("remove local snapshot artifacts '{}'", path.display()),
+                    error,
+                )),
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn list_committed_ids(&self) -> RepositoryResult<Vec<SnapshotId>> {
+        let root = self.root.clone();
+        run_repository_blocking("list local snapshot artifacts", move || {
+            let snapshots_dir = PosixFsSnapshotArtifactLayout::snapshots_dir(&root);
+            let entries = match std::fs::read_dir(&snapshots_dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => {
+                    return Err(RepositoryError::backend(
+                        format!(
+                            "read local snapshot directory '{}'",
+                            snapshots_dir.display()
+                        ),
+                        error,
+                    ));
+                }
+            };
+            let mut ids = Vec::new();
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| RepositoryError::backend("read local snapshot entry", error))?
+                    .path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Ok(id) = SnapshotId::parse(name) else {
+                    continue;
+                };
+                let marker = PosixFsSnapshotArtifactLayout::new(&root, &id)
+                    .path(POSIXFS_SNAPSHOT_COMMIT_MARKER);
+                if marker.is_file() {
+                    ids.push(id);
+                }
+            }
+            Ok(ids)
+        })
+        .await
+    }
+
+    fn remove_snapshot_dir(&self, id: &SnapshotId) {
+        let path = PosixFsSnapshotArtifactLayout::new(&self.root, id).snapshot_dir();
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -246,17 +397,6 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn get_recovery_record(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        let id = id.clone();
-        self.run_catalog("load recovery snapshot record", move |catalog| {
-            catalog.get_recovery_record(&id)
-        })
-        .await
-    }
-
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         let id_or_alias = id_or_alias.to_string();
         self.run_catalog("load snapshot", move |catalog| catalog.get(&id_or_alias))
@@ -276,13 +416,6 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             .await
     }
 
-    async fn list_recovery_candidates(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.run_catalog("list snapshot recovery candidates", move |catalog| {
-            catalog.list_recovery_candidates()
-        })
-        .await
-    }
-
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
         let id_or_alias = id_or_alias.to_string();
         self.run_catalog("delete snapshot", move |catalog| {
@@ -298,21 +431,6 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         let id = id.clone();
         self.run_catalog("delete snapshot by id", move |catalog| {
             catalog.delete_record(&id)
-        })
-        .await
-    }
-
-    async fn purge_by_id(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        let id = id.clone();
-        self.run_catalog("purge node-local snapshot by id", move |catalog| {
-            catalog.purge_record(&id)
-        })
-        .await
-    }
-
-    async fn gc_unreferenced_artifacts(&self) -> RepositoryResult<usize> {
-        self.run_catalog("garbage-collect snapshot managed layers", |catalog| {
-            catalog.gc_unreferenced_managed_layers()
         })
         .await
     }

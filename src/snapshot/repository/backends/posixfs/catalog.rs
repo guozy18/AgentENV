@@ -403,28 +403,11 @@ impl PosixFsCatalogStore {
         &self,
         id: &SnapshotId,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
-        Ok(self
-            .get_recovery_record(id)?
-            .filter(SnapshotRecord::is_ready))
-    }
-
-    /// Loads an exact record with a durable committed closure for recovery,
-    /// without requiring the catalog lifecycle to have reached Ready.
-    pub(crate) fn get_recovery_record(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
         self.ensure_layout()?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
             return Ok(None);
         };
-        if record.committed.is_some()
-            && matches!(
-                record.lifecycle,
-                SnapshotLifecycle::Preparing | SnapshotLifecycle::Ready
-            )
-            && self.commit_marker_path(id).exists()
-        {
+        if record.committed.is_some() && record.is_ready() && self.commit_marker_path(id).exists() {
             Ok(Some(record))
         } else {
             Ok(None)
@@ -575,22 +558,6 @@ impl PosixFsCatalogStore {
         Ok(records)
     }
 
-    /// Lists every durable local record, including hidden lifecycle states.
-    /// Public list/get intentionally hide Preparing and Deleting identities,
-    /// but node-local reconciliation must discover them after a crash so an
-    /// interrupted metadata commit or purge can converge.
-    pub(crate) fn list_recovery_candidates(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.ensure_layout()?;
-        let mut records = self.load_all_records_unlocked()?;
-        records.sort_by(|left, right| {
-            right
-                .updated_at_unix_ms
-                .cmp(&left.updated_at_unix_ms)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-        });
-        Ok(records)
-    }
-
     fn load_all_records_unlocked(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
         let records_dir = self.records_dir();
         let mut records = Vec::new();
@@ -722,22 +689,10 @@ impl PosixFsCatalogStore {
     }
 
     pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        self.delete_record_with_policy(id, true)
+        self.delete_record_with_policy(id)
     }
 
-    /// Removes a node-local recovery closure after its canonical identity is
-    /// no longer served from this store. The same fence and runtime lease
-    /// ordering as canonical deletion are retained, but the local record is
-    /// physically removed instead of becoming a reusable identity tombstone.
-    pub(crate) fn purge_record(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        self.delete_record_with_policy(id, false)
-    }
-
-    fn delete_record_with_policy(
-        &self,
-        id: &SnapshotId,
-        retain_tombstone: bool,
-    ) -> RepositoryResult<bool> {
+    fn delete_record_with_policy(&self, id: &SnapshotId) -> RepositoryResult<bool> {
         // Fence the identity before waiting for a runtime artifact lease. A
         // runnable snapshot holds the repository shared lock for its whole
         // lifetime, so taking the exclusive lock first would leave the
@@ -785,7 +740,7 @@ impl PosixFsCatalogStore {
             // remove both committed and any empty/interrupted publish
             // directory on every retry.
             store.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
-            if retain_tombstone && record.committed.is_some() {
+            if record.committed.is_some() {
                 // Keep a compact terminal identity tombstone after the
                 // physical closure is gone. This prevents a late publisher
                 // from resurrecting the same SnapshotId, while public reads
@@ -794,8 +749,6 @@ impl PosixFsCatalogStore {
                 tombstone.committed = None;
                 tombstone.updated_at_unix_ms = now_unix_ms();
                 store.write_record_unlocked(&tombstone)?;
-            } else if !retain_tombstone {
-                store.remove_file_if_exists(&store.record_path(id))?;
             }
             Ok(true)
         };

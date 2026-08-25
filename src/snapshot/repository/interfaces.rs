@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::errors::{RepositoryError, RepositoryResult};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
-    RunnableSnapshot, SnapshotId, SnapshotLifecycle, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
+    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
+    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
 /// Snapshot record list filter.
@@ -14,8 +14,7 @@ use crate::snapshot::types::{
 /// When multiple fields are present they combine with AND semantics.
 /// When all fields are `None`, the filter matches all publicly visible
 /// snapshot records, including pending template builds and committed
-/// snapshots. Hidden Preparing/Deleting identities are available only through
-/// [`SnapshotRepository::list_recovery_candidates`].
+/// snapshots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotListFilter {
     /// Match aliases that start with this prefix.
@@ -230,10 +229,7 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// Unlike [`Self::get_record`], this read excludes hidden lifecycle states,
     /// records without committed artifacts, and backend-specific records whose
-    /// visibility/commit marker is missing. Lifecycle reconciliation should use
-    /// [`Self::get_record`] for hidden-state inspection and
-    /// [`Self::get_recovery_record`] when it needs to validate a committed
-    /// closure.
+    /// visibility/commit marker is missing.
     async fn get_committed_record(
         &self,
         id: &SnapshotId,
@@ -242,26 +238,6 @@ pub trait SnapshotRepository: Send + Sync {
             .get_record(id)
             .await?
             .filter(|record| record.is_ready() && record.committed.is_some()))
-    }
-
-    /// Loads an exact record whose immutable closure is committed and visible
-    /// to recovery, including hidden Preparing lifecycle states.
-    ///
-    /// This is intentionally separate from [`Self::get_committed_record`]:
-    /// public runnable reads must require `Ready`, while startup reconciliation
-    /// must be able to finish a metadata commit after a crash that persisted a
-    /// Preparing record after the closure and its commit marker were durable.
-    async fn get_recovery_record(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        Ok(self.get_record(id).await?.filter(|record| {
-            record.committed.is_some()
-                && matches!(
-                    record.lifecycle,
-                    SnapshotLifecycle::Preparing | SnapshotLifecycle::Ready
-                )
-        }))
     }
 
     /// Loads one snapshot record by repository id or alias.
@@ -277,17 +253,6 @@ pub trait SnapshotRepository: Send + Sync {
 
     /// Lists snapshot records matching the provided filter.
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
-
-    /// Lists records that may need node-local recovery reconciliation.
-    ///
-    /// Public listing intentionally hides Preparing/Deleting identities. A
-    /// node-local recovery store must still be able to discover those hidden
-    /// records after a crash so an interrupted purge or metadata commit can
-    /// converge. Backends that do not expose a separate local recovery store
-    /// may use the public list as a conservative default.
-    async fn list_recovery_candidates(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.list(SnapshotListFilter::matches_all()).await
-    }
 
     /// Deletes one snapshot record by repository id or alias.
     ///
@@ -310,26 +275,6 @@ pub trait SnapshotRepository: Send + Sync {
         Err(RepositoryError::Unsupported {
             feature: "deleting a snapshot by exact id".to_string(),
         })
-    }
-
-    /// Purges a node-local recovery closure after its canonical metadata has
-    /// moved to Distributed or otherwise made the local copy unnecessary.
-    ///
-    /// This is deliberately distinct from [`Self::delete_by_id`]: canonical
-    /// repositories may retain a terminal identity tombstone to fence stale
-    /// writers, while a node-local recovery store must release the physical
-    /// record so it cannot block a later local recovery publication.
-    async fn purge_by_id(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
-        Err(RepositoryError::Unsupported {
-            feature: "purging a node-local snapshot closure".to_string(),
-        })
-    }
-
-    /// Reclaims repository-owned managed layers that no committed closure references.
-    /// Repositories without a local managed-layer store may treat this as a
-    /// no-op; the manager uses it only for node-local recovery maintenance.
-    async fn gc_unreferenced_artifacts(&self) -> RepositoryResult<usize> {
-        Ok(0)
     }
 
     /// Resolves a human-readable alias to the current snapshot id.

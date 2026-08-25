@@ -13,6 +13,7 @@ use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 pub use oss::OssBackend;
+pub(crate) use posixfs::PosixFsLocalArtifactStore;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
@@ -72,28 +73,25 @@ pub fn build_snapshot_backend(
     }
 }
 
-/// Builds the durable node-local POSIX repository used for sandbox recovery
-/// points. It is deliberately independent of the configured publication
-/// backend, so an OSS outage cannot prevent a local snapshot from committing.
+/// Builds the durable node-local POSIX artifact store used for Local snapshots.
+/// It is deliberately independent of the configured publication backend, so
+/// an OSS outage cannot prevent a local physical closure from being committed.
 pub(crate) fn build_local_snapshot_backend() -> Result<(
-    Arc<dyn SnapshotRepository>,
+    Arc<PosixFsLocalArtifactStore>,
     Arc<dyn SnapshotRuntimeResolver>,
 )> {
     let config = ConfigManager::global_config();
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
     let root = config.home_path.join("snapshot-local-store");
     let cache_root = root.join("cache");
+    let runtime_root = root.join("runtime");
     let cache = LocalArtifactCache::new(cache_root.clone(), None)?;
-    Ok(PosixFsBackend::from_parts(
-        PosixFsBackendConfig {
-            root: root.clone(),
-            cache_root: Some(cache_root),
-            runtime_cache_root: Some(root.join("runtime")),
-        },
+    Ok(PosixFsBackend::local_from_parts(
+        root,
+        runtime_root,
         overlaybd_layers,
         cache,
-    )
-    .into_parts())
+    ))
 }
 
 pub(crate) fn shared_runtime_cache_root() -> PathBuf {
