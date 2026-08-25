@@ -6,7 +6,6 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use dashmap::DashMap;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -38,12 +37,6 @@ use super::types::{
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
-
-#[derive(Default)]
-struct SandboxGate {
-    data_plane: Arc<RwLock<()>>,
-    lifecycle: Mutex<()>,
-}
 
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
@@ -78,6 +71,7 @@ impl ShutdownOutcome {
 enum FailedLaunchStage {
     Registered,
     TransitionalPersisted,
+    RunningPersisted,
 }
 
 impl FailedLaunchStage {
@@ -85,11 +79,12 @@ impl FailedLaunchStage {
         match self {
             Self::Registered => None,
             Self::TransitionalPersisted => Some(plan.transitional_state()),
+            Self::RunningPersisted => Some(SandboxState::Running),
         }
     }
 
     fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::TransitionalPersisted)
+        matches!(self, Self::RunningPersisted)
     }
 }
 
@@ -102,10 +97,6 @@ pub struct Orchestrator<
     factory: F,
     persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
-    /// Proxy draining and lifecycle completion share one per-sandbox owner,
-    /// while remaining independent locks: delete must wait for lifecycle
-    /// finalization without waiting for long-lived proxy streams.
-    sandbox_gates: DashMap<SandboxId, Arc<SandboxGate>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -196,7 +187,6 @@ where
             factory,
             persister,
             sandboxes: RwLock::new(HashMap::new()),
-            sandbox_gates: DashMap::new(),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -604,7 +594,7 @@ where
                         let mut sandbox = source_handle.lock().await;
                         sandbox.stop().await
                     };
-                    self.remove_sandbox_metadata(&source_sandbox_id).await?;
+                    self.store.remove(&source_sandbox_id).await?;
                 } else {
                     let _ = self
                         .store
@@ -762,6 +752,14 @@ where
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn proxy_lookup_for(&self, sandbox_id: &SandboxId) -> Result<ProxyLookupResult> {
+        if let Some(route) = self.proxy_routes.read().await.route(sandbox_id).cloned() {
+            trace!(
+                version = route.version(),
+                "resolved running proxy target from runtime table"
+            );
+            return Ok(ProxyLookupResult::Ready(route.target().clone()));
+        }
+
         let metadata = self.store.get(sandbox_id).await?;
         Ok(match metadata {
             None => {
@@ -769,19 +767,8 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
-                match self.proxy_routes.read().await.route(sandbox_id).cloned() {
-                    Some(route) => {
-                        trace!(
-                            version = route.version(),
-                            "resolved running proxy target from runtime table"
-                        );
-                        ProxyLookupResult::Ready(route.target().clone())
-                    }
-                    None => {
-                        warn!("running sandbox is missing a runtime proxy route");
-                        ProxyLookupResult::RouteMissing
-                    }
-                }
+                warn!("running sandbox is missing a runtime proxy route");
+                ProxyLookupResult::RouteMissing
             }
             Some(metadata) if metadata.state == SandboxState::Paused => {
                 debug!(auto_resume = metadata.auto_resume, "sandbox is paused");
@@ -794,70 +781,6 @@ where
                 ProxyLookupResult::Unavailable(metadata.state)
             }
         })
-    }
-
-    /// Acquires the data-plane read side of a sandbox lifecycle gate. The
-    /// owned guard can be held by a response body or WebSocket bridge.
-    pub(crate) async fn acquire_proxy_read(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
-        let existing_gate = self
-            .sandbox_gates
-            .get(sandbox_id)
-            .map(|gate| Arc::clone(gate.value()));
-        if let Some(gate) = existing_gate {
-            return Ok(Arc::clone(&gate.data_plane).read_owned().await);
-        }
-        if self.store.get(sandbox_id).await?.is_none() {
-            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
-        }
-
-        let gate = self.sandbox_gate(sandbox_id);
-        let guard = Arc::clone(&gate.data_plane).read_owned().await;
-        if self.store.get(sandbox_id).await?.is_some() {
-            return Ok(guard);
-        }
-
-        drop(guard);
-        self.sandbox_gates.remove(sandbox_id);
-        Err(OrchestratorError::SandboxNotFound(*sandbox_id))
-    }
-
-    fn sandbox_gate(&self, sandbox_id: &SandboxId) -> Arc<SandboxGate> {
-        self.sandbox_gates
-            .entry(*sandbox_id)
-            .or_insert_with(|| Arc::new(SandboxGate::default()))
-            .clone()
-    }
-
-    async fn remove_sandbox_metadata(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> super::store::Result<Option<SandboxMetadata>> {
-        let metadata = self.store.remove(sandbox_id).await?;
-        self.sandbox_gates.remove(sandbox_id);
-        Ok(metadata)
-    }
-
-    async fn cleanup_paused_state(
-        &self,
-        sandbox_id: &SandboxId,
-        artifacts_are_independent: bool,
-        after: &'static str,
-    ) -> bool {
-        let result = if artifacts_are_independent {
-            self.persister.delete_record_and_artifacts(sandbox_id).await
-        } else {
-            self.persister.delete_record(sandbox_id).await
-        };
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                warn!(%error, artifacts_are_independent, after, "failed to clean up paused sandbox state");
-                false
-            }
-        }
     }
 
     /// Updates the keep-alive timeout for a RUNNING sandbox.
@@ -1042,25 +965,9 @@ where
             }
         };
 
-        let delete_gate = self.sandbox_gate(&sandbox_id);
-        let _delete_lifecycle = delete_gate.lifecycle.lock().await;
-
-        // Removing the record is the durable deletion fence. Keep artifacts
-        // until after the runtime stops because a legacy resumed runtime may
-        // still read them, but never report deletion while a loadable Paused
-        // record remains.
-        if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                .await;
-            return Err(OrchestratorError::from(err));
-        }
-
-        let (handle, _) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         // If the sandbox is still in memory, attempt to stop it.
-        let mut stop_error = None;
         if let Some(handle) = handle {
             let stop_result = {
                 let mut sandbox = handle.lock().await;
@@ -1068,13 +975,23 @@ where
             };
 
             if let Err(err) = stop_result {
-                warn!(error = ?err, "sandbox stop failed during delete; not restoring a potentially destroyed runtime");
-                stop_error = Some(err);
+                warn!(error = ?err, "failed to stop sandbox during delete");
+                self.sandboxes.write().await.insert(sandbox_id, handle);
+                self.restore_proxy_route(sandbox_id, removed_route).await;
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::Stop,
+                    source: err,
+                });
             }
         }
 
         // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.remove_sandbox_metadata(&sandbox_id).await?;
+        let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1093,14 +1010,7 @@ where
             .await;
         info!("sandbox deleted");
 
-        match stop_error {
-            Some(source) => Err(OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
-                operation: SandboxOperation::Stop,
-                source,
-            }),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Stops every known sandbox and tears down in-memory runtime state.
@@ -1179,15 +1089,6 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        // The state transition closes admission for new proxy requests. Drain
-        // requests that acquired their read guard while the sandbox was still
-        // Running before pause captures and tears down the runtime.
-        let pause_gate = self.sandbox_gate(&sandbox_id);
-        // Keep data_plane -> lifecycle order: auto-resume holds a data-plane
-        // read while joining lifecycle finalization.
-        let _pause_data_plane = Arc::clone(&pause_gate.data_plane).write_owned().await;
-        let _pause_lifecycle = pause_gate.lifecycle.lock().await;
-
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1242,7 +1143,7 @@ where
             warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
-            self.remove_sandbox_metadata(&sandbox_id).await?;
+            self.store.remove(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1266,16 +1167,10 @@ where
                         let mut sandbox = handle.lock().await;
                         sandbox.stop().await
                     };
-                    match stop_result {
-                        Ok(()) => {
-                            self.cleanup_paused_state(&sandbox_id, true, "terminal pause failure")
-                                .await;
-                        }
-                        Err(stop_err) => {
-                            warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
-                        }
+                    if let Err(stop_err) = stop_result {
+                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
                     }
-                    self.remove_sandbox_metadata(&sandbox_id).await?;
+                    self.store.remove(&sandbox_id).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1319,7 +1214,6 @@ where
             .await
         {
             warn!(error = ?err, "failed to persist paused sandbox state");
-            let mut release_paused_image_refs = true;
             let resume_result = {
                 let mut sandbox = handle.lock().await;
                 sandbox.resume().await
@@ -1330,80 +1224,27 @@ where
                     let mut sandbox = handle.lock().await;
                     sandbox.stop().await
                 };
-                let record_fenced = match stop_result {
-                    Ok(()) => {
-                        self.cleanup_paused_state(
-                            &sandbox_id,
-                            true,
-                            "persistence and resume failure",
-                        )
-                        .await
-                    }
-                    Err(stop_err) => {
-                        warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
-                        false
-                    }
-                };
-                if !record_fenced {
-                    release_paused_image_refs = false;
+                if let Err(stop_err) = stop_result {
+                    warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
                 }
-                if let Err(error) = self.remove_sandbox_metadata(&sandbox_id).await {
+                if let Err(error) = self.store.remove(&sandbox_id).await {
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
             } else {
-                let artifacts_are_independent =
-                    paused_state.artifacts_are_independent_after_resume();
-                let record_fenced = match self.persister.delete_record(&sandbox_id).await {
-                    Ok(()) => true,
-                    Err(delete_error) => {
-                        warn!(error = ?delete_error, "failed to delete ambiguously persisted paused record; trying a resuming tombstone");
-                        match self.persister.mark_resuming(&sandbox_id).await {
-                            Ok(()) => true,
-                            Err(fence_error) => {
-                                warn!(error = ?fence_error, "failed to fence ambiguously persisted paused record; not restoring Running metadata");
-                                false
-                            }
-                        }
-                    }
-                };
-                if record_fenced {
-                    if artifacts_are_independent {
-                        self.cleanup_paused_state(
-                            &sandbox_id,
-                            true,
-                            "pause persistence failure after successful runtime recovery",
-                        )
-                        .await;
-                    }
-                    self.sandboxes.write().await.insert(sandbox_id, handle);
-                    self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                        .await;
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Pausing],
-                        )
-                        .await;
-                } else {
-                    release_paused_image_refs = false;
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_error) = stop_result {
-                        warn!(error = ?stop_error, "failed to stop sandbox after persistence fencing failure");
-                    }
-                    if let Err(remove_error) = self.remove_sandbox_metadata(&sandbox_id).await {
-                        warn!(error = ?remove_error, "failed to remove sandbox after persistence fencing failure");
-                    }
-                }
-            }
-            if release_paused_image_refs {
-                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                self.sandboxes.write().await.insert(sandbox_id, handle);
+                self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                    .await;
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Pausing],
+                    )
                     .await;
             }
+            self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                .await;
             return Err(OrchestratorError::InternalError(format!(
                 "failed to persist paused sandbox state: {err:#}"
             )));
@@ -1475,7 +1316,7 @@ where
             }
             SandboxState::Running => {
                 // Already running — just update the timeout if requested and return.
-                return self.finish_running_resume(sandbox_id, timeout).await;
+                return self.maybe_update_running_timeout(sandbox_id, timeout).await;
             }
             SandboxState::Paused => {}
             state => {
@@ -1506,7 +1347,7 @@ where
                 return match actual_state {
                     SandboxState::Running => {
                         // Another task already completed the resume.
-                        self.finish_running_resume(sandbox_id, timeout).await
+                        self.maybe_update_running_timeout(sandbox_id, timeout).await
                     }
                     SandboxState::Resuming => {
                         // A second concurrent resume snuck in between our state
@@ -1528,12 +1369,6 @@ where
             }
             Err(err) => return Err(OrchestratorError::from(err)),
         }
-
-        // This lock is separate from the data-plane RwLock: proxy auto-resume
-        // may already hold a read guard, while lifecycle followers must wait
-        // until old-record cleanup, ref release, and the Resume event finish.
-        let resume_gate = self.sandbox_gate(&sandbox_id);
-        let _resume_lifecycle = resume_gate.lifecycle.lock().await;
 
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
@@ -1621,15 +1456,6 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        // The state transition closes admission for new proxy requests. The
-        // write guard then drains requests that resolved while the sandbox was
-        // still Running before capture mutates the runtime.
-        let snapshot_gate = self.sandbox_gate(&sandbox_id);
-        // Match pause's data_plane -> lifecycle order; reversing it can
-        // deadlock an auto-resume follower that already holds a proxy read.
-        let _snapshot_data_plane = Arc::clone(&snapshot_gate.data_plane).write_owned().await;
-        let _snapshot_lifecycle = snapshot_gate.lifecycle.lock().await;
-
         // Get the sandbox handle.
         let handle = {
             let sandboxes = self.sandboxes.read().await;
@@ -1638,7 +1464,7 @@ where
         let Some(handle) = handle else {
             warn!("sandbox handle not found while snapshotting, removing from store");
             self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            self.remove_sandbox_metadata(&sandbox_id).await?;
+            self.store.remove(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1662,7 +1488,7 @@ where
                     if let Err(stop_err) = stop_result {
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal snapshot failure");
                     }
-                    self.remove_sandbox_metadata(&sandbox_id).await?;
+                    self.store.remove(&sandbox_id).await?;
                 } else {
                     let _ = self
                         .store
@@ -1965,30 +1791,14 @@ where
         Ok(update_result.current)
     }
 
-    async fn finish_running_resume(
-        &self,
-        sandbox_id: SandboxId,
-        timeout: NewTimeout,
-    ) -> Result<SandboxMetadata> {
-        let gate = self.sandbox_gate(&sandbox_id);
-        let _completion = gate.lifecycle.lock().await;
-        self.maybe_update_running_timeout(sandbox_id, timeout).await
-    }
-
     /// Joins a concurrent pause already in progress for the same sandbox.
     /// Waits for the `Pausing` state to resolve and maps the final state to
     /// the appropriate `Ok(())` / `Err(...)` result.
     async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<()> {
         debug!("concurrent pause in progress, waiting for completion");
-        let gate = self.sandbox_gate(&sandbox_id);
-        self.wait_for_transition(sandbox_id, SandboxState::Pausing)
-            .await?;
-        let _completion = gate.lifecycle.lock().await;
         let m = self
-            .store
-            .get(&sandbox_id)
-            .await?
-            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            .wait_for_transition(sandbox_id, SandboxState::Pausing)
+            .await?;
         match m.state {
             SandboxState::Paused => {
                 debug!("concurrent pause succeeded");
@@ -2024,15 +1834,9 @@ where
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
         debug!("concurrent resume in progress, waiting for completion");
-        let gate = self.sandbox_gate(&sandbox_id);
-        self.wait_for_transition(sandbox_id, SandboxState::Resuming)
-            .await?;
-        let _completion = gate.lifecycle.lock().await;
         let m = self
-            .store
-            .get(&sandbox_id)
-            .await?
-            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            .wait_for_transition(sandbox_id, SandboxState::Resuming)
+            .await?;
         match m.state {
             SandboxState::Running => self.maybe_update_running_timeout(sandbox_id, timeout).await,
             SandboxState::Paused => {
@@ -2287,43 +2091,8 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
-        let proxy_target = {
-            let sandbox = handle.lock().await;
-            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
-                Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
-                    drop(sandbox);
-                    self.cleanup_failed_launch(
-                        &plan,
-                        handle,
-                        FailedLaunchStage::TransitionalPersisted,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
-        };
-        if !self
-            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
-            .await
-        {
-            warn!("sandbox runtime handle became stale before route publication");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
-            return Err(OrchestratorError::InternalError(
-                "sandbox runtime handle became stale before route publication".to_string(),
-            ));
-        }
-
         let launch_timeout = plan.timeout();
-        let resume_artifacts_are_independent = match &plan {
-            LaunchPlan::Create(_) => None,
-            LaunchPlan::Resume(resume) => {
-                Some(resume.paused_state.artifacts_are_independent_after_resume())
-            }
-        };
-        let is_resume = resume_artifacts_are_independent.is_some();
+        let is_resume = matches!(plan, LaunchPlan::Resume(_));
         let final_metadata = match self
             .store
             .update_if_state(
@@ -2349,9 +2118,30 @@ where
             }
         };
 
-        if let Some(artifacts_are_independent) = resume_artifacts_are_independent {
-            self.cleanup_paused_state(&sandbox_id, artifacts_are_independent, "successful resume")
-                .await;
+        let proxy_target = {
+            let sandbox = handle.lock().await;
+            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
+                Ok(proxy_target) => proxy_target,
+                Err(err) => {
+                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
+                    drop(sandbox);
+                    self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+                        .await;
+                    return Err(err);
+                }
+            }
+        };
+        if !self
+            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
+            .await
+        {
+            debug!("skipping runtime proxy route publication because sandbox handle is stale");
+        }
+
+        if is_resume {
+            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
+                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+            }
         }
 
         info!("sandbox launch completed");
@@ -2427,7 +2217,7 @@ where
             .await;
         match plan {
             LaunchPlan::Create(_) => {
-                if let Err(err) = self.remove_sandbox_metadata(&plan.sandbox_id()).await {
+                if let Err(err) = self.store.remove(&plan.sandbox_id()).await {
                     warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
                 }
             }

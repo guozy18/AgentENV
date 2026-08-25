@@ -4,9 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use overlaybd::config::LayerConfig;
 
-use super::catalog::{PosixFileLockGuard, PosixFsCatalogStore};
 use super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
-use super::run_repository_blocking;
 use crate::image::cache::OverlaybdLayerStore;
 use crate::snapshot::artifact_cache::{CacheHandle, LocalArtifactCache};
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
@@ -25,7 +23,6 @@ use crate::snapshot::{
 /// Resolves committed snapshot artifacts into node-local runnable paths on a POSIX filesystem.
 pub struct PosixFsRuntimeResolver {
     repository_root: PathBuf,
-    repository_lock_root: Option<PathBuf>,
     image_materializer: RuntimeImageMaterializer,
     cache: Arc<LocalArtifactCache>,
 }
@@ -37,11 +34,6 @@ struct MaterializeSpec<'a> {
     allow_empty_layers: bool,
 }
 
-struct PosixRuntimeArtifactLease {
-    _cache_handles: Vec<CacheHandle>,
-    _repository_lock: Option<PosixFileLockGuard>,
-}
-
 impl PosixFsRuntimeResolver {
     /// Creates a runtime resolver that turns committed POSIX-backed snapshots into node-local
     /// runnable paths.
@@ -51,34 +43,8 @@ impl PosixFsRuntimeResolver {
         store: Arc<dyn OverlaybdLayerStore>,
         cache: Arc<LocalArtifactCache>,
     ) -> Self {
-        Self::with_lock_root(
-            repository_root.clone(),
-            Some(repository_root),
-            runtime_cache_root,
-            store,
-            cache,
-        )
-    }
-
-    pub(crate) fn new_without_repository_lock(
-        repository_root: PathBuf,
-        runtime_cache_root: PathBuf,
-        store: Arc<dyn OverlaybdLayerStore>,
-        cache: Arc<LocalArtifactCache>,
-    ) -> Self {
-        Self::with_lock_root(repository_root, None, runtime_cache_root, store, cache)
-    }
-
-    fn with_lock_root(
-        repository_root: PathBuf,
-        repository_lock_root: Option<PathBuf>,
-        runtime_cache_root: PathBuf,
-        store: Arc<dyn OverlaybdLayerStore>,
-        cache: Arc<LocalArtifactCache>,
-    ) -> Self {
         Self {
             repository_root,
-            repository_lock_root,
             image_materializer: RuntimeImageMaterializer::new(runtime_cache_root, store),
             cache,
         }
@@ -97,17 +63,6 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is not ready", snapshot.id),
                 })?;
-        let repository_lock = if let Some(repository_root) = &self.repository_lock_root {
-            let repository_root = repository_root.clone();
-            Some(
-                run_repository_blocking("acquire POSIX runtime artifact lease", move || {
-                    PosixFsCatalogStore::new(repository_root).acquire_repository_shared_lock()
-                })
-                .await?,
-            )
-        } else {
-            None
-        };
         let snapshot_id = snapshot.id.clone();
         let commit_marker = self
             .snapshot_layout(&snapshot_id)
@@ -152,10 +107,7 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
-        let artifact_lease: Arc<RuntimeArtifactLease> = Arc::new(PosixRuntimeArtifactLease {
-            _cache_handles: handles,
-            _repository_lock: repository_lock,
-        });
+        let artifact_lease: Arc<RuntimeArtifactLease> = Arc::new(handles);
         let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, artifact_lease);
         Ok(runnable)
     }

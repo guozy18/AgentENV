@@ -114,13 +114,9 @@ impl PosixFsBackend {
         Arc<dyn SnapshotRuntimeResolver>,
     ) {
         let artifact_store = Arc::new(PosixFsLocalArtifactStore::new(root.clone()));
-        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =
-            Arc::new(PosixFsRuntimeResolver::new_without_repository_lock(
-                root,
-                runtime_cache_root,
-                store,
-                cache,
-            ));
+        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
+            PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
+        );
         (artifact_store, runtime_resolver)
     }
 }
@@ -151,9 +147,6 @@ impl PosixFsLocalArtifactStore {
     ) -> RepositoryResult<CommittedSnapshot> {
         let store = self.clone();
         run_repository_blocking("publish local snapshot artifacts", move || {
-            metadata
-                .validate()
-                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
             validate_attached_drives(&manifest)?;
             let built = store
                 .artifact_store
@@ -181,71 +174,14 @@ impl PosixFsLocalArtifactStore {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_marker(&self, id: &SnapshotId) -> std::path::PathBuf {
         PosixFsSnapshotArtifactLayout::new(&self.root, id).path(POSIXFS_SNAPSHOT_COMMIT_MARKER)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_committed(&self, id: &SnapshotId) -> bool {
         self.commit_marker(id).is_file()
-    }
-
-    pub(crate) async fn purge(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        let root = self.root.clone();
-        let id = id.clone();
-        run_repository_blocking("purge local snapshot artifacts", move || {
-            let path = PosixFsSnapshotArtifactLayout::new(&root, &id).snapshot_dir();
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(RepositoryError::backend(
-                    format!("remove local snapshot artifacts '{}'", path.display()),
-                    error,
-                )),
-            }
-        })
-        .await
-    }
-
-    pub(crate) async fn list_committed_ids(&self) -> RepositoryResult<Vec<SnapshotId>> {
-        let root = self.root.clone();
-        run_repository_blocking("list local snapshot artifacts", move || {
-            let snapshots_dir = PosixFsSnapshotArtifactLayout::snapshots_dir(&root);
-            let entries = match std::fs::read_dir(&snapshots_dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => {
-                    return Err(RepositoryError::backend(
-                        format!(
-                            "read local snapshot directory '{}'",
-                            snapshots_dir.display()
-                        ),
-                        error,
-                    ));
-                }
-            };
-            let mut ids = Vec::new();
-            for entry in entries {
-                let path = entry
-                    .map_err(|error| RepositoryError::backend("read local snapshot entry", error))?
-                    .path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let Ok(id) = SnapshotId::parse(name) else {
-                    continue;
-                };
-                let marker = PosixFsSnapshotArtifactLayout::new(&root, &id)
-                    .path(POSIXFS_SNAPSHOT_COMMIT_MARKER);
-                if marker.is_file() {
-                    ids.push(id);
-                }
-            }
-            Ok(ids)
-        })
-        .await
     }
 
     fn remove_snapshot_dir(&self, id: &SnapshotId) {
@@ -263,9 +199,6 @@ pub(crate) struct PosixFsSnapshotRepository {
 impl PosixFsSnapshotRepository {
     pub(crate) fn new(root: std::path::PathBuf) -> Self {
         let catalog_store = PosixFsCatalogStore::new(root.clone());
-        if let Err(error) = catalog_store.reconcile_startup() {
-            tracing::warn!(error = %error, "snapshot catalog startup reconciliation failed");
-        }
         Self {
             catalog_store,
             artifact_store: PosixFsArtifactStore::new(root),
@@ -287,7 +220,6 @@ impl PosixFsSnapshotRepository {
             attached_drives: built.attached_drives,
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
-            legacy_artifact_namespace: None,
         }
     }
 
@@ -307,8 +239,8 @@ impl PosixFsSnapshotRepository {
             Err(error) => {
                 // `begin_publish` creates the per-identity staging directory
                 // before validation. Remove that empty staging directory on
-                // a rejected retry (in particular a Deleting tombstone), but
-                // keep any already committed closure intact.
+                // a rejected retry, but keep any already committed closure
+                // intact.
                 let _ = self.catalog_store.abort_publish(&session);
                 return Err(error);
             }
@@ -378,37 +310,10 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn get_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
-        let id = id.clone();
-        self.run_catalog("load exact snapshot record", move |catalog| {
-            catalog.get_record(&id)
-        })
-        .await
-    }
-
-    async fn get_committed_record(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        let id = id.clone();
-        self.run_catalog("load committed snapshot record", move |catalog| {
-            catalog.get_committed_record(&id)
-        })
-        .await
-    }
-
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         let id_or_alias = id_or_alias.to_string();
         self.run_catalog("load snapshot", move |catalog| catalog.get(&id_or_alias))
             .await
-    }
-
-    async fn get_for_delete(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        let id_or_alias = id_or_alias.to_string();
-        self.run_catalog("load snapshot for delete", move |catalog| {
-            catalog.get_for_delete(&id_or_alias)
-        })
-        .await
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -419,18 +324,10 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
         let id_or_alias = id_or_alias.to_string();
         self.run_catalog("delete snapshot", move |catalog| {
-            let Some(record) = catalog.get_for_delete(&id_or_alias)? else {
+            let Some(record) = catalog.get(&id_or_alias)? else {
                 return Ok(());
             };
             catalog.delete_record(&record.id).map(|_| ())
-        })
-        .await
-    }
-
-    async fn delete_by_id(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        let id = id.clone();
-        self.run_catalog("delete snapshot by id", move |catalog| {
-            catalog.delete_record(&id)
         })
         .await
     }
@@ -466,17 +363,12 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
 
 #[cfg(test)]
 mod tests {
+    use overlaybd::config::ImageConfig as OverlaybdImageConfig;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
-
-    use overlaybd::config::ImageConfig as OverlaybdImageConfig;
     use tempfile::TempDir;
-    use tokio::sync::oneshot;
-    use tokio::time::timeout;
 
-    use super::super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
@@ -492,8 +384,6 @@ mod tests {
         TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
     };
     use crate::types::SandboxResources;
-
-    use super::super::catalog::PosixFsCatalogStore;
 
     #[derive(Debug)]
     struct TestOverlaybdLayerStore;
@@ -626,271 +516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_runnable_lease_blocks_delete_until_drop() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = test_backend(tempdir.path());
-        let repository = backend.repository();
-        let resolver = backend.runtime_resolver();
-        let snapshot_id = SnapshotId::generate();
-        let stored = repository
-            .publish(
-                sample_metadata(snapshot_id.clone(), Some("leased-delete")),
-                seed_built_snapshot(tempdir.path()),
-            )
-            .await
-            .expect("publish should work");
-        let runnable = resolver
-            .resolve(Arc::new(stored))
-            .await
-            .expect("resolve should work");
-
-        let root = tempdir.path().to_path_buf();
-        let id_for_delete = snapshot_id.clone();
-        let (started_tx, started_rx) = oneshot::channel();
-        let mut delete_task = tokio::task::spawn_blocking(move || {
-            started_tx.send(()).expect("start signal should send");
-            PosixFsCatalogStore::new(root).delete_record(&id_for_delete)
-        });
-        started_rx.await.expect("delete task should start");
-        assert!(timeout(Duration::from_millis(200), &mut delete_task)
-            .await
-            .is_err());
-        assert!(PosixFsSnapshotArtifactLayout::record_path(tempdir.path(), &snapshot_id).exists());
-        assert_eq!(
-            repository
-                .get_record(&snapshot_id)
-                .await
-                .expect("fenced record lookup should work")
-                .expect("delete fence should retain the identity")
-                .lifecycle,
-            crate::snapshot::SnapshotLifecycle::Deleting
-        );
-
-        drop(runnable);
-        assert!(timeout(Duration::from_secs(2), delete_task)
-            .await
-            .expect("delete should finish after the runnable lease is dropped")
-            .expect("delete task should join")
-            .expect("delete should succeed"));
-        let tombstone = repository
-            .get_record(&snapshot_id)
-            .await
-            .expect("terminal tombstone lookup should work")
-            .expect("delete should retain the terminal identity tombstone");
-        assert_eq!(
-            tombstone.lifecycle,
-            crate::snapshot::SnapshotLifecycle::Deleting
-        );
-        assert!(tombstone.committed.is_none());
-    }
-
-    #[tokio::test]
-    async fn resolved_runnable_lease_blocks_managed_layer_gc_until_drop() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = test_backend(tempdir.path());
-        let repository = backend.repository();
-        let resolver = backend.runtime_resolver();
-        let snapshot_id = SnapshotId::generate();
-        let stored = repository
-            .publish(
-                sample_metadata(snapshot_id, Some("leased-gc")),
-                seed_built_snapshot(tempdir.path()),
-            )
-            .await
-            .expect("publish should work");
-        let runnable = resolver
-            .resolve(Arc::new(stored))
-            .await
-            .expect("resolve should work");
-        let orphan = PosixFsSnapshotArtifactLayout::managed_layer_path(
-            tempdir.path(),
-            &format!("sha256:{}", "d".repeat(64)),
-        );
-        fs::create_dir_all(orphan.parent().expect("managed layer should have a parent"))
-            .expect("managed layer directory should exist");
-        fs::write(&orphan, b"orphan").expect("managed layer should write");
-
-        let root = tempdir.path().to_path_buf();
-        let (started_tx, started_rx) = oneshot::channel();
-        let mut gc_task = tokio::task::spawn_blocking(move || {
-            started_tx.send(()).expect("start signal should send");
-            PosixFsCatalogStore::new(root).gc_unreferenced_managed_layers()
-        });
-        started_rx.await.expect("GC task should start");
-        assert!(timeout(Duration::from_millis(200), &mut gc_task)
-            .await
-            .is_err());
-        assert!(orphan.exists());
-
-        drop(runnable);
-        assert_eq!(
-            timeout(Duration::from_secs(2), gc_task)
-                .await
-                .expect("GC should finish after the runnable lease is dropped")
-                .expect("GC task should join")
-                .expect("GC should succeed"),
-            1
-        );
-        assert!(!orphan.exists());
-    }
-
-    #[tokio::test]
-    async fn equivalent_publish_retry_skips_missing_inputs_but_changed_metadata_is_rejected() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_repository(tempdir.path());
-        let snapshot_id = SnapshotId::generate();
-        let metadata = sample_metadata(snapshot_id.clone(), Some("idempotent-publish"));
-        let original_manifest = seed_built_snapshot(tempdir.path());
-        let stored = repository
-            .publish(metadata.clone(), original_manifest.clone())
-            .await
-            .expect("initial publish should work");
-
-        let missing_manifest = FirecrackerSnapshotManifest::new(
-            tempdir.path().join("missing-vm-state"),
-            tempdir.path().join("missing-memory-config"),
-            1,
-            tempdir.path().join("missing-rootfs-config"),
-            1,
-            &[],
-        )
-        .expect("manifest shape should be valid");
-        let retried = repository
-            .publish(metadata.clone(), missing_manifest.clone())
-            .await
-            .expect("equivalent retry should not read publish inputs");
-        assert_eq!(retried.id, stored.id);
-        assert_eq!(retried.updated_at_unix_ms, stored.updated_at_unix_ms);
-
-        let alias = metadata
-            .alias
-            .clone()
-            .expect("test metadata should have alias");
-        fs::remove_file(PosixFsSnapshotArtifactLayout::alias_path(
-            tempdir.path(),
-            &alias,
-        ))
-        .expect("alias binding should exist");
-        repository
-            .publish(metadata.clone(), missing_manifest.clone())
-            .await
-            .expect("equivalent retry should repair the alias without reading inputs");
-        assert_eq!(
-            repository
-                .resolve_alias(alias.as_ref())
-                .await
-                .expect("alias resolution should work"),
-            Some(snapshot_id.clone())
-        );
-
-        let mut changed_metadata = metadata.clone();
-        changed_metadata.context.workdir = "/different".to_string();
-        let error = repository
-            .publish(changed_metadata, missing_manifest)
-            .await
-            .expect_err("changed logical metadata must not be accepted as an idempotent retry");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-
-        let unchanged = repository
-            .get(&snapshot_id.to_string())
-            .await
-            .expect("snapshot lookup should work")
-            .expect("original snapshot should remain visible");
-        assert_eq!(unchanged.updated_at_unix_ms, stored.updated_at_unix_ms);
-        assert_eq!(
-            unchanged.committed.expect("committed payload").context,
-            stored.committed.expect("committed payload").context
-        );
-
-        let layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
-        fs::remove_file(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER))
-            .expect("remove marker to simulate an interrupted delete");
-        assert!(repository
-            .get(&snapshot_id.to_string())
-            .await
-            .expect("hidden snapshot lookup should work")
-            .is_none());
-
-        repository
-            .publish(metadata, original_manifest)
-            .await
-            .expect("equivalent retry should restore the missing marker");
-        assert!(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER).exists());
-        assert!(repository
-            .get(&snapshot_id.to_string())
-            .await
-            .expect("recovered snapshot lookup should work")
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn changed_recovery_retry_preserves_existing_fixed_artifacts() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_repository(tempdir.path());
-        let snapshot_id = SnapshotId::generate();
-        let metadata = sample_metadata(snapshot_id.clone(), Some("immutable-recovery"));
-        let original_manifest = seed_built_snapshot(tempdir.path());
-        repository
-            .publish(metadata.clone(), original_manifest.clone())
-            .await
-            .expect("initial publish should work");
-
-        let layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
-        let vm_state_path = layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let manifest_path = layout.path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        let committed_vm_state = fs::read(&vm_state_path).expect("committed vm state should exist");
-        let committed_manifest = fs::read(&manifest_path).expect("committed manifest should exist");
-        fs::remove_file(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER))
-            .expect("commit marker should exist");
-
-        let changed_vm_state_path = tempdir.path().join("changed-vm-state");
-        fs::write(&changed_vm_state_path, b"different vm state")
-            .expect("changed vm state should write");
-        let mut changed_vm_state = original_manifest.clone();
-        changed_vm_state.vm_state.path = changed_vm_state_path;
-        let error = repository
-            .publish(metadata.clone(), changed_vm_state)
-            .await
-            .expect_err("changed vm state must not replace committed bytes");
-        assert!(matches!(error, RepositoryError::IntegrityMismatch { .. }));
-        assert_eq!(
-            fs::read(&vm_state_path).expect("committed vm state should remain"),
-            committed_vm_state
-        );
-        assert_eq!(
-            fs::read(&manifest_path).expect("committed manifest should remain"),
-            committed_manifest
-        );
-
-        let mut changed_manifest = original_manifest.clone();
-        changed_manifest.rootfs.virtual_size += 1;
-        let error = repository
-            .publish(metadata.clone(), changed_manifest)
-            .await
-            .expect_err("changed firecracker manifest must not replace committed bytes");
-        assert!(matches!(error, RepositoryError::IntegrityMismatch { .. }));
-        assert_eq!(
-            fs::read(&vm_state_path).expect("committed vm state should remain"),
-            committed_vm_state
-        );
-        assert_eq!(
-            fs::read(&manifest_path).expect("committed manifest should remain"),
-            committed_manifest
-        );
-        assert!(repository
-            .get_record(&snapshot_id)
-            .await
-            .expect("exact record lookup should work")
-            .is_some());
-
-        repository
-            .publish(metadata, original_manifest)
-            .await
-            .expect("exact recovery should restore visibility");
-        assert!(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER).exists());
-    }
-
-    #[tokio::test]
     async fn pending_template_publish_accepts_the_computed_disk_size() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let repository = test_repository(tempdir.path());
@@ -945,7 +570,7 @@ mod tests {
 
         assert!(matches!(err, RepositoryError::AliasConflict { .. }));
         assert!(repository
-            .get_record(&second_id)
+            .get(&second_id.to_string())
             .await
             .expect("exact lookup after conflict should work")
             .is_none());
@@ -1000,49 +625,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_recovers_after_visibility_marker_was_removed() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_backend(tempdir.path()).repository();
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("interrupted-delete").expect("alias should parse");
-
-        repository
-            .publish(
-                sample_metadata(snapshot_id.clone(), Some(alias.as_ref())),
-                seed_built_snapshot(tempdir.path()),
-            )
-            .await
-            .expect("publish should work");
-
-        let layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
-        fs::remove_file(layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER))
-            .expect("simulate delete interrupted after hiding the record");
-        assert!(repository
-            .get(alias.as_ref())
-            .await
-            .expect("hidden snapshot lookup should work")
-            .is_none());
-
-        repository
-            .delete(alias.as_ref())
-            .await
-            .expect("retry should fence and remove the hidden record artifacts");
-
-        assert!(!layout.snapshot_dir().exists());
-        let tombstone = repository
-            .get_record(&snapshot_id)
-            .await
-            .expect("terminal tombstone lookup should work")
-            .expect("interrupted delete should retain the identity fence");
-        assert_eq!(
-            tombstone.lifecycle,
-            crate::snapshot::SnapshotLifecycle::Deleting
-        );
-        assert!(tombstone.committed.is_none());
-        assert!(!PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias).exists());
-    }
-
-    #[tokio::test]
     async fn delete_removes_failed_template_build_record() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let repository = test_backend(tempdir.path()).repository();
@@ -1068,19 +650,9 @@ mod tests {
             .await
             .expect("delete should work");
 
-        let tombstone = repository
-            .get_record(&snapshot_id)
-            .await
-            .expect("terminal tombstone lookup should work")
-            .expect("delete should retain failed build identity fence");
-        assert_eq!(
-            tombstone.lifecycle,
-            crate::snapshot::SnapshotLifecycle::Deleting
-        );
-        assert!(tombstone.committed.is_none());
         assert!(
-            record_path.exists(),
-            "terminal tombstone should remain durable"
+            !record_path.exists(),
+            "deleted failed build record should be removed"
         );
         assert!(
             repository
@@ -1128,64 +700,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_record_requires_a_commit_marker() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let repository = test_repository(tempdir.path());
-        let snapshot_id = SnapshotId::generate();
-        repository
-            .publish(
-                sample_metadata(snapshot_id.clone(), Some("marker-read")),
-                seed_built_snapshot(tempdir.path()),
-            )
-            .await
-            .expect("snapshot publish should work");
-
-        assert!(repository
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("committed read should work")
-            .is_some());
-        std::fs::remove_file(
-            PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id)
-                .path(POSIXFS_SNAPSHOT_COMMIT_MARKER),
-        )
-        .expect("commit marker should exist");
-
-        assert!(repository
-            .get_record(&snapshot_id)
-            .await
-            .expect("raw exact read should work")
-            .is_some());
-        assert!(repository
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("committed read should work")
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn runtime_resolve_rejects_a_missing_commit_marker() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let cache =
-            LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
-        let resolver = PosixFsRuntimeResolver::new(
-            tempdir.path().to_path_buf(),
-            tempdir.path().join("runtime-cache"),
-            test_overlaybd_layer_store(),
-            cache,
-        );
-        let metadata = sample_metadata(SnapshotId::generate(), None);
-        let snapshot = Arc::new(ready_record(metadata, CommittedSnapshot::mock()));
-
-        let error = resolver
-            .resolve(snapshot)
-            .await
-            .expect_err("runtime resolution must require the commit marker");
-        assert!(matches!(error, RepositoryError::Unavailable { .. }));
-        assert!(error.to_string().contains("commit marker"));
-    }
-
-    #[tokio::test]
     async fn resolve_rejects_missing_artifact_paths() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let cache =
@@ -1211,7 +725,6 @@ mod tests {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            legacy_artifact_namespace: None,
             custom_extension_params: None,
         };
         let snapshot_dir = tempdir
@@ -1284,7 +797,6 @@ mod tests {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            legacy_artifact_namespace: None,
             custom_extension_params: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));

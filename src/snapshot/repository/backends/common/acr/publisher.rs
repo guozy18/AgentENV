@@ -85,6 +85,12 @@ impl AcrDiskImageExporter {
 
         let client = self.client_for_registry(&target.registry).await?;
 
+        let manifest_url = target.manifest_url(&tag);
+        client
+            .ensure_manifest_absent(&manifest_url, &target.repository, &tag)
+            .await
+            .map_err(RepositoryError::from)?;
+
         let mut descriptors = Vec::with_capacity(image.layers.len());
         let mut committed_layers = Vec::with_capacity(image.layers.len());
         let upload_url = target.upload_url();
@@ -135,34 +141,9 @@ impl AcrDiskImageExporter {
             descriptors,
             &tag,
         )?;
-        let expected_manifest_digest = digest::sha256_digest(&manifest);
-        let manifest_url = target.manifest_url(&tag);
-        let manifest_digest = match client
-            .manifest_digest(&manifest_url, &target.repository)
-            .await?
-        {
-            Some(existing) if existing == expected_manifest_digest => existing,
-            Some(existing) => {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "ACR snapshot tag '{tag}' already contains manifest '{existing}', expected '{expected_manifest_digest}'"
-                    ),
-                });
-            }
-            None => {
-                let published = client
-                    .put_manifest(&manifest_url, &target.repository, manifest)
-                    .await?;
-                if published != expected_manifest_digest {
-                    return Err(RepositoryError::IntegrityMismatch {
-                        artifact: format!("ACR snapshot manifest for tag '{tag}'"),
-                        expected: expected_manifest_digest,
-                        actual: published,
-                    });
-                }
-                published
-            }
-        };
+        let manifest_digest = client
+            .put_manifest(&manifest_url, &target.repository, manifest)
+            .await?;
 
         Ok(DiskImageExportOutcome {
             layers: committed_layers,
@@ -424,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_registry_manifest_retry_reuses_same_digest_and_rejects_conflict() {
+    async fn source_registry_manifest_publication() {
         let state = Arc::new(Mutex::new(FakeState::with_existing_blobs()));
         let base = fake_server(Arc::clone(&state)).await;
         let dir = TempDir::new().unwrap();
@@ -465,7 +446,6 @@ mod tests {
 
         let expected_tag = format!("agentenv-snapshot-{snapshot_id}");
         let publication = outcome.publication.unwrap();
-        let manifest_digest = publication.manifest_digest.clone();
         assert_eq!(publication.tag, expected_tag);
         assert_eq!(
             publication.image_ref,
@@ -490,35 +470,6 @@ mod tests {
                 }),
             ]
         );
-
-        let retry = publisher
-            .export(
-                &snapshot_id,
-                DiskImageSubject::Rootfs,
-                &image,
-                Some(SnapshotOciConfigInput::new(&context, Some(&raw))),
-            )
-            .await
-            .expect("an exact manifest retry should reuse the existing tag");
-        assert_eq!(
-            retry
-                .publication
-                .expect("retry publication should be recorded")
-                .manifest_digest,
-            manifest_digest
-        );
-
-        let changed_context = CommandContext::new(HashMap::new(), "/different");
-        let error = publisher
-            .export(
-                &snapshot_id,
-                DiskImageSubject::Rootfs,
-                &image,
-                Some(SnapshotOciConfigInput::new(&changed_context, Some(&raw))),
-            )
-            .await
-            .expect_err("a different manifest must not overwrite the existing tag");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
 
         let (_, expected_config_digest, _) = snapshot_oci_config_blob(
             host_architecture_for_oci(),

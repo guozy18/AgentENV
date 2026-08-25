@@ -406,16 +406,11 @@ async fn backend_pause_state_survives_encoding_and_failed_resume_retry() -> Resu
     Ok(())
 }
 
-async fn run_temporal_pause_resume_case(
-    track_dirty_pages: bool,
-    rounds: usize,
-    diff_failure_round: Option<usize>,
-) -> Result<()> {
+async fn run_temporal_pause_resume_case(rounds: usize) -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.vcpu_count = 1;
     sandbox_config.mem_size_mib = 128;
-    sandbox_config.common.track_dirty_pages = track_dirty_pages;
     let attached_drive_image = sandbox_config
         .common
         .rootfs_image_config
@@ -449,18 +444,7 @@ async fn run_temporal_pause_resume_case(
         write_temporal_disk_state(&mut sandbox, round).await?;
 
         let artifact_root = artifact_base.path().join(format!("generation-{round}"));
-        let diff_state_blocker = if diff_failure_round == Some(round) {
-            tokio::fs::create_dir_all(&artifact_root).await?;
-            // Diff cannot open a Unix socket as its state file; the Full
-            // fallback writes a sibling file and can atomically replace it.
-            Some(std::os::unix::net::UnixListener::bind(
-                artifact_root.join("vm_state.bin"),
-            )?)
-        } else {
-            None
-        };
         let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root)).await?;
-        drop(diff_state_blocker);
         let firecracker_state = paused_state
             .as_ref()
             .downcast_ref::<FirecrackerPausedState>()
@@ -566,12 +550,7 @@ async fn run_temporal_pause_resume_case(
 #[tokio::test]
 async fn temporal_pause_resume_preserves_mutable_state_without_growing_overlaybd_lowers(
 ) -> Result<()> {
-    run_temporal_pause_resume_case(true, 3, Some(1)).await
-}
-
-#[tokio::test]
-async fn temporal_pause_resume_works_with_dirty_tracking_disabled() -> Result<()> {
-    run_temporal_pause_resume_case(false, 2, None).await
+    run_temporal_pause_resume_case(3).await
 }
 
 /// Verify multi-level snapshot chains: first → second → resume from second after

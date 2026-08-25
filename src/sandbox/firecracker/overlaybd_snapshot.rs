@@ -917,34 +917,22 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     Ok((data_path, memory_size))
 }
 
-/// Convert Firecracker's standard sparse diff-memory file into a sealed
-/// OverlayBD layer.
-///
-/// Firecracker writes untouched guest-memory pages as holes in `mem.bin`.
-/// OverlayBD's raw packager preserves that sparse layout while producing the
-/// same sealed layer shape as the direct dirty-range path. The temporary
-/// sparse file is removed only after the final layer rename succeeds.
-pub(crate) async fn convert_sparse_mem_to_overlaybd(
-    sparse_mem_path: &Path,
+/// Convert a complete memory file into a sealed OverlayBD layer.
+pub(crate) async fn convert_memory_file_to_overlaybd(
+    memory_path: &Path,
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
 ) -> Result<(PathBuf, u64)> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
-
     let data_path = output_dir.join("overlaybd.commit");
-    let virtual_size = tokio::fs::metadata(sparse_mem_path)
+    let virtual_size = tokio::fs::metadata(memory_path)
         .await
-        .with_context(|| format!("stat sparse memory snapshot: {}", sparse_mem_path.display()))?
+        .with_context(|| format!("stat memory snapshot: {}", memory_path.display()))?
         .len();
-    let source: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::open_ro(sparse_mem_path).with_context(|| {
-            format!("open sparse memory snapshot: {}", sparse_mem_path.display())
-        })?);
-    let mappings = create_mappings_from_sparse(&source, 0)
-        .await
-        .with_context(|| format!("scan sparse memory snapshot: {}", sparse_mem_path.display()))?;
+    let source: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(memory_path)?);
+    let mappings = create_mappings_from_sparse(&source, 0).await?;
     publish_memory_overlaybd_layer(
         &[source],
         &mappings,
@@ -953,17 +941,8 @@ pub(crate) async fn convert_sparse_mem_to_overlaybd(
         mode,
         DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
     )
-    .await
-    .context("convert sparse memory snapshot to overlaybd layer")?;
-
-    if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
-        warn!(
-            mem_path = %sparse_mem_path.display(),
-            error = %error,
-            "failed to remove sparse memory snapshot after overlaybd commit"
-        );
-    }
-
+    .await?;
+    let _ = tokio::fs::remove_file(memory_path).await;
     Ok((data_path, virtual_size))
 }
 
@@ -975,7 +954,6 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
-    use overlaybd::index_file::LSMTReadOnlyFile;
     use serde_json::json;
 
     #[test]
@@ -1391,32 +1369,5 @@ mod tests {
             tokio::fs::read(&output).await.expect("read final"),
             existing
         );
-    }
-
-    #[tokio::test]
-    async fn convert_sparse_mem_removes_source_after_atomic_publish() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source = temp.path().join("mem.bin");
-        let expected: Vec<u8> = (0..8192).map(|offset| (offset / 4096) as u8).collect();
-        tokio::fs::write(&source, &expected)
-            .await
-            .expect("write sparse memory source");
-
-        let output_dir = temp.path().join("memory");
-        let (output, virtual_size) =
-            convert_sparse_mem_to_overlaybd(&source, &output_dir, OverlaybdCompactOutput::Raw)
-                .await
-                .expect("publish sparse memory layer");
-
-        assert_eq!(virtual_size, expected.len() as u64);
-        assert!(!source.exists());
-        assert!(!output.with_extension("commit.tmp").exists());
-
-        let file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::open_ro(&output).expect("open published layer"));
-        let layer = LSMTReadOnlyFile::open(file)
-            .await
-            .expect("open logical overlaybd layer");
-        assert_eq!(layer.read_at(0, expected.len()).await.unwrap(), expected);
     }
 }

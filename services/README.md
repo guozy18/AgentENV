@@ -236,10 +236,7 @@ The make targets materialize a temporary Kustomize build context so Kubernetes r
 
 The DaemonSet injects scheduler-report identity and endpoint wiring for runtime nodes:
 
-- `AENV_NODE_ID` comes from the Kubernetes host's `spec.nodeName`, so a Pod
-  replacement keeps the node-local snapshot owner identity stable.
-- `AENV_SERVICE_INSTANCE_ID` comes from the Pod UID and fences heartbeats from
-  a replaced Pod.
+- `AENV_NODE_ID` comes from Pod metadata name.
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-scheduler:9090`.
 - `AENV_SANDBOX_PROXY_DOMAINS` comes from the shared sandbox proxy ConfigMap.

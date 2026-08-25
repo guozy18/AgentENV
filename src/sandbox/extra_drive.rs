@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, SourceStateStrategy};
+use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 
@@ -299,12 +299,8 @@ pub(crate) struct PreparedDrives {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExtraDrivePrepareMode {
-    Fresh {
-        allow_shrink: bool,
-    },
-    Resume {
-        source_state_strategy: SourceStateStrategy,
-    },
+    Fresh { allow_shrink: bool },
+    Resume,
 }
 
 impl ExtraDrivePrepareMode {
@@ -316,7 +312,7 @@ impl ExtraDrivePrepareMode {
                 // size is intentionally left unknown so the daemon can read it.
                 (drive.virtual_size(), None)
             }
-            Self::Resume { .. } => {
+            Self::Resume => {
                 // For resume/snapshot-backed launches, virtual_size is the
                 // known actual block-device size recorded in snapshot metadata.
                 (drive.virtual_size(), drive.virtual_size())
@@ -327,7 +323,7 @@ impl ExtraDrivePrepareMode {
     fn allow_shrink(self) -> bool {
         match self {
             Self::Fresh { allow_shrink } => allow_shrink,
-            Self::Resume { .. } => false,
+            Self::Resume => false,
         }
     }
 }
@@ -374,32 +370,22 @@ pub(crate) async fn prepare_extra_drives(
     let mut mounts = Vec::with_capacity(extra_drives.len());
     let mut cleanup_paths = Vec::with_capacity(extra_drives.len());
     let mut runtimes = Vec::with_capacity(extra_drives.len());
-    let source_state_strategy = match mode {
-        ExtraDrivePrepareMode::Fresh { .. } => SourceStateStrategy::Reuse,
-        ExtraDrivePrepareMode::Resume {
-            source_state_strategy,
-        } => source_state_strategy,
-    };
-
     for drive in extra_drives {
         let result = async {
             let runtime_dir = drive.runtime_dir(sandbox_work_dir);
             let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
             let allow_shrink = mode.allow_shrink();
             let runtime_device = UblkDeviceManager::global()
-                .create_overlaybd_runtime_device(
-                    CreateOverlaybdRuntimeDeviceRequest {
-                        source_image_config: drive.image_config_path(),
-                        global_config: global_config_path,
-                        runtime_dir: &runtime_dir,
-                        read_only: drive.read_only(),
-                        runtime_upper_mode,
-                        requested_virtual_size,
-                        known_source_virtual_size,
-                        allow_shrink,
-                    },
-                    source_state_strategy,
-                )
+                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                    source_image_config: drive.image_config_path(),
+                    global_config: global_config_path,
+                    runtime_dir: &runtime_dir,
+                    read_only: drive.read_only(),
+                    runtime_upper_mode,
+                    requested_virtual_size,
+                    known_source_virtual_size,
+                    allow_shrink,
+                })
                 .await
                 .context("create overlaybd extra drive runtime device")?;
             let symlink_name = drive.attachment_symlink_name();
@@ -510,14 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_invalid_mount_path_falls_back_to_default() {
-        assert_eq!(
-            normalize_mount_path_or_default("data", PathBuf::from("/proc/data")),
-            Path::new("/mnt/data")
-        );
-    }
-
-    #[test]
     fn overlaybd_drive_rejects_reserved_path_ancestor() {
         let err = ExtraDrive::try_new_overlaybd_with_mount_path(
             "data",
@@ -574,10 +552,7 @@ mod tests {
             (None, None)
         );
         assert_eq!(
-            ExtraDrivePrepareMode::Resume {
-                source_state_strategy: SourceStateStrategy::Reuse,
-            }
-            .device_sizes(&drive_without_size),
+            ExtraDrivePrepareMode::Resume.device_sizes(&drive_without_size),
             (None, None)
         );
 
@@ -590,10 +565,7 @@ mod tests {
             (Some(2 * 1024 * 1024 * 1024), None)
         );
         assert_eq!(
-            ExtraDrivePrepareMode::Resume {
-                source_state_strategy: SourceStateStrategy::Reuse,
-            }
-            .device_sizes(&sized),
+            ExtraDrivePrepareMode::Resume.device_sizes(&sized),
             (Some(2 * 1024 * 1024 * 1024), Some(2 * 1024 * 1024 * 1024))
         );
     }

@@ -12,9 +12,25 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type NodeRegistry interface {
+	Snapshot(allowLingering bool) []Node
+	Contains(node Node) bool
+	Resolve(nodeID string) (Node, bool)
+	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error)
+	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
+	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
+	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
+	GetObserved(nodeID string, clusterID string, now time.Time) (*schedulerv1.ObservedNode, bool)
+	// PeekObserved returns the latest heartbeat-reported NodeSnapshot for a node.
+	// Unlike GetObserved, it does not derive status from discovery state or TTL,
+	// and returns only the raw snapshot suitable for scheduling decisions.
+	// Returns nil if the node has never sent a heartbeat.
+	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	UnregisterObserved(nodeID string, serviceInstanceID string) error
+}
+
 var (
 	ErrServiceInstanceMismatch = errors.New("service instance mismatch")
-	ErrStaleServiceInstance    = errors.New("stale service instance")
 	ErrNodeNotInRegistry       = errors.New("node is not in scheduler node list")
 	defaultObservedReportTTL   = 30 * time.Second
 )
@@ -33,12 +49,6 @@ type AtomicNodeRegistry struct {
 	observed         map[string]observedNodeRecord
 	cpuIntersection  map[string]string
 	intersectionSent map[string]bool
-	// currentServiceInstances and fencedServiceInstances are process-local
-	// ownership state. Once a newer service instance has reported for a node,
-	// heartbeats from the replaced instance remain fenced even if discovery
-	// temporarily removes and re-adds that node.
-	currentServiceInstances map[string]string
-	fencedServiceInstances  map[string]map[string]struct{}
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -48,14 +58,12 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 	}
 
 	registry := &AtomicNodeRegistry{
-		nodesByID:               make(map[string]Node),
-		lingeringIDs:            make(map[string]bool),
-		observedTTL:             ttl,
-		observed:                make(map[string]observedNodeRecord),
-		cpuIntersection:         make(map[string]string),
-		intersectionSent:        make(map[string]bool),
-		currentServiceInstances: make(map[string]string),
-		fencedServiceInstances:  make(map[string]map[string]struct{}),
+		nodesByID:        make(map[string]Node),
+		lingeringIDs:     make(map[string]bool),
+		observedTTL:      ttl,
+		observed:         make(map[string]observedNodeRecord),
+		cpuIntersection:  make(map[string]string),
+		intersectionSent: make(map[string]bool),
 	}
 	registry.Set(nodes, nil)
 	return registry
@@ -77,6 +85,13 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 		return result[i].ID < result[j].ID
 	})
 	return result
+}
+
+func (r *AtomicNodeRegistry) Contains(node Node) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	known, ok := r.nodesByID[node.ID]
+	return ok && known.Endpoint == node.Endpoint
 }
 
 func (r *AtomicNodeRegistry) Resolve(nodeID string) (Node, bool) {
@@ -133,34 +148,12 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
 	}
-	serviceInstanceID := strings.TrimSpace(req.GetServiceInstanceId())
-	if expectedServiceInstanceID := strings.TrimSpace(node.ServiceInstanceID); expectedServiceInstanceID != "" && expectedServiceInstanceID != serviceInstanceID {
-		return Node{}, "", ErrServiceInstanceMismatch
-	}
-
-	if fenced := r.fencedServiceInstances[req.GetNodeId()]; fenced != nil {
-		if _, ok := fenced[serviceInstanceID]; ok {
-			return Node{}, "", ErrStaleServiceInstance
-		}
-	}
-
-	previousServiceInstanceID, hadPreviousInstance := r.currentServiceInstances[req.GetNodeId()]
-	sameServiceInstance := hadPreviousInstance && previousServiceInstanceID == serviceInstanceID
-	if hadPreviousInstance && !sameServiceInstance {
-		fenced := r.fencedServiceInstances[req.GetNodeId()]
-		if fenced == nil {
-			fenced = make(map[string]struct{})
-			r.fencedServiceInstances[req.GetNodeId()] = fenced
-		}
-		fenced[previousServiceInstanceID] = struct{}{}
-	}
-	r.currentServiceInstances[req.GetNodeId()] = serviceInstanceID
 
 	prevCPU, existed := "", false
 	if prev, ok := r.observed[req.GetNodeId()]; ok {
 		existed = true
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
-		if sameServiceInstance && machineInfo != nil && machineInfo.CpuConfigJson == "" {
+		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
 			machineInfo.CpuConfigJson = prevCPU
 		}
 	}
@@ -170,7 +163,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			NodeId:            req.GetNodeId(),
 			Endpoint:          node.Endpoint,
 			ClusterId:         req.GetClusterId(),
-			ServiceInstanceId: serviceInstanceID,
+			ServiceInstanceId: req.GetServiceInstanceId(),
 			Version:           req.GetVersion(),
 			Commit:            req.GetCommit(),
 			MachineInfo:       machineInfo,
@@ -190,12 +183,14 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	r.observed[req.GetNodeId()] = record
 
 	clusterID := req.GetClusterId()
-	if !existed || !sameServiceInstance || (machineInfo != nil && machineInfo.GetCpuConfigJson() != prevCPU) {
+	if !existed || (machineInfo != nil && machineInfo.GetCpuConfigJson() != prevCPU) {
 		r.invalidateIntersectionLocked(clusterID)
 	}
 	if _, computed := r.cpuIntersection[clusterID]; !computed {
-		if result := r.computeReadyIntersectionLocked(clusterID); result != "" {
-			r.cpuIntersection[clusterID] = result
+		if r.allConfigsReadyLocked(clusterID) {
+			if result := r.computeIntersectionLocked(clusterID); result != "" {
+				r.cpuIntersection[clusterID] = result
+			}
 		}
 	}
 
@@ -215,17 +210,29 @@ func (r *AtomicNodeRegistry) invalidateIntersectionLocked(clusterID string) {
 	}
 }
 
-func (r *AtomicNodeRegistry) computeReadyIntersectionLocked(clusterID string) string {
+func (r *AtomicNodeRegistry) allConfigsReadyLocked(clusterID string) bool {
+	total, withConfig := 0, 0
+	for _, rec := range r.observed {
+		if rec.node.GetClusterId() != clusterID {
+			continue
+		}
+		total++
+		if rec.node.GetMachineInfo().GetCpuConfigJson() != "" {
+			withConfig++
+		}
+	}
+	return total > 0 && withConfig == total
+}
+
+func (r *AtomicNodeRegistry) computeIntersectionLocked(clusterID string) string {
 	var jsons []string
 	for _, rec := range r.observed {
 		if rec.node.GetClusterId() != clusterID {
 			continue
 		}
-		j := rec.node.GetMachineInfo().GetCpuConfigJson()
-		if j == "" {
-			return ""
+		if j := rec.node.GetMachineInfo().GetCpuConfigJson(); j != "" {
+			jsons = append(jsons, j)
 		}
-		jsons = append(jsons, j)
 	}
 	result, err := IntersectCpuConfigs(jsons)
 	if err != nil {
@@ -327,7 +334,11 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	snapshot := r.observed[nodeID].node.GetSnapshot()
+	record, ok := r.observed[nodeID]
+	if !ok || record.node == nil {
+		return nil
+	}
+	snapshot := record.node.GetSnapshot()
 	if snapshot == nil {
 		return nil
 	}
@@ -375,16 +386,10 @@ func (r *AtomicNodeRegistry) deriveObservedNodeViewLocked(record observedNodeRec
 	if ttl <= 0 {
 		ttl = defaultObservedReportTTL
 	}
-	serviceInstanceMatches := strings.TrimSpace(knownNode.ServiceInstanceID) == "" ||
-		strings.TrimSpace(out.GetServiceInstanceId()) == strings.TrimSpace(knownNode.ServiceInstanceID)
 
 	if out.GetLastSeenUnixMs() > 0 && nowMs-out.GetLastSeenUnixMs() > ttl.Milliseconds() {
 		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
-	} else if !inDiscovery || !serviceInstanceMatches {
-		// A stable node ID can survive a Pod replacement, but the old
-		// heartbeat must not make the replacement endpoint look ready before
-		// the new process reports. Local snapshot routing relies on READY as
-		// proof that the owner process has initialized its node-local store.
+	} else if !inDiscovery {
 		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
 	} else if isLingering {
 		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_LINGERING

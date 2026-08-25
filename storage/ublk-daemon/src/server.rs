@@ -25,7 +25,6 @@ use uvm_ublk::{
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
-    SourceStateStrategy,
 };
 use crate::runtime;
 
@@ -523,7 +522,6 @@ async fn handle_connection(
             requested_virtual_size,
             known_source_virtual_size,
             allow_shrink,
-            source_state_strategy,
         } => {
             let request = OverlaybdRuntimeDeviceRequest {
                 source_image_config: &source_image_config,
@@ -537,7 +535,6 @@ async fn handle_connection(
                 resize_global_config: &resize_global_config,
                 resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
-                source_state_strategy,
             };
             handle_create_overlaybd_runtime_device(
                 request,
@@ -635,7 +632,6 @@ struct OverlaybdRuntimeDeviceRequest<'a> {
     resize_global_config: &'a Path,
     resize_permit: Arc<Mutex<()>>,
     allow_shrink: bool,
-    source_state_strategy: SourceStateStrategy,
 }
 
 async fn handle_create_overlaybd_runtime_device(
@@ -659,7 +655,6 @@ async fn handle_create_overlaybd_runtime_device(
             resize_global_config: request.resize_global_config,
             resize_permit: request.resize_permit,
             allow_shrink: request.allow_shrink,
-            source_state_strategy: request.source_state_strategy,
         })
         .await
         {

@@ -6891,7 +6891,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SnapshotInfo
     }
 }
 
-/// Storage availability of a reusable snapshot. Local snapshots are available only on the publishing node; distributed snapshots are published to the primary repository.
+/// Storage availability of a reusable snapshot. Local snapshots are available only on the publishing Pod; distributed snapshots are published to the primary repository.
 /// Enumeration of values.
 /// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
 /// which helps with FFI.

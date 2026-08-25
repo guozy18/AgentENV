@@ -3,15 +3,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
 use tonic::async_trait;
 
 use super::super::store::SandboxMetadata;
 use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::sandbox::PausedSandboxState;
 use crate::types::SandboxId;
-
-type RecordingBlock = (Arc<Notify>, Arc<Notify>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum RecordingCall {
@@ -49,7 +46,6 @@ pub(crate) struct RecordingPersister {
     pub(crate) calls: Arc<Mutex<Vec<RecordingCall>>>,
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
-    blocks: Arc<Mutex<HashMap<RecordingCall, RecordingBlock>>>,
 }
 
 impl RecordingPersister {
@@ -75,24 +71,6 @@ impl RecordingPersister {
     pub(crate) fn fail_next(&self, call: RecordingCall) {
         let mut failures = self.failures.lock().unwrap();
         *failures.entry(call).or_default() += 1;
-    }
-
-    pub(crate) fn block_next(&self, call: RecordingCall) -> (Arc<Notify>, Arc<Notify>) {
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        self.blocks
-            .lock()
-            .unwrap()
-            .insert(call, (Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
-    }
-
-    async fn maybe_block(&self, call: RecordingCall) {
-        let block = self.blocks.lock().unwrap().remove(&call);
-        if let Some((entered, release)) = block {
-            entered.notify_one();
-            release.notified().await;
-        }
     }
 
     fn maybe_fail(&self, call: RecordingCall) -> PersistenceResult<()> {
@@ -151,22 +129,18 @@ impl SandboxPersister for RecordingPersister {
     async fn rollback_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.record(RecordingCall::RollbackResuming);
         self.maybe_fail(RecordingCall::RollbackResuming)?;
-        self.maybe_block(RecordingCall::RollbackResuming).await;
         Ok(())
     }
 
     async fn delete_record(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.record(RecordingCall::DeleteRecord);
         self.maybe_fail(RecordingCall::DeleteRecord)?;
-        self.maybe_block(RecordingCall::DeleteRecord).await;
         Ok(())
     }
 
     async fn delete_record_and_artifacts(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         self.record(RecordingCall::DeleteRecordAndArtifacts);
         self.maybe_fail(RecordingCall::DeleteRecordAndArtifacts)?;
-        self.maybe_block(RecordingCall::DeleteRecordAndArtifacts)
-            .await;
         Ok(())
     }
 }

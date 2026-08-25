@@ -110,12 +110,6 @@ async fn main() -> anyhow::Result<()> {
         identity.id.clone(),
         snapshot_p2p_transport,
     )?);
-    if let Err(error) = snapshot_manager.reconcile_local_artifacts().await {
-        warn!(
-            error = %error,
-            "snapshot cross-authority reconciliation was incomplete; continuing startup conservatively"
-        );
-    }
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,

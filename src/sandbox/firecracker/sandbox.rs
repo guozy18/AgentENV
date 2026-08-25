@@ -9,7 +9,7 @@ use nix::libc;
 use tempfile::TempDir;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
-use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, SourceStateStrategy};
+use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use super::config::{
     create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
@@ -20,7 +20,7 @@ use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    convert_sparse_mem_to_overlaybd, link_or_copy_runtime_artifact,
+    convert_memory_file_to_overlaybd, link_or_copy_runtime_artifact,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
     stage_temporal_overlaybd_device,
 };
@@ -120,23 +120,10 @@ fn build_disk_rate_limiter(
 }
 
 /// A token bucket Firecracker interprets as "disable this dimension".
-///
-/// Firecracker's `PATCH /drives` maps an *absent* token bucket to
-/// `BucketUpdate::None` (leave unchanged), so a snapshot-inherited limit cannot
-/// be removed by omission. The explicit disable sentinel is a bucket with both
-/// `size == 0` and `refill_time == 0`; a mixed bucket (e.g. `size == 0`,
-/// `refill_time == 1`) is not the sentinel and can be rejected as an invalid
-/// token bucket, failing the resume PATCH. Send both fields as zero.
 fn disabled_bucket() -> Box<firecracker_client::models::TokenBucket> {
     Box::new(firecracker_client::models::TokenBucket::new(0, 0))
 }
 
-/// Build the limiter to PATCH on resume, reconciling a snapshot-inherited
-/// limiter against the node's current config. BOTH buckets are always present:
-/// a configured dimension uses its own bucket, an unset dimension is overwritten
-/// with a disabled (`size == 0`) bucket so any inherited limit on that dimension
-/// is cleared (an omitted bucket would instead be left unchanged; see
-/// [`disabled_bucket`]).
 fn reconcile_disk_rate_limiter(
     cfg: &crate::cfg::DiskRateLimitConfig,
 ) -> Result<Box<firecracker_client::models::RateLimiter>> {
@@ -192,17 +179,10 @@ pub struct FirecrackerSandbox {
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
-    /// Parent for the next memory capture after Firecracker's compatibility
-    /// diff path consumes the dirty bitmap. Direct dirty-range capture keeps
-    /// the bitmap intact and therefore does not advance this parent.
-    consumed_memory_snapshot_config_path: Option<PathBuf>,
     /// Complete mutable memory backing for Temporal pause/resume. Firecracker
     /// maps this file privately, and a pause merges the latest guest pages back
     /// before publishing a new single-use continuation.
     temporal_mem_file_path: Option<PathBuf>,
-    /// Forces the next memory checkpoint to be Full after an uncertain Diff
-    /// failure, rather than relying on a possibly-consumed dirty bitmap.
-    needs_full_memory_snapshot: bool,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
     /// waits out the fallback with no notification.
@@ -264,10 +244,6 @@ impl PausedSandboxState for FirecrackerPausedState {
         RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
             &self.snapshot_config.common,
         ))
-    }
-
-    fn artifacts_are_independent_after_resume(&self) -> bool {
-        self.snapshot_config.temporal_mem_file_path.is_some()
     }
 }
 
@@ -476,21 +452,6 @@ impl FirecrackerSandbox {
                 "{resume_failure_prefix}: {capture_error}; resume error: {resume_error:#}"
             ))),
         }
-    }
-
-    fn memory_snapshot_parent_config_path(&self) -> Option<&Path> {
-        if self.temporal_mem_file_path.is_some() || self.needs_full_memory_snapshot {
-            return None;
-        }
-        self.consumed_memory_snapshot_config_path
-            .as_deref()
-            .or(match &self.launch {
-                LaunchMode::Resume(config) => config
-                    .mem_overlaybd_config
-                    .as_ref()
-                    .map(|memory| memory.image_config_path.as_path()),
-                LaunchMode::Fresh(_) => None,
-            })
     }
 
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
@@ -856,15 +817,21 @@ impl FirecrackerSandbox {
         let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
             &ConfigManager::global_config().memory_snapshot,
         );
-        let (mem_layer_path, mem_virtual_size, memory_dirty_state_consumed) = self
+        let (mem_layer_path, mem_virtual_size) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
-        let mut live_runtime_mutated = memory_dirty_state_consumed;
+        let mut live_runtime_mutated = false;
 
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
-        let resume_mem_image_config_path = self.memory_snapshot_parent_config_path();
+        let resume_mem_image_config_path = match &self.launch {
+            LaunchMode::Resume(config) => config
+                .mem_overlaybd_config
+                .as_ref()
+                .map(|memory| memory.image_config_path.as_path()),
+            LaunchMode::Fresh(_) => None,
+        };
         let mem_image_config = classify_after_live_mutation(
             build_mem_snapshot_image_config(
                 resume_mem_image_config_path,
@@ -981,13 +948,6 @@ impl FirecrackerSandbox {
             managed_snapshot_root: None,
         };
 
-        if memory_dirty_state_consumed {
-            self.consumed_memory_snapshot_config_path = snapshot
-                .mem_overlaybd_config
-                .as_ref()
-                .map(|memory| memory.image_config_path.clone());
-        }
-
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
             mem_image_config_path = ?snapshot.mem_overlaybd_config.as_ref().map(|memory| &memory.image_config_path),
@@ -1002,15 +962,15 @@ impl FirecrackerSandbox {
         vm_state_path: &Path,
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
-    ) -> Result<(PathBuf, u64, bool)> {
+    ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
-        if self.temporal_mem_file_path.is_some() || self.needs_full_memory_snapshot {
+        if self.temporal_mem_file_path.is_some() {
             let staged_memory_path = snapshot_dir.join("mem.bin");
             let memory_size = self
                 .stage_temporal_memory_checkpoint(vm_state_path, &staged_memory_path)
                 .await
                 .context("checkpoint temporal memory before reusable snapshot")?;
-            let (path, packaged_size) = convert_sparse_mem_to_overlaybd(
+            let (path, packaged_size) = convert_memory_file_to_overlaybd(
                 &staged_memory_path,
                 &mem_overlaybd_dir,
                 memory_output,
@@ -1021,58 +981,23 @@ impl FirecrackerSandbox {
                 packaged_size == memory_size,
                 "packaged temporal memory size mismatch: expected {memory_size}, got {packaged_size}"
             );
-            return Ok((path, memory_size, false));
+            return Ok((path, memory_size));
         }
 
         let firecracker_pid = self.fc_instance.pid()?;
         self.fc_instance
             .create_diff_snapshot(vm_state_path, None)
             .await?;
-        // `vm_state.bin` now represents this paused VM state. Preserve errors
-        // from the direct capture/conversion path; only the optional
-        // dirty-range request gets the compatibility fallback. Firecracker's
-        // standard diff path consumes its dirty bitmap, so any failure after
-        // starting that fallback is terminal: resuming and retrying could omit
-        // pages consumed by the failed attempt.
-        match self.fc_instance.get_dirty_memory_ranges().await {
-            Ok(dirty_ranges) => {
-                let (path, size) = convert_dirty_memory_to_overlaybd(
-                    firecracker_pid,
-                    &dirty_ranges,
-                    &mem_overlaybd_dir,
-                    memory_output,
-                )
-                .await
-                .context("convert dirty memory ranges to overlaybd layer")?;
-                Ok((path, size, false))
-            }
-            Err(dirty_error) => {
-                warn!(
-                    error = %dirty_error,
-                    "dirty memory snapshot path unavailable; falling back to sparse Firecracker diff snapshot"
-                );
-                let mem_path = snapshot_dir.join("mem.bin");
-                let _ = tokio::fs::remove_file(vm_state_path).await;
-                self.fc_instance
-                    .create_diff_snapshot(vm_state_path, Some(&mem_path))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "create sparse compatibility snapshot after dirty-range failure: {}",
-                            dirty_error
-                        )
-                    })
-                    .map_err(|error| anyhow::Error::new(SandboxCaptureError::terminal(error)))?;
-                let (path, size) =
-                    convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir, memory_output)
-                        .await
-                        .context("convert sparse memory snapshot to overlaybd layer")
-                        .map_err(|error| {
-                            anyhow::Error::new(SandboxCaptureError::terminal(error))
-                        })?;
-                Ok((path, size, true))
-            }
-        }
+        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
+        let (path, size) = convert_dirty_memory_to_overlaybd(
+            firecracker_pid,
+            &dirty_ranges,
+            &mem_overlaybd_dir,
+            memory_output,
+        )
+        .await
+        .context("convert dirty memory ranges to overlaybd layer")?;
+        Ok((path, size))
     }
 
     async fn stage_temporal_memory_checkpoint(
@@ -1084,36 +1009,9 @@ impl FirecrackerSandbox {
             .temporal_mem_file_path
             .clone()
             .unwrap_or_else(|| self.work_dir.path().join(TEMPORAL_MEM_FILE_NAME));
-        let existing_size = tokio::fs::metadata(&memory_path)
-            .await
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .map(|metadata| metadata.len());
         let expected_size = self.configured_memory_size();
-        let can_merge_diff = self.temporal_mem_file_path.is_some()
-            && self.launch.common().track_dirty_pages
-            && !self.needs_full_memory_snapshot
-            && existing_size == Some(expected_size);
-
-        if can_merge_diff {
-            if let Err(error) = self
-                .fc_instance
-                .create_diff_snapshot(vm_state_path, Some(&memory_path))
-                .await
-            {
-                warn!(
-                    error = %error,
-                    memory_path = %memory_path.display(),
-                    "temporal diff memory checkpoint failed; retrying with a full snapshot"
-                );
-                self.needs_full_memory_snapshot = true;
-                self.replace_temporal_memory_with_full_snapshot(vm_state_path, &memory_path)
-                    .await?;
-            }
-        } else {
-            self.replace_temporal_memory_with_full_snapshot(vm_state_path, &memory_path)
-                .await?;
-        }
+        self.replace_temporal_memory_with_full_snapshot(vm_state_path, &memory_path)
+            .await?;
 
         let memory_size = tokio::fs::metadata(&memory_path)
             .await
@@ -1124,7 +1022,6 @@ impl FirecrackerSandbox {
             "temporal memory snapshot size mismatch: expected {expected_size}, got {memory_size}"
         );
         self.temporal_mem_file_path = Some(memory_path.clone());
-        self.needs_full_memory_snapshot = false;
         link_or_copy_runtime_artifact(&memory_path, persisted_memory_path)
             .await
             .context("stage temporal memory checkpoint")?;
@@ -1181,7 +1078,6 @@ impl FirecrackerSandbox {
         }
         .await;
         if result.is_err() {
-            self.needs_full_memory_snapshot = true;
             let _ = tokio::fs::remove_file(&replacement_path).await;
             let _ = tokio::fs::remove_file(&replacement_state_path).await;
         }
@@ -1526,9 +1422,7 @@ impl FirecrackerSandbox {
             rootfs_runtime: None,
             mem_ublk_device: None,
             mem_snapshot_image_config_path: None,
-            consumed_memory_snapshot_config_path: None,
             temporal_mem_file_path: None,
-            needs_full_memory_snapshot: false,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
@@ -1556,19 +1450,16 @@ impl FirecrackerSandbox {
             .as_ref()
             .context("fresh sandbox rootfs image config is missing")?;
         let runtime_dir = work_dir.join("overlaybd");
-        self.prepare_rootfs_runtime(
-            CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: &rootfs_image_config.image_config_path,
-                global_config: &global_cfg_path,
-                runtime_dir: &runtime_dir,
-                read_only: rootfs_image_config.read_only,
-                runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
-                requested_virtual_size: config.common.rootfs_virtual_size,
-                known_source_virtual_size: None,
-                allow_shrink: config.common.rootfs_allow_shrink,
-            },
-            SourceStateStrategy::Reuse,
-        )
+        self.prepare_rootfs_runtime(CreateOverlaybdRuntimeDeviceRequest {
+            source_image_config: &rootfs_image_config.image_config_path,
+            global_config: &global_cfg_path,
+            runtime_dir: &runtime_dir,
+            read_only: rootfs_image_config.read_only,
+            runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
+            requested_virtual_size: config.common.rootfs_virtual_size,
+            known_source_virtual_size: None,
+            allow_shrink: config.common.rootfs_allow_shrink,
+        })
         .await
         .context("prepare fresh user image runtime")?;
 
@@ -1709,12 +1600,6 @@ impl FirecrackerSandbox {
         }
 
         let global_config = ConfigManager::global_config();
-        let source_state_strategy = if config.temporal_mem_file_path.is_some() {
-            SourceStateStrategy::Clone
-        } else {
-            SourceStateStrategy::Reuse
-        };
-
         let rootfs_virtual_size = config
             .common
             .rootfs_virtual_size
@@ -1787,25 +1672,22 @@ impl FirecrackerSandbox {
         if config.common.ublk_config.is_some() {
             let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
             let runtime_dir = fc_cwd.join("overlaybd");
-            self.prepare_rootfs_runtime(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: &rootfs_image_config.image_config_path,
-                    global_config: &global_cfg_path,
-                    runtime_dir: &runtime_dir,
-                    read_only: rootfs_image_config.read_only,
-                    runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
-                    requested_virtual_size: Some(rootfs_virtual_size),
-                    known_source_virtual_size: Some(rootfs_virtual_size),
-                    allow_shrink: false,
-                },
-                source_state_strategy,
-            )
+            self.prepare_rootfs_runtime(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: &rootfs_image_config.image_config_path,
+                global_config: &global_cfg_path,
+                runtime_dir: &runtime_dir,
+                read_only: rootfs_image_config.read_only,
+                runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
+                requested_virtual_size: Some(rootfs_virtual_size),
+                known_source_virtual_size: Some(rootfs_virtual_size),
+                allow_shrink: false,
+            })
             .await
             .context("prepare snapshot user image runtime")?;
         }
 
         // ── Extra drives ──
-        self.prepare_snapshot_backing_drives(&config.common.extra_drives, source_state_strategy)
+        self.prepare_snapshot_backing_drives(&config.common.extra_drives)
             .await
             .context("prepare snapshot-backed extra drives for resume")?;
 
@@ -1922,12 +1804,6 @@ impl FirecrackerSandbox {
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
 
-        // A restored snapshot inherits whatever limiter was active when it was
-        // paused, so reconcile against the node's current config while the VM is
-        // still loaded-but-paused — before resume() lets the guest issue I/O.
-        // Both buckets are always overwritten (configured or unlimited) so an
-        // inherited dimension the current config leaves unset is cleared rather
-        // than left unchanged.
         let reconciled = reconcile_disk_rate_limiter(&config.common.disk_rate_limit)?;
         self.fc_instance
             .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
@@ -2115,11 +1991,7 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
-    async fn prepare_snapshot_backing_drives(
-        &mut self,
-        extra_drives: &[ExtraDrive],
-        source_state_strategy: SourceStateStrategy,
-    ) -> Result<()> {
+    async fn prepare_snapshot_backing_drives(&mut self, extra_drives: &[ExtraDrive]) -> Result<()> {
         let global_config = ConfigManager::global_config();
         let ublk_config = &global_config.ublk;
         let overlaybd_global = ublk_config.overlaybd.global_config_path.clone();
@@ -2129,9 +2001,7 @@ impl FirecrackerSandbox {
             &overlaybd_global,
             self.work_dir.path(),
             runtime_upper_mode,
-            ExtraDrivePrepareMode::Resume {
-                source_state_strategy,
-            },
+            ExtraDrivePrepareMode::Resume,
         )
         .await?;
         let (_attachments_already_in_snapshot, extra_drive_runtimes) =
@@ -2143,11 +2013,10 @@ impl FirecrackerSandbox {
     async fn prepare_rootfs_runtime(
         &mut self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
-        source_state_strategy: SourceStateStrategy,
     ) -> Result<()> {
         let source_image_config_path = request.source_image_config.to_path_buf();
         let runtime_device = UblkDeviceManager::global()
-            .create_overlaybd_runtime_device(request, source_state_strategy)
+            .create_overlaybd_runtime_device(request)
             .await
             .context("create user image overlaybd runtime device")?;
         self.rootfs_image_config_path = Some(source_image_config_path);
@@ -2403,35 +2272,24 @@ mod tests {
 
     #[test]
     fn reconcile_disabled_makes_both_buckets_disabled() {
-        // Firecracker treats an absent bucket in a PATCH as "leave unchanged", so
-        // clearing an inherited limiter requires overwriting BOTH buckets with a
-        // disabled (size == 0) bucket rather than sending an empty RateLimiter.
         let mut cfg = rate_limit_cfg();
         cfg.enabled = false;
         cfg.bandwidth_bytes_per_sec = 100 << 20;
         cfg.iops = 3000;
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
-        let bw = rl.bandwidth.expect("bandwidth bucket present");
-        let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.size, 0);
-        assert_eq!(ops.size, 0);
+        assert_eq!(rl.bandwidth.expect("bandwidth bucket").size, 0);
+        assert_eq!(rl.ops.expect("ops bucket").size, 0);
     }
 
     #[test]
     fn reconcile_bandwidth_only_clears_inherited_iops() {
-        // Enabled with bandwidth but no iops: bandwidth gets its configured
-        // bucket, while the unset iops dimension is overwritten with a disabled
-        // bucket so a snapshot-inherited IOPS limit does not survive the resume.
         let mut cfg = rate_limit_cfg();
         cfg.enabled = true;
         cfg.bandwidth_bytes_per_sec = 100 << 20;
         cfg.iops = 0;
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
-        let bw = rl.bandwidth.expect("bandwidth bucket present");
-        let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(bw.size, 100 << 20);
-        assert_eq!(ops.size, 0);
+        assert_eq!(rl.bandwidth.expect("bandwidth bucket").size, 100 << 20);
+        assert_eq!(rl.ops.expect("ops bucket").size, 0);
     }
 
     #[test]
@@ -2441,11 +2299,8 @@ mod tests {
         cfg.bandwidth_bytes_per_sec = 0;
         cfg.iops = 3000;
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
-        let bw = rl.bandwidth.expect("bandwidth bucket present");
-        let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.size, 0);
-        assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(ops.size, 3000);
+        assert_eq!(rl.bandwidth.expect("bandwidth bucket").size, 0);
+        assert_eq!(rl.ops.expect("ops bucket").size, 3000);
     }
 
     #[test]
@@ -2455,12 +2310,8 @@ mod tests {
         cfg.bandwidth_bytes_per_sec = 100 << 20;
         cfg.iops = 3000;
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
-        let bw = rl.bandwidth.expect("bandwidth bucket present");
-        let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(bw.size, 100 << 20);
-        assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(ops.size, 3000);
+        assert_eq!(rl.bandwidth.expect("bandwidth bucket").size, 100 << 20);
+        assert_eq!(rl.ops.expect("ops bucket").size, 3000);
     }
 
     #[test]
@@ -2530,21 +2381,6 @@ mod tests {
                 expected_terminal
             );
         }
-    }
-
-    #[test]
-    fn consumed_memory_snapshot_becomes_next_capture_parent() -> Result<()> {
-        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
-        assert!(sandbox.memory_snapshot_parent_config_path().is_none());
-
-        let consumed_parent = PathBuf::from("managed-snapshots/mem_image.json");
-        sandbox.consumed_memory_snapshot_config_path = Some(consumed_parent.clone());
-
-        assert_eq!(
-            sandbox.memory_snapshot_parent_config_path(),
-            Some(consumed_parent.as_path())
-        );
-        Ok(())
     }
 
     #[tokio::test]

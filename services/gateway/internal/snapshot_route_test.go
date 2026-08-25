@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,238 +15,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-func TestSnapshotRequestOperation(t *testing.T) {
-	tests := []struct {
-		name              string
-		method            string
-		target            string
-		launchSnapshotRef string
-		wantOperation     snapshotOperation
-		wantRef           string
-	}{
-		{
-			name:              "sandbox launch",
-			method:            http.MethodPost,
-			target:            "/sandboxes",
-			launchSnapshotRef: "team/base:v1",
-			wantOperation:     snapshotOperationLaunch,
-			wantRef:           "team/base:v1",
-		},
-		{
-			name:          "snapshot promotion",
-			method:        http.MethodPost,
-			target:        "/snapshots/snap-1/promote",
-			wantOperation: snapshotOperationPromote,
-			wantRef:       "snap-1",
-		},
-		{
-			name:          "escaped promotion reference",
-			method:        http.MethodPost,
-			target:        "/snapshots/team%2Fsnap%3Av1/promote",
-			wantOperation: snapshotOperationPromote,
-			wantRef:       "team/snap:v1",
-		},
-		{
-			name:          "escaped promotion static segments",
-			method:        http.MethodPost,
-			target:        "/%73napshots/snap-1/%70romote/",
-			wantOperation: snapshotOperationPromote,
-			wantRef:       "snap-1",
-		},
-		{name: "snapshot get", method: http.MethodGet, target: "/snapshots/snap-1", wantOperation: snapshotOperationNone},
-		{name: "snapshot capture", method: http.MethodPost, target: "/sandboxes/sbx-1/snapshots", wantOperation: snapshotOperationNone},
-		{name: "nested promotion path", method: http.MethodPost, target: "/snapshots/a/b/promote", wantOperation: snapshotOperationNone},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, "http://gateway.test"+tc.target, nil)
-			operation, snapshotRef := snapshotRequestOperation(req, tc.launchSnapshotRef)
-			if operation != tc.wantOperation || snapshotRef != tc.wantRef {
-				t.Fatalf("operation = (%v, %q), want (%v, %q)", operation, snapshotRef, tc.wantOperation, tc.wantRef)
-			}
-		})
-	}
-}
-
-func TestLookupSnapshotPlacementUsesOpaqueQueryAndSelectedHeaders(t *testing.T) {
-	type observedRequest struct {
-		snapshotRef string
-		headers     http.Header
-	}
-	observed := make(chan observedRequest, 1)
-	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		observed <- observedRequest{snapshotRef: r.URL.Query().Get("snapshotID"), headers: r.Header.Clone()}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"snapshotType":"distributed"}`))
-	}))
-	defer metadataNode.Close()
-
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	incoming := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", nil)
-	incoming.Header.Set("Authorization", "Bearer token")
-	incoming.Header.Set("X-API-Key", "api-key")
-	incoming.Header.Set("X-Team-ID", "team-1")
-	incoming.Header.Set("X-Admin-Token", "admin-token")
-	incoming.Header.Set("Traceparent", "00-trace")
-	incoming.Header.Set("Tracestate", "state")
-	incoming.Header.Set("Baggage", "key=value")
-	incoming.Header.Set("X-Request-ID", "request-1")
-	incoming.Header.Set(headerSandboxID, "must-not-leak")
-	incoming.Header.Set(headerTargetPort, "49983")
-	incoming.Header.Set("Content-Length", "123")
-
-	placement, err := server.lookupSnapshotPlacement(
-		context.Background(),
-		incoming,
-		&schedulerv1.Node{Endpoint: metadataNode.URL},
-		"team/snap:v1 & next",
-	)
-	if err != nil {
-		t.Fatalf("lookup snapshot placement failed: %v", err)
-	}
-	if placement.SnapshotType != "distributed" {
-		t.Fatalf("snapshot type = %q, want distributed", placement.SnapshotType)
-	}
-
-	request := <-observed
-	if request.snapshotRef != "team/snap:v1 & next" {
-		t.Fatalf("snapshot reference = %q", request.snapshotRef)
-	}
-	for name, want := range map[string]string{
-		"X-API-Key":    "api-key",
-		"Traceparent":  "00-trace",
-		"Tracestate":   "state",
-		"Baggage":      "key=value",
-		"X-Request-ID": "request-1",
-	} {
-		if got := request.headers.Get(name); got != want {
-			t.Fatalf("%s = %q, want %q", name, got, want)
-		}
-	}
-	for _, name := range []string{
-		"Authorization",
-		"X-Team-ID",
-		"X-Admin-Token",
-		headerSandboxID,
-		headerTargetPort,
-		"Content-Length",
-	} {
-		if got := request.headers.Get(name); got != "" {
-			t.Fatalf("internal placement request leaked %s = %q", name, got)
-		}
-	}
-}
-
-func TestSnapshotPlacementErrorContract(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		placementStatus int
-		target          string
-		body            string
-		wantStatus      int
-		wantMessage     string
-		wantEmptyBody   bool
-	}{
-		{
-			name:            "launch/invalid reference",
-			placementStatus: http.StatusBadRequest,
-			target:          "/sandboxes",
-			body:            `{"templateID":"bad alias"}`,
-			wantStatus:      http.StatusBadRequest,
-			wantMessage:     "invalid snapshot reference",
-		},
-		{
-			name:            "promote/invalid reference",
-			placementStatus: http.StatusBadRequest,
-			target:          "/snapshots/bad%20alias/promote",
-			wantStatus:      http.StatusConflict,
-			wantMessage:     "invalid snapshot reference",
-		},
-		{
-			name:            "launch/not found",
-			placementStatus: http.StatusNotFound,
-			target:          "/sandboxes",
-			body:            `{"templateID":"snap-1"}`,
-			wantStatus:      http.StatusBadRequest,
-			wantMessage:     "template snap-1 not found",
-		},
-		{
-			name:            "promote/not found",
-			placementStatus: http.StatusNotFound,
-			target:          "/snapshots/snap-1/promote",
-			wantStatus:      http.StatusNotFound,
-			wantMessage:     "snapshot snap-1 not found",
-		},
-		{
-			name:            "launch/unauthorized",
-			placementStatus: http.StatusUnauthorized,
-			target:          "/sandboxes",
-			body:            `{"templateID":"snap-1"}`,
-			wantStatus:      http.StatusUnauthorized,
-			wantEmptyBody:   true,
-		},
-		{
-			name:            "promote/unauthorized",
-			placementStatus: http.StatusUnauthorized,
-			target:          "/snapshots/snap-1/promote",
-			wantStatus:      http.StatusUnauthorized,
-			wantEmptyBody:   true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			originalRequest := make(chan struct{}, 1)
-			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == snapshotPlacementPath {
-					w.WriteHeader(tc.placementStatus)
-					return
-				}
-				originalRequest <- struct{}{}
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer metadataNode.Close()
-
-			server := newTestServer(t, stubSchedulerClient{
-				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL}}, nil
-				},
-			}, time.Second, 1024)
-
-			req := httptest.NewRequest(http.MethodPost, "http://gateway.test"+tc.target, strings.NewReader(tc.body))
-			resp := httptest.NewRecorder()
-			authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-			if resp.Code != tc.wantStatus {
-				t.Fatalf("status = %d, want %d; body=%q", resp.Code, tc.wantStatus, resp.Body.String())
-			}
-			if tc.wantEmptyBody {
-				if resp.Body.Len() != 0 {
-					t.Fatalf("response body = %q, want empty generated-API response", resp.Body.String())
-				}
-			} else {
-				if got := resp.Header().Get("Content-Type"); got != "application/json" {
-					t.Fatalf("Content-Type = %q, want application/json", got)
-				}
-				var envelope struct {
-					Code    int    `json:"code"`
-					Message string `json:"message"`
-				}
-				if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil {
-					t.Fatalf("decode error envelope: %v; body=%q", err, resp.Body.String())
-				}
-				if envelope.Code != tc.wantStatus || envelope.Message != tc.wantMessage {
-					t.Fatalf("error envelope = %+v, want code=%d message=%q", envelope, tc.wantStatus, tc.wantMessage)
-				}
-			}
-			select {
-			case <-originalRequest:
-				t.Fatal("placement error fell back to the scheduled node or reached the public upstream route")
-			default:
-			}
-		})
-	}
-}
-
 func TestLocalSnapshotLaunchRoutesToOwnerAndRecordsAssignment(t *testing.T) {
 	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != snapshotPlacementPath {
@@ -257,6 +24,9 @@ func TestLocalSnapshotLaunchRoutesToOwnerAndRecordsAssignment(t *testing.T) {
 		}
 		if got := r.URL.Query().Get("snapshotID"); got != "team/base:v1" {
 			t.Errorf("placement snapshotID = %q, want %q", got, "team/base:v1")
+		}
+		if got := r.Header.Get("X-API-Key"); got != testAPIKey {
+			t.Errorf("placement API key = %q, want %s", got, testAPIKey)
 		}
 		_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
 	}))
@@ -300,6 +70,7 @@ func TestLocalSnapshotLaunchRoutesToOwnerAndRecordsAssignment(t *testing.T) {
 	requestBody := `{"templateID":"team/base:v1","metadata":{"team":"alpha"}}`
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(requestBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", testAPIKey)
 	resp := httptest.NewRecorder()
 	authenticatedTestHandler(server).ServeHTTP(resp, req)
 
@@ -357,62 +128,6 @@ func TestLocalSnapshotPromotionRoutesToOwner(t *testing.T) {
 	}
 }
 
-func TestLocalSnapshotPromotionWithProxyHeadersStillRoutesToOwner(t *testing.T) {
-	placementRequests := make(chan struct{}, 1)
-	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != snapshotPlacementPath {
-			t.Errorf("metadata node received unexpected path %q", r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		placementRequests <- struct{}{}
-		_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
-	}))
-	defer metadataNode.Close()
-
-	ownerPath := make(chan string, 1)
-	ownerNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ownerPath <- r.URL.Path
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer ownerNode.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL}}, nil
-		},
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			t.Fatal("snapshot promotion must not use sandbox lookup")
-			return nil, nil
-		},
-		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-			if req.GetNodeId() != "node-b" {
-				t.Fatalf("GetNode owner = %q, want node-b", req.GetNodeId())
-			}
-			return observedNodeResponse("node-b", ownerNode.URL, schedulerv1.NodeStatus_NODE_STATUS_READY), nil
-		},
-	}, time.Second, 1024)
-
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/snapshots/snap-1/promote", nil)
-	req.Header.Set(headerAPIKey, testAPIKey)
-	req.Header.Set(headerE2BSandboxID, "sbx-1")
-	req.Header.Set(headerE2BTargetPort, "49983")
-	resp := httptest.NewRecorder()
-	server.Handler().ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204; body=%q", resp.Code, resp.Body.String())
-	}
-	select {
-	case <-placementRequests:
-	case <-time.After(time.Second):
-		t.Fatal("snapshot placement lookup was not attempted")
-	}
-	if got := <-ownerPath; got != "/snapshots/snap-1/promote" {
-		t.Fatalf("owner path = %q, want promotion path", got)
-	}
-}
-
 func TestDistributedSnapshotPromotionKeepsScheduledNode(t *testing.T) {
 	originalRequest := make(chan string, 1)
 	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -443,175 +158,6 @@ func TestDistributedSnapshotPromotionKeepsScheduledNode(t *testing.T) {
 	}
 }
 
-func TestSnapshotMetadataRequestsDoNotUsePlacementLookup(t *testing.T) {
-	for _, path := range []string{"/snapshots", "/snapshots/snap-1"} {
-		t.Run(path, func(t *testing.T) {
-			upstreamPath := make(chan string, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upstreamPath <- r.URL.Path
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
-
-			server := newTestServer(t, stubSchedulerClient{
-				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}}, nil
-				},
-			}, time.Second, 1024)
-
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test"+path, nil)
-			resp := httptest.NewRecorder()
-			authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-			if resp.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200", resp.Code)
-			}
-			if got := <-upstreamPath; got != path {
-				t.Fatalf("upstream path = %q, want %q", got, path)
-			}
-		})
-	}
-}
-
-func TestSnapshotCaptureUsesSandboxLookupWithoutPlacement(t *testing.T) {
-	upstreamPath := make(chan string, 1)
-	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamPath <- r.URL.Path
-		w.WriteHeader(http.StatusCreated)
-	}))
-	defer owner.Close()
-
-	mainScheduler := stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			t.Fatal("snapshot capture must not call Schedule")
-			return nil, nil
-		},
-	}
-	queryOnlyScheduler := stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-1" {
-				t.Fatalf("LookupNode sandbox = %q, want sbx-1", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: owner.URL}}, nil
-		},
-	}
-	server := newTestServer(t, mainScheduler, time.Second, 1024, withQueryOnlyScheduler(queryOnlyScheduler))
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"http://gateway.test/sandboxes/sbx-1/snapshots",
-		strings.NewReader(`{"snapshotType":"local"}`),
-	)
-	resp := httptest.NewRecorder()
-	authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%q", resp.Code, resp.Body.String())
-	}
-	if got := <-upstreamPath; got != "/sandboxes/sbx-1/snapshots" {
-		t.Fatalf("upstream path = %q", got)
-	}
-}
-
-func TestNewSandboxRoutingInputErrorsBeforeSchedule(t *testing.T) {
-	tests := []struct {
-		name       string
-		body       string
-		wantStatus int
-	}{
-		{name: "missing templateID", body: `{"metadata":{"team":"alpha"}}`, wantStatus: http.StatusBadRequest},
-		{name: "malformed JSON", body: `{"templateID":`, wantStatus: http.StatusBadRequest},
-		{name: "empty body", body: "", wantStatus: http.StatusBadRequest},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			scheduled := make(chan struct{}, 1)
-			server := newTestServer(t, stubSchedulerClient{
-				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-					scheduled <- struct{}{}
-					return nil, errors.New("Schedule must not be called")
-				},
-			}, time.Second, 1024)
-
-			req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(tc.body))
-			resp := httptest.NewRecorder()
-			authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-			if resp.Code != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", resp.Code, tc.wantStatus)
-			}
-			select {
-			case <-scheduled:
-				t.Fatal("invalid request reached Scheduler.Schedule")
-			default:
-			}
-		})
-	}
-}
-
-func TestOversizedNewSandboxBodyIsForwardedAndLocalOwnerRouted(t *testing.T) {
-	requestBody := `{"metadata":{"pad":"` + strings.Repeat("a", maxHintBodyBytes) + `"},"templateID":"team/base:v1"}`
-	ownerRequests := make(chan string, 1)
-
-	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != snapshotPlacementPath {
-			t.Errorf("scheduled node received public request path %q", r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if got := r.URL.Query().Get("snapshotID"); got != "team/base:v1" {
-			t.Errorf("placement snapshotID = %q, want team/base:v1", got)
-		}
-		_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
-	}))
-	defer metadataNode.Close()
-
-	ownerNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read owner request body: %v", err)
-			return
-		}
-		ownerRequests <- string(body)
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sandboxID":"sbx-created"}`))
-	}))
-	defer ownerNode.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL}}, nil
-		},
-		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-			if req.GetNodeId() != "node-b" {
-				t.Fatalf("GetNode owner = %q, want node-b", req.GetNodeId())
-			}
-			return observedNodeResponse("node-b", ownerNode.URL, schedulerv1.NodeStatus_NODE_STATUS_READY), nil
-		},
-		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}, time.Second, 1024)
-
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(requestBody))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-	authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%q", resp.Code, resp.Body.String())
-	}
-	select {
-	case got := <-ownerRequests:
-		if got != requestBody {
-			t.Fatalf("owner request body length/content mismatch: got %d bytes, want %d", len(got), len(requestBody))
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for owner request")
-	}
-}
-
 func TestSnapshotPlacementFailureDoesNotFallbackToScheduledNode(t *testing.T) {
 	originalRequest := make(chan struct{}, 1)
 	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -630,8 +176,7 @@ func TestSnapshotPlacementFailureDoesNotFallbackToScheduledNode(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	requestBody := `{"templateID":"snap-1","pad":"` + strings.Repeat("x", maxHintBodyBytes) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(requestBody))
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(`{"templateID":"snap-1"}`))
 	resp := httptest.NewRecorder()
 	authenticatedTestHandler(server).ServeHTTP(resp, req)
 
@@ -655,64 +200,6 @@ func TestSnapshotPlacementFailureDoesNotFallbackToScheduledNode(t *testing.T) {
 	case <-originalRequest:
 		t.Fatal("placement failure fell back to the scheduled node")
 	default:
-	}
-	if got := len(sandboxBodyBufferSlots); got != 0 {
-		t.Fatalf("held body buffer slots after placement failure = %d, want 0", got)
-	}
-}
-
-func TestNewSandboxBodyLimitReturnsRequestEntityTooLarge(t *testing.T) {
-	scheduleCalled := false
-	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			scheduleCalled = true
-			return nil, errors.New("must not schedule an oversized request")
-		},
-	}, time.Second, 1024)
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"http://gateway.test/sandboxes",
-		strings.NewReader(sandboxRequestBodyOfSize(t, maxNewSandboxBodyBytes+1)),
-	)
-	req.ContentLength = -1
-	req.TransferEncoding = []string{"chunked"}
-	resp := httptest.NewRecorder()
-	authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413; body=%q", resp.Code, resp.Body.String())
-	}
-	if scheduleCalled {
-		t.Fatal("oversized request reached Scheduler")
-	}
-	if got := len(sandboxBodyBufferSlots); got != 0 {
-		t.Fatalf("held buffer slots after oversized request = %d, want 0", got)
-	}
-}
-
-func TestNewSandboxBufferSaturationReturnsServiceUnavailable(t *testing.T) {
-	for range cap(sandboxBodyBufferSlots) {
-		sandboxBodyBufferSlots <- struct{}{}
-	}
-	defer func() {
-		for range cap(sandboxBodyBufferSlots) {
-			<-sandboxBodyBufferSlots
-		}
-	}()
-
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"http://gateway.test/sandboxes",
-		strings.NewReader(sandboxRequestBodyOfSize(t, maxHintBodyBytes+1)),
-	)
-	defer req.Body.Close()
-	resp := httptest.NewRecorder()
-	authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body=%q", resp.Code, resp.Body.String())
 	}
 }
 

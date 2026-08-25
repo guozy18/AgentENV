@@ -9,7 +9,7 @@ pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 pub(crate) use snapshot::{now_unix_ms, rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use snapshot::{
     CommandContext, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, RunnableSnapshot, SnapshotLifecycle, SnapshotPublishMetadata,
+    PersistedDiskImagePublication, RunnableSnapshot, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotType,
     StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };

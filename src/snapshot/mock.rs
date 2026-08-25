@@ -44,10 +44,6 @@ impl SnapshotRepository for MockSnapshotRepository {
         Err(Self::unsupported())
     }
 
-    async fn get_record(&self, _id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
     async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         Err(Self::unsupported())
     }

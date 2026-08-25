@@ -17,7 +17,7 @@ use overlaybd::virtual_file::VirtualFile;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
-use crate::protocol::{ResizeToolSpec, SourceStateStrategy};
+use crate::protocol::ResizeToolSpec;
 use crate::server::ImageServiceCache;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -26,7 +26,6 @@ const RESIZE_OUTPUT_TRUNCATED_MARKER: &[u8] = b" ... (truncated)";
 const RUNTIME_IMAGE_CONFIG_FILE: &str = "image.json";
 const RUNTIME_UPPER_DATA_FILE: &str = "upper.data";
 const RUNTIME_UPPER_INDEX_FILE: &str = "upper.index";
-const RUNTIME_SOURCE_LOWERS_DIR: &str = "source-lowers";
 const RUNTIME_RESULT_FILE: &str = "result.txt";
 
 #[derive(Debug)]
@@ -104,7 +103,6 @@ pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
     /// all share the single isolated resize cacheDir.
     pub(crate) resize_permit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) allow_shrink: bool,
-    pub(crate) source_state_strategy: SourceStateStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,12 +120,6 @@ enum ResolvedUpperMode {
 }
 
 #[derive(Debug)]
-struct AdoptedLowerPath {
-    layer_index: usize,
-    file: PathBuf,
-    clear_dir: bool,
-}
-
 pub(crate) async fn materialize_overlaybd_runtime(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
 ) -> Result<MaterializedOverlaybdRuntime> {
@@ -167,7 +159,6 @@ async fn materialize_runtime_contents(
         resize_global_config,
         resize_permit,
         allow_shrink,
-        source_state_strategy,
     } = request;
 
     let base_virtual_size = match known_source_virtual_size {
@@ -191,14 +182,6 @@ async fn materialize_runtime_contents(
         validate_requested_virtual_size(requested_virtual_size, base_virtual_size, allow_shrink)
             .map_err(|err| InvalidRequest(format!("{err:#}")))?;
 
-    if source_state_strategy == SourceStateStrategy::Clone
-        && matches!(upper_mode, ResolvedUpperMode::Create(_))
-    {
-        return Err(InvalidRequest(
-            "source state clone requires an existing writable OverlayBD upper".to_string(),
-        )
-        .into());
-    }
     if actual_virtual_size != base_virtual_size
         && !matches!(upper_mode, ResolvedUpperMode::Create(_))
     {
@@ -207,18 +190,6 @@ async fn materialize_runtime_contents(
         )
         .into());
     }
-    let upper_mode = match (upper_mode, source_state_strategy) {
-        (ResolvedUpperMode::Existing(upper), SourceStateStrategy::Clone) => {
-            ResolvedUpperMode::Existing(clone_existing_upper(&upper, runtime_dir).await?)
-        }
-        (upper_mode, _) => upper_mode,
-    };
-    let adopted_lowers = match source_state_strategy {
-        SourceStateStrategy::Reuse => Vec::new(),
-        SourceStateStrategy::Clone => {
-            adopt_source_owned_lowers(source_image_config, runtime_dir).await?
-        }
-    };
     match &upper_mode {
         ResolvedUpperMode::Absent | ResolvedUpperMode::Existing(_) => {}
         ResolvedUpperMode::Create(mode) => {
@@ -239,12 +210,7 @@ async fn materialize_runtime_contents(
         }
     }
 
-    let image = materialize_overlaybd_image_config(
-        source_image_config,
-        runtime_dir,
-        &upper_mode,
-        &adopted_lowers,
-    )?;
+    let image = materialize_overlaybd_image_config(source_image_config, runtime_dir, &upper_mode)?;
     let runtime_image_config_path = runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE);
     fs::write(
         &runtime_image_config_path,
@@ -587,141 +553,10 @@ fn resolve_source_upper(image_config_path: &Path) -> Result<Option<ResolvedSourc
     }))
 }
 
-async fn adopt_source_owned_lowers(
-    image_config_path: &Path,
-    runtime_dir: &Path,
-) -> Result<Vec<AdoptedLowerPath>> {
-    let image = load_image_config(image_config_path)
-        .with_context(|| format!("load source image config {}", image_config_path.display()))?;
-    let source_root =
-        fs::canonicalize(image_config_path.parent().unwrap_or_else(|| Path::new(".")))
-            .with_context(|| {
-                format!(
-                    "resolve source image config directory {}",
-                    image_config_path.display()
-                )
-            })?;
-    let mut adopted = Vec::new();
-
-    for (layer_index, layer) in image.lowers.iter().enumerate() {
-        let Some(source) = resolve_local_layer_path(layer) else {
-            continue;
-        };
-        let Some((source, source_owned)) = resolve_local_artifact(&source, &source_root)? else {
-            continue;
-        };
-        let file = if source_owned {
-            let destination = runtime_dir
-                .join(RUNTIME_SOURCE_LOWERS_DIR)
-                .join(format!("{layer_index:04}"))
-                .join("layer.data");
-            adopt_immutable_lower_file(&source, &destination).await?;
-            destination
-        } else {
-            source
-        };
-        adopted.push(AdoptedLowerPath {
-            layer_index,
-            file,
-            clear_dir: !layer.dir.is_empty(),
-        });
-    }
-
-    Ok(adopted)
-}
-
-fn resolve_local_artifact(path: &Path, source_root: &Path) -> Result<Option<(PathBuf, bool)>> {
-    match fs::canonicalize(path) {
-        Ok(path) => {
-            let source_owned = path.starts_with(source_root);
-            Ok(Some((path, source_owned)))
-        }
-        Err(err) if path.starts_with(source_root) => Err(err).with_context(|| {
-            format!(
-                "resolve source-owned OverlayBD lower artifact {}",
-                path.display()
-            )
-        }),
-        Err(_) => Ok(None),
-    }
-}
-
-async fn adopt_immutable_lower_file(source: &Path, destination: &Path) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create adopted lower directory {}", parent.display()))?;
-    }
-    match tokio::fs::hard_link(source, destination).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            tracing::debug!(
-                source = %source.display(),
-                destination = %destination.display(),
-                error = %err,
-                "hard-link source-owned lower failed; falling back to reflink or sparse copy"
-            );
-            clone_state_file(source, destination).await
-        }
-    }
-}
-
-async fn clone_existing_upper(
-    source: &ResolvedSourceUpper,
-    runtime_dir: &Path,
-) -> Result<ResolvedSourceUpper> {
-    let data_path = runtime_dir.join(RUNTIME_UPPER_DATA_FILE);
-    clone_state_file(&source.data_path, &data_path).await?;
-
-    let index_path = if let Some(source) = source.index_path.as_deref() {
-        let destination = runtime_dir.join(RUNTIME_UPPER_INDEX_FILE);
-        clone_state_file(source, &destination).await?;
-        Some(destination)
-    } else {
-        None
-    };
-
-    Ok(ResolvedSourceUpper {
-        data_path,
-        index_path,
-        writable_mode: source.writable_mode,
-    })
-}
-
-async fn clone_state_file(source: &Path, destination: &Path) -> Result<()> {
-    let mut command = tokio::process::Command::new("cp");
-    command.kill_on_drop(true).arg("-L");
-    #[cfg(target_os = "linux")]
-    command.args(["--reflink=auto", "--sparse=always"]);
-    let output = command
-        .arg("--")
-        .arg(source)
-        .arg(destination)
-        .output()
-        .await
-        .with_context(|| {
-            format!(
-                "clone OverlayBD source state {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-    anyhow::ensure!(
-        output.status.success(),
-        "clone OverlayBD source state {} to {} failed (status={}): {}",
-        source.display(),
-        destination.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
-}
-
 fn materialize_overlaybd_image_config(
     image_config_path: &Path,
     runtime_dir: &Path,
     upper_mode: &ResolvedUpperMode,
-    adopted_lowers: &[AdoptedLowerPath],
 ) -> Result<Value> {
     let raw = fs::read_to_string(image_config_path).with_context(|| {
         format!(
@@ -738,36 +573,6 @@ fn materialize_overlaybd_image_config(
     let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
 
     rewrite_overlaybd_lower_paths(&mut value, base, runtime_dir)?;
-    if !adopted_lowers.is_empty() {
-        let lowers = value
-            .as_object_mut()
-            .and_then(|object| object.get_mut("lowers"))
-            .and_then(Value::as_array_mut)
-            .context("overlaybd image config lowers should be an array")?;
-        for adopted in adopted_lowers {
-            let lower = lowers
-                .get_mut(adopted.layer_index)
-                .and_then(Value::as_object_mut)
-                .with_context(|| {
-                    format!(
-                        "overlaybd lower {} should be an object",
-                        adopted.layer_index
-                    )
-                })?;
-            lower.insert(
-                "file".to_string(),
-                Value::String(
-                    relative_path(runtime_dir, &adopted.file)?
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-            );
-            if adopted.clear_dir {
-                lower.insert("dir".to_string(), Value::String(String::new()));
-            }
-        }
-    }
-
     let upper = match upper_mode {
         ResolvedUpperMode::Absent => json!({}),
         ResolvedUpperMode::Create(mode) => {
@@ -811,7 +616,7 @@ fn materialize_overlaybd_image_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
     use overlaybd::backend::local::LocalFile;
@@ -839,8 +644,13 @@ mod tests {
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) {
         let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
         let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path).unwrap());
-        let args = LayerInfo::new(data_file, Some(index_file), payload.len() as u64);
-        let lower = create_file_rw(args).await.unwrap();
+        let lower = create_file_rw(LayerInfo::new(
+            data_file,
+            Some(index_file),
+            payload.len() as u64,
+        ))
+        .await
+        .unwrap();
         lower.write_at(0, payload).await.unwrap();
         lower.close_seal().await.unwrap();
     }
@@ -864,42 +674,11 @@ mod tests {
             resize_global_config: global_config,
             resize_permit: Arc::new(tokio::sync::Mutex::new(())),
             allow_shrink: false,
-            source_state_strategy: SourceStateStrategy::Reuse,
         }
     }
 
     #[tokio::test]
-    async fn source_upper_target_state_is_rejected_before_materialization() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "data": "upper.data",
-                    "index": "upper.index",
-                    "target": "upper.target",
-                    "gzipIndex": "upper.gzip-index"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.known_source_virtual_size = Some(8192);
-        request.source_state_strategy = SourceStateStrategy::Clone;
-
-        let error = materialize_overlaybd_runtime(request).await.unwrap_err();
-        assert!(error.downcast_ref::<InvalidRequest>().is_some());
-        assert!(error
-            .to_string()
-            .contains("target/gzipIndex state is unsupported"));
-        assert!(!runtime_dir.exists());
-    }
-
-    #[tokio::test]
-    async fn lower_only_runtime_creates_fresh_upper_but_cannot_clone_source_state() {
+    async fn lower_only_runtime_creates_fresh_upper() {
         let temp = tempfile::tempdir().unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
         let lower_path = temp.path().join("lower.data");
@@ -928,19 +707,6 @@ mod tests {
         assert_eq!(runtime.actual_virtual_size, payload.len() as u64);
         assert!(runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
         assert!(runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists());
-
-        let clone_runtime_dir = temp.path().join("clone-runtime");
-        let mut request =
-            materialize_test_request(&cache, &source, &global_config, &clone_runtime_dir);
-        request.known_source_virtual_size = Some(payload.len() as u64);
-        request.source_state_strategy = SourceStateStrategy::Clone;
-        let err = materialize_overlaybd_runtime(request).await.unwrap_err();
-
-        assert!(err.downcast_ref::<InvalidRequest>().is_some());
-        assert!(err
-            .to_string()
-            .contains("existing writable OverlayBD upper"));
-        assert!(!clone_runtime_dir.exists());
     }
 
     #[tokio::test]
@@ -1285,190 +1051,6 @@ mod tests {
                 })
             );
         }
-    }
-
-    #[tokio::test]
-    async fn source_state_clone_adopts_owned_lower_without_copying_external_lower() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source_dir = temp.path().join("paused-source");
-        let stable_dir = temp.path().join("stable-cache");
-        fs::create_dir(&source_dir).unwrap();
-        fs::create_dir(&stable_dir).unwrap();
-
-        let owned_lower = source_dir.join("owned.commit");
-        let owned_index = source_dir.join("owned.index");
-        let owned_layer_dir = source_dir.join("owned-layer-dir");
-        fs::create_dir(&owned_layer_dir).unwrap();
-        let owned_dir_lower = owned_layer_dir.join("overlaybd.commit");
-        let owned_dir_index = source_dir.join("owned-dir.index");
-        let stable_lower = stable_dir.join("overlaybd.commit");
-        let stable_index = stable_dir.join("stable.index");
-        let payload = vec![0x6A; 8192];
-        create_sealed_lower(&owned_lower, &owned_index, &payload).await;
-        create_sealed_lower(&owned_dir_lower, &owned_dir_index, &payload).await;
-        create_sealed_lower(&stable_lower, &stable_index, &payload).await;
-        let source = write_source(
-            &source_dir,
-            json!({
-                "lowers": [
-                    { "dir": stable_dir },
-                    { "file": owned_lower },
-                    { "dir": "owned-layer-dir" }
-                ],
-                "upper": {},
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.read_only = true;
-        request.known_source_virtual_size = Some(payload.len() as u64);
-        request.source_state_strategy = SourceStateStrategy::Clone;
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
-
-        let runtime_config = load_image_config(&runtime.runtime_image_config_path).unwrap();
-        assert_eq!(
-            fs::canonicalize(&runtime_config.lowers[0].file).unwrap(),
-            fs::canonicalize(&stable_lower).unwrap()
-        );
-        assert!(runtime_config.lowers[0].dir.is_empty());
-        let adopted_lower = fs::canonicalize(&runtime_config.lowers[1].file).unwrap();
-        assert!(adopted_lower.starts_with(fs::canonicalize(&runtime_dir).unwrap()));
-        assert_eq!(
-            fs::read(&adopted_lower).unwrap(),
-            fs::read(&owned_lower).unwrap()
-        );
-        let adopted_dir_lower = fs::canonicalize(&runtime_config.lowers[2].file).unwrap();
-        assert!(adopted_dir_lower.starts_with(fs::canonicalize(&runtime_dir).unwrap()));
-        assert!(runtime_config.lowers[2].dir.is_empty());
-        assert_eq!(
-            fs::read(&adopted_dir_lower).unwrap(),
-            fs::read(&owned_dir_lower).unwrap()
-        );
-        assert_eq!(runtime_config.upper, UpperConfig::default());
-
-        fs::remove_dir_all(&source_dir).unwrap();
-        assert_eq!(
-            reopen_overlaybd_virtual_size(
-                &cache,
-                &runtime.runtime_image_config_path,
-                &global_config,
-            )
-            .await
-            .unwrap(),
-            payload.len() as u64
-        );
-    }
-
-    #[tokio::test]
-    async fn materialize_existing_upper_clone_is_independent_for_supported_layouts() {
-        for (mode, virtual_size, layout) in [
-            (UpperMode::LogStructured, 16384, RwLayout::LogStructured),
-            (
-                UpperMode::HybridLogStructured,
-                24576,
-                RwLayout::HybridLogStructured,
-            ),
-            (UpperMode::Sparse, 8192, RwLayout::Sparse),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let (cache, global_config) = test_cache(temp.path()).await;
-            let source_data = temp.path().join("existing-upper.data");
-            let source_index =
-                (mode != UpperMode::Sparse).then(|| temp.path().join("existing-upper.index"));
-            prepare_runtime_upper(&source_data, source_index.as_deref(), virtual_size, mode)
-                .unwrap();
-            let source = write_source(
-                temp.path(),
-                json!({
-                    "lowers": [],
-                    "upper": {
-                        "mode": mode,
-                        "data": "existing-upper.data",
-                        "index": source_index.as_ref().map(|_| "existing-upper.index").unwrap_or("")
-                    },
-                    "resultFile": ""
-                }),
-            );
-            let runtime_dir = temp.path().join("runtime");
-            let mut request =
-                materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-            request.known_source_virtual_size = Some(virtual_size);
-            request.source_state_strategy = SourceStateStrategy::Clone;
-            let runtime = materialize_overlaybd_runtime(request).await.unwrap();
-
-            let image = load_image_config(&runtime.runtime_image_config_path).unwrap();
-            assert_eq!(image.upper.writable_mode(), mode);
-            let cloned_data = resolve_config_path(&runtime_dir, &image.upper.data).unwrap();
-            let cloned_index = (!image.upper.index.is_empty())
-                .then(|| resolve_config_path(&runtime_dir, &image.upper.index))
-                .transpose()
-                .unwrap();
-            assert_eq!(cloned_data, runtime_dir.join(RUNTIME_UPPER_DATA_FILE));
-            assert_eq!(cloned_index.is_some(), source_index.is_some());
-            assert_eq!(
-                runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists(),
-                source_index.is_some()
-            );
-            validate_rw_header_pair_paths(
-                &cloned_data,
-                cloned_index.as_deref(),
-                virtual_size,
-                layout,
-            )
-            .unwrap();
-
-            let mut files = vec![(source_data.as_path(), cloned_data.as_path())];
-            if let (Some(source), Some(cloned)) = (source_index.as_deref(), cloned_index.as_deref())
-            {
-                files.push((source, cloned));
-            }
-            for (source, cloned) in files {
-                let expected = fs::read(source).unwrap();
-                assert_eq!(fs::read(cloned).unwrap(), expected);
-                assert_ne!(
-                    fs::metadata(source).unwrap().ino(),
-                    fs::metadata(cloned).unwrap().ino()
-                );
-                fs::write(cloned, b"runtime mutation").unwrap();
-                assert_eq!(fs::read(source).unwrap(), expected);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn existing_upper_clone_failure_rolls_back_partial_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source_data = temp.path().join("existing-upper.data");
-        fs::write(&source_data, b"source-data").unwrap();
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "mode": "logStructured",
-                    "data": "existing-upper.data",
-                    "index": "missing-upper.index"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.known_source_virtual_size = Some(16384);
-        request.source_state_strategy = SourceStateStrategy::Clone;
-        let err = materialize_overlaybd_runtime(request).await.unwrap_err();
-
-        assert!(
-            format!("{err:#}").contains("missing-upper.index"),
-            "unexpected clone error: {err:#}"
-        );
-        assert!(!runtime_dir.exists());
-        assert_eq!(fs::read(source_data).unwrap(), b"source-data");
     }
 
     #[test]

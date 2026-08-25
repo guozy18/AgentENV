@@ -114,8 +114,7 @@ impl ApiImpl {
             RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
                 Self::error(409, err.to_string())
             }
-            RepositoryError::Unavailable { .. }
-            | RepositoryError::ConcurrentModification { .. } => Self::error(503, err.to_string()),
+            RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
         }
@@ -138,9 +137,9 @@ impl ApiImpl {
     /// so callers must retry instead of treating node-local state as truth.
     fn reusable_snapshot_error(err: &RepositoryError) -> models::Error {
         match err {
-            RepositoryError::Backend { .. }
-            | RepositoryError::Unavailable { .. }
-            | RepositoryError::ConcurrentModification { .. } => Self::error(503, err.to_string()),
+            RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. } => {
+                Self::error(503, err.to_string())
+            }
             _ => Self::repository_error(err),
         }
     }

@@ -11,7 +11,7 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
-    SourceStateStrategy, UblkDaemonClient, UblkDaemonSpawnConfig,
+    UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -355,13 +355,12 @@ impl UblkDeviceManager {
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
-        source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let client = self.require_client()?;
         let mut metric =
             MetricGuard::operation(UBLK_OPERATION_DURATION, "create_runtime_overlaybd");
         let created = client
-            .create_overlaybd_runtime_device(request, source_state_strategy)
+            .create_overlaybd_runtime_device(request)
             .await
             .context("create overlaybd runtime device via daemon");
         metric.finish(&created);

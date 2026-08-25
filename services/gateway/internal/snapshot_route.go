@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	snapshotPlacementPath             = "/internal/snapshots/placement"
-	maxSnapshotPlacementResponseBytes = 8 * 1024
+	snapshotPlacementPath = "/internal/snapshots/placement"
 )
 
 var (
@@ -101,23 +100,23 @@ func (s *Server) routeSnapshotRequest(
 	scheduledNode *schedulerv1.Node,
 	operation snapshotOperation,
 	snapshotRef string,
-) (*schedulerv1.Node, bool, *gatewayResponseError) {
+) (*schedulerv1.Node, bool, *proxyResponseError) {
 	placement, err := s.lookupSnapshotPlacement(ctx, incoming, scheduledNode, snapshotRef)
 	if err != nil {
 		if errors.Is(err, errSnapshotPlacementUnauthorized) {
-			return nil, false, &gatewayResponseError{
+			return nil, false, &proxyResponseError{
 				statusCode: http.StatusUnauthorized,
 				message:    "authentication required",
 			}
 		}
 		if errors.Is(err, errSnapshotPlacementNotFound) {
 			if operation == snapshotOperationLaunch {
-				return nil, false, &gatewayResponseError{
+				return nil, false, &proxyResponseError{
 					statusCode: http.StatusBadRequest,
 					message:    fmt.Sprintf("template %s not found", snapshotRef),
 				}
 			}
-			return nil, false, &gatewayResponseError{
+			return nil, false, &proxyResponseError{
 				statusCode: http.StatusNotFound,
 				message:    fmt.Sprintf("snapshot %s not found", snapshotRef),
 			}
@@ -127,12 +126,12 @@ func (s *Server) routeSnapshotRequest(
 			if operation == snapshotOperationPromote {
 				statusCode = http.StatusConflict
 			}
-			return nil, false, &gatewayResponseError{
+			return nil, false, &proxyResponseError{
 				statusCode: statusCode,
 				message:    "invalid snapshot reference",
 			}
 		}
-		return nil, false, &gatewayResponseError{
+		return nil, false, &proxyResponseError{
 			statusCode: http.StatusServiceUnavailable,
 			message:    "snapshot placement unavailable",
 			cause:      err,
@@ -156,8 +155,8 @@ func (s *Server) routeSnapshotRequest(
 	}
 }
 
-func invalidSnapshotPlacement(message string) *gatewayResponseError {
-	return &gatewayResponseError{
+func invalidSnapshotPlacement(message string) *proxyResponseError {
+	return &proxyResponseError{
 		statusCode: http.StatusServiceUnavailable,
 		message:    "snapshot placement unavailable",
 		cause:      errors.New(message),
@@ -186,7 +185,9 @@ func (s *Server) lookupSnapshotPlacement(
 	if err != nil {
 		return nil, fmt.Errorf("build snapshot placement request: %w", err)
 	}
-	copySnapshotPlacementHeaders(req.Header, incoming.Header)
+	for _, value := range incoming.Header.Values("X-API-Key") {
+		req.Header.Add("X-API-Key", value)
+	}
 	req.Header.Set("Accept", "application/json")
 
 	client := *s.httpClient
@@ -211,14 +212,10 @@ func (s *Server) lookupSnapshotPlacement(
 		return nil, fmt.Errorf("snapshot placement returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSnapshotPlacementResponseBytes+1))
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read snapshot placement response: %w", err)
 	}
-	if len(body) > maxSnapshotPlacementResponseBytes {
-		return nil, errors.New("snapshot placement response is too large")
-	}
-
 	var placement snapshotPlacement
 	if err := json.Unmarshal(body, &placement); err != nil {
 		return nil, fmt.Errorf("decode snapshot placement response: %w", err)
@@ -226,29 +223,15 @@ func (s *Server) lookupSnapshotPlacement(
 	return &placement, nil
 }
 
-func copySnapshotPlacementHeaders(dst http.Header, src http.Header) {
-	for _, name := range []string{
-		"X-API-Key",
-		"Traceparent",
-		"Tracestate",
-		"Baggage",
-		"X-Request-ID",
-	} {
-		for _, value := range src.Values(name) {
-			dst.Add(name, value)
-		}
-	}
-}
-
 func (s *Server) resolveReadySnapshotOwner(
 	ctx context.Context,
 	ownerNodeID string,
-) (*schedulerv1.Node, bool, *gatewayResponseError) {
+) (*schedulerv1.Node, bool, *proxyResponseError) {
 	rpcStart := time.Now()
 	resp, err := s.scheduler.GetNode(ctx, &schedulerv1.GetNodeRequest{NodeId: ownerNodeID})
 	recordGatewaySchedulerRPC("GetNode", rpcStart, err)
 	if err != nil {
-		return nil, false, &gatewayResponseError{
+		return nil, false, &proxyResponseError{
 			statusCode: http.StatusServiceUnavailable,
 			message:    "snapshot owner unavailable",
 			cause:      err,
@@ -275,8 +258,8 @@ func (s *Server) resolveReadySnapshotOwner(
 	}, true, nil
 }
 
-func unavailableSnapshotOwner(message string) *gatewayResponseError {
-	return &gatewayResponseError{
+func unavailableSnapshotOwner(message string) *proxyResponseError {
+	return &proxyResponseError{
 		statusCode: http.StatusServiceUnavailable,
 		message:    "snapshot owner unavailable",
 		cause:      errors.New(message),

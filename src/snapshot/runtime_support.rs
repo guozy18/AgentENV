@@ -36,14 +36,6 @@ impl RuntimeImageMaterializer {
         self.runtime_root.join(snapshot_id.to_string())
     }
 
-    pub(crate) fn snapshot_dir_with_legacy_namespace(
-        &self,
-        snapshot_id: &SnapshotId,
-        namespace: &str,
-    ) -> PathBuf {
-        self.snapshot_dir(snapshot_id).join(namespace)
-    }
-
     pub(crate) fn rootfs_image_config_path(&self, snapshot_id: &SnapshotId) -> PathBuf {
         self.snapshot_dir(snapshot_id)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir)

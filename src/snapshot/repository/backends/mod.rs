@@ -73,9 +73,9 @@ pub fn build_snapshot_backend(
     }
 }
 
-/// Builds the durable node-local POSIX artifact store used for Local snapshots.
+/// Builds the Pod-local POSIX artifact store used for Local snapshots.
 /// It is deliberately independent of the configured publication backend, so
-/// an OSS outage cannot prevent a local physical closure from being committed.
+/// an OSS outage cannot prevent the local physical closure from being sealed.
 pub(crate) fn build_local_snapshot_backend() -> Result<(
     Arc<PosixFsLocalArtifactStore>,
     Arc<dyn SnapshotRuntimeResolver>,

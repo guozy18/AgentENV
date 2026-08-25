@@ -27,17 +27,6 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 - `kubectl` with Kustomize support
 - shared storage across all runtime nodes, using either POSIXFS or OSS
 
-The default DaemonSet mounts `/var/lib/aenv` from each worker as a hostPath;
-those directories are not shared with other workers. For a multi-node
-deployment using `posix_fs`, mount one shared filesystem only at the canonical
-`/workspace/env/snapshot-store` subdirectory (with cross-node locking,
-atomic-rename, and read-after-write guarantees), while keeping each worker's
-`/workspace/env/snapshot-local-store` and other runtime state host-local.
-Alternatively configure `snapshot.repository_backend = "oss"` with a
-CAS-capable object store. A per-node hostPath with the default `posix_fs`
-backend is suitable only for a single runtime node and must not be used as a
-cluster-wide snapshot catalog.
-
 The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see [PVM Deployment](./pvm.md).
 
@@ -106,10 +95,7 @@ The make targets build a temporary Kustomize context so runtime Pods mount the r
 The runtime DaemonSet injects scheduler-report wiring for each node Pod:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon` so the Pod uses the `uvm-ublk-daemon` binary included in the runtime image
-- `AENV_NODE_ID` from the Kubernetes host's `spec.nodeName`, so a Pod
-  replacement keeps the node-local snapshot owner identity stable
-- `AENV_SERVICE_INSTANCE_ID` from the Pod UID (`metadata.uid`), fencing
-  heartbeats from a replaced Pod
+- `AENV_NODE_ID` from Pod metadata name (`metadata.name`)
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true`
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090`
 - `AENV_SANDBOX_PROXY_DOMAINS` from the shared sandbox proxy ConfigMap

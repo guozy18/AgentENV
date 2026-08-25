@@ -51,14 +51,6 @@ fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
     }
 }
 
-fn snapshot_get_error_response(error: models::Error) -> SnapshotsSnapshotIdGetResponse {
-    match error.code {
-        400 => SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error),
-        503 => SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error),
-        _ => SnapshotsSnapshotIdGetResponse::Status500_ServerError(error),
-    }
-}
-
 #[async_trait]
 impl Snapshots<()> for ApiImpl {
     type Claims = super::Claims;
@@ -142,11 +134,7 @@ impl Snapshots<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, ()> {
-        match self
-            .snapshot_manager
-            .get_sandbox_snapshot(&path_params.snapshot_id)
-            .await
-        {
+        match self.snapshot_manager.get(&path_params.snapshot_id).await {
             Ok(Some(record)) => Ok(
                 SnapshotsSnapshotIdGetResponse::Status200_SuccessfullyReturnedTheSnapshot(
                     models::SnapshotInfo::from(record),
@@ -158,9 +146,14 @@ impl Snapshots<()> for ApiImpl {
                     format!("snapshot '{}' not found", path_params.snapshot_id),
                 ),
             )),
-            Err(err) => Ok(snapshot_get_error_response(
-                Self::reusable_snapshot_manager_error(&err),
-            )),
+            Err(err) => {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                Ok(match error.code {
+                    400 => SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error),
+                    503 => SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error),
+                    _ => SnapshotsSnapshotIdGetResponse::Status500_ServerError(error),
+                })
+            }
         }
     }
 
@@ -237,38 +230,5 @@ mod tests {
         assert_eq!(info.image_ref, None);
         let serialized = serde_json::to_value(&info).expect("serialize SnapshotInfo");
         assert!(serialized.get("imageRef").is_none());
-    }
-
-    #[test]
-    fn promotion_invalid_transition_is_reported_as_conflict() {
-        let error =
-            ApiImpl::snapshot_promotion_error(&crate::snapshot::RepositoryError::InvalidRequest {
-                reason: "record changed during promotion".to_string(),
-            });
-
-        assert_eq!(error.code, 409);
-    }
-
-    #[test]
-    fn snapshot_get_invalid_reference_is_reported_as_bad_request() {
-        let error =
-            ApiImpl::reusable_snapshot_error(&crate::snapshot::RepositoryError::InvalidRequest {
-                reason: "invalid snapshot alias".to_string(),
-            });
-
-        assert!(matches!(
-            snapshot_get_error_response(error),
-            SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error) if error.code == 400
-        ));
-    }
-
-    #[test]
-    fn promotion_repository_outage_is_reported_as_unavailable() {
-        let error = ApiImpl::snapshot_promotion_error(&crate::snapshot::RepositoryError::Backend {
-            message: "metadata authority is offline".to_string(),
-            source: None,
-        });
-
-        assert_eq!(error.code, 503);
     }
 }

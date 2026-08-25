@@ -6,15 +6,13 @@ use agentenv::sandbox::FirecrackerSnapshotManifest;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::repository::backends::OssBackend;
 use agentenv::snapshot::{
-    CommittedSnapshot, OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId,
-    SnapshotLifecycle, SnapshotListFilter, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotType,
+    OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions, SnapshotType,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
-use aws_sdk_s3::primitives::ByteStream;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::index_file::{CommitArgs, LSMTFile};
 use overlaybd::virtual_file::VirtualFile;
@@ -149,16 +147,6 @@ fn prefixed_key(prefix: &str, relative: &str) -> String {
     format!("{prefix}/{relative}")
 }
 
-fn artifact_key_for_record(prefix: &str, record: &SnapshotRecord, relative: &str) -> String {
-    let artifact_path = record
-        .committed
-        .as_ref()
-        .and_then(|committed| committed.legacy_artifact_namespace.as_deref())
-        .map(|namespace| format!("artifacts/{}/{namespace}/{relative}", record.id))
-        .unwrap_or_else(|| format!("artifacts/{}/{relative}", record.id));
-    prefixed_key(prefix, &artifact_path)
-}
-
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> {
@@ -225,19 +213,23 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     assert_eq!(object_bytes.as_ref(), source_zfile_bytes.as_slice());
     assert!(
         fixture
-            .object_exists(&artifact_key_for_record(
+            .object_exists(&prefixed_key(
                 prefix,
-                &stored,
-                SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+                &format!(
+                    "artifacts/{}/{}",
+                    stored.id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state
+                ),
             ))
             .await?
     );
     assert!(
         fixture
-            .object_exists(&artifact_key_for_record(
+            .object_exists(&prefixed_key(
                 prefix,
-                &stored,
-                SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+                &format!(
+                    "artifacts/{}/{}",
+                    stored.id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest
+                ),
             ))
             .await?
     );
@@ -270,264 +262,6 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         mem_config["lowers"][0]["size"],
         source_zfile_bytes.len() as u64
     );
-
-    // Upgrade compatibility: old records must keep resolving and deleting
-    // their exact persisted attempt prefix without touching fixed siblings.
-    drop(runnable);
-    let legacy_namespace = "attempt-old";
-    for relative in [
-        SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-        SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-    ] {
-        let fixed_key = prefixed_key(prefix, &format!("artifacts/{snapshot_id}/{relative}"));
-        let bytes = fixture
-            .client
-            .get_object()
-            .bucket(&fixture.bucket)
-            .key(&fixed_key)
-            .send()
-            .await?
-            .body
-            .collect()
-            .await?
-            .into_bytes();
-        fixture
-            .client
-            .put_object()
-            .bucket(&fixture.bucket)
-            .key(prefixed_key(
-                prefix,
-                &format!("artifacts/{snapshot_id}/{legacy_namespace}/{relative}"),
-            ))
-            .body(ByteStream::from(bytes.to_vec()))
-            .send()
-            .await?;
-        fixture
-            .client
-            .delete_object()
-            .bucket(&fixture.bucket)
-            .key(fixed_key)
-            .send()
-            .await?;
-    }
-    let mut legacy = stored;
-    legacy
-        .committed
-        .as_mut()
-        .expect("snapshot should remain committed")
-        .legacy_artifact_namespace = Some(legacy_namespace.to_string());
-    fixture
-        .client
-        .put_object()
-        .bucket(&fixture.bucket)
-        .key(prefixed_key(
-            prefix,
-            &format!("catalog/records/{snapshot_id}.json"),
-        ))
-        .body(ByteStream::from(serde_json::to_vec(&legacy)?))
-        .send()
-        .await?;
-    let legacy_record = repository
-        .get_record(&snapshot_id)
-        .await?
-        .expect("legacy record should remain readable");
-    let legacy_runnable = resolver.resolve(Arc::new(legacy_record)).await?;
-    assert!(legacy_runnable.manifest().vm_state.path.exists());
-    drop(legacy_runnable);
-
-    let fixed_sibling = prefixed_key(prefix, &format!("artifacts/{snapshot_id}/fixed-sibling"));
-    fixture
-        .client
-        .put_object()
-        .bucket(&fixture.bucket)
-        .key(&fixed_sibling)
-        .body(ByteStream::from_static(b"fixed sibling"))
-        .send()
-        .await?;
-    assert!(repository.delete_by_id(&snapshot_id).await?);
-    assert!(
-        !fixture
-            .object_exists(&prefixed_key(
-                prefix,
-                &format!(
-                    "artifacts/{snapshot_id}/{legacy_namespace}/{}",
-                    SNAPSHOT_ARTIFACT_LAYOUT.vm_state
-                ),
-            ))
-            .await?
-    );
-    assert!(fixture.object_exists(&fixed_sibling).await?);
-    assert!(repository.delete_by_id(&snapshot_id).await?);
-    assert!(!fixture.object_exists(&fixed_sibling).await?);
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn snapshot_oss_local_metadata_promotes_same_identity_to_distributed() -> Result<()> {
-    let fixture = MinioFixture::start().await?;
-    let workspace = TempDir::new()?;
-    let prefix = "snapshots/local-promotion";
-    let oss = test_oss_config(&fixture, prefix);
-    ensure_test_config()?;
-
-    let (repository, resolver) =
-        OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
-    let artifacts_root = workspace.path().join("local-artifacts");
-    let (rootfs_digest, memory_digest, _, manifest) =
-        write_built_artifacts(&artifacts_root).await?;
-    let snapshot_id = SnapshotId::generate();
-    let source_sandbox_id = "sandbox-local-promotion".to_string();
-    let context = agentenv::snapshot::CommandContext::default();
-    let resources = SandboxResources::default();
-    let runtime_versions = test_runtime_versions();
-    let virtualization_mode = ConfigManager::global_config().virtualization_mode;
-    let image_configs = agentenv::types::ImageConfigs::new();
-    let local = SnapshotRecord {
-        id: snapshot_id.clone(),
-        snapshot_type: SnapshotType::Local,
-        owner_node_id: Some("node-a".to_string()),
-        lifecycle: SnapshotLifecycle::Ready,
-        alias: None,
-        source: SnapshotSource::Sandbox {
-            source_sandbox_id: source_sandbox_id.clone(),
-        },
-        resources,
-        created_at_unix_ms: 1,
-        updated_at_unix_ms: 1,
-        committed: Some(CommittedSnapshot {
-            context: context.clone(),
-            startup: None,
-            runtime_versions: runtime_versions.clone(),
-            virtualization_mode,
-            image_configs: image_configs.clone(),
-            rootfs_layers: Vec::new(),
-            attached_drives: Vec::new(),
-            memory_layers: Vec::new(),
-            disk_publications: Vec::new(),
-            legacy_artifact_namespace: None,
-            custom_extension_params: None,
-        }),
-    };
-
-    let local = repository.commit_record(local).await?;
-    assert_eq!(local.id, snapshot_id);
-    assert_eq!(local.snapshot_type, SnapshotType::Local);
-    assert_eq!(local.owner_node_id.as_deref(), Some("node-a"));
-    assert!(local.alias.is_none());
-    assert_eq!(local.lifecycle, SnapshotLifecycle::Ready);
-
-    let exact_local = repository
-        .get_record(&snapshot_id)
-        .await?
-        .expect("Local canonical metadata should be readable by exact id");
-    assert_eq!(exact_local.snapshot_type, SnapshotType::Local);
-    assert_eq!(exact_local.owner_node_id.as_deref(), Some("node-a"));
-    assert!(exact_local.alias.is_none());
-
-    let record_key = prefixed_key(prefix, &format!("catalog/records/{snapshot_id}.json"));
-    let record_json = fixture
-        .client
-        .get_object()
-        .bucket(&fixture.bucket)
-        .key(&record_key)
-        .send()
-        .await?
-        .body
-        .collect()
-        .await?
-        .into_bytes();
-    let record_json = String::from_utf8(record_json.to_vec())?;
-    assert!(
-        !record_json.contains(workspace.path().to_string_lossy().as_ref()),
-        "canonical Local metadata must not contain node-local artifact paths"
-    );
-
-    let vm_state_key = artifact_key_for_record(prefix, &local, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-    let manifest_key = artifact_key_for_record(
-        prefix,
-        &local,
-        SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-    );
-    assert!(!fixture.object_exists(&vm_state_key).await?);
-    assert!(!fixture.object_exists(&manifest_key).await?);
-
-    let promoted = repository
-        .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: SnapshotType::Distributed,
-                owner_node_id: None,
-                alias: None,
-                source: SnapshotPublishSource::Sandbox { source_sandbox_id },
-                context,
-                startup: None,
-                resources,
-                runtime_versions,
-                virtualization_mode,
-                image_configs,
-                custom_extension_params: None,
-            },
-            manifest,
-        )
-        .await?;
-
-    assert_eq!(promoted.id, snapshot_id);
-    assert_eq!(promoted.snapshot_type, SnapshotType::Distributed);
-    assert!(promoted.owner_node_id.is_none());
-    assert!(promoted.alias.is_none());
-    assert_eq!(promoted.lifecycle, SnapshotLifecycle::Ready);
-    let exact_promoted = repository
-        .get_record(&snapshot_id)
-        .await?
-        .expect("promoted metadata should remain visible by exact id");
-    assert_eq!(exact_promoted.id, snapshot_id);
-    assert_eq!(exact_promoted.snapshot_type, SnapshotType::Distributed);
-    assert!(exact_promoted.owner_node_id.is_none());
-    assert!(exact_promoted.alias.is_none());
-
-    let promoted_vm_state_key =
-        artifact_key_for_record(prefix, &promoted, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-    let promoted_manifest_key = artifact_key_for_record(
-        prefix,
-        &promoted,
-        SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-    );
-    assert!(fixture.object_exists(&promoted_vm_state_key).await?);
-    assert!(fixture.object_exists(&promoted_manifest_key).await?);
-    assert!(
-        fixture
-            .object_exists(&prefixed_key(
-                prefix,
-                &format!("managed-layers/{rootfs_digest}")
-            ))
-            .await?
-    );
-    assert!(
-        fixture
-            .object_exists(&prefixed_key(
-                prefix,
-                &format!("managed-layers/{memory_digest}")
-            ))
-            .await?
-    );
-
-    let committed = promoted
-        .committed
-        .as_ref()
-        .expect("promoted snapshot should carry its distributed closure");
-    assert!(matches!(
-        committed.rootfs_layers.as_slice(),
-        [OverlaybdLayerRef::Managed(layer)] if layer.digest == rootfs_digest
-    ));
-    assert_eq!(committed.memory_layers.len(), 1);
-    assert_eq!(committed.memory_layers[0].digest, memory_digest);
-
-    let runnable = resolver.resolve(Arc::new(promoted)).await?;
-    assert!(runnable.manifest().vm_state.path.exists());
-    assert!(runnable.manifest().memory.image_config_path.exists());
-    assert!(runnable.manifest().rootfs.image_config_path.exists());
 
     Ok(())
 }

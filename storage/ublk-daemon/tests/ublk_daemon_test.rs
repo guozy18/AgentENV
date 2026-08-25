@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
-    SourceStateStrategy, UblkDaemonClient,
+    UblkDaemonClient,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -345,7 +345,6 @@ mod client_tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
-                source_state_strategy,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -355,10 +354,7 @@ mod client_tests {
                 assert_eq!(requested_virtual_size, None);
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(!allow_shrink);
-                let dev_id = match source_state_strategy {
-                    SourceStateStrategy::Reuse => 11,
-                    SourceStateStrategy::Clone => 12,
-                };
+                let dev_id = 11;
                 DaemonResponse::OverlaybdRuntimeDeviceCreated {
                     dev_id,
                     device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
@@ -384,7 +380,7 @@ mod client_tests {
             allow_shrink: false,
         };
         let device = client
-            .create_overlaybd_runtime_device(request(), SourceStateStrategy::Reuse)
+            .create_overlaybd_runtime_device(request())
             .await
             .unwrap();
         assert_eq!(device.dev_id, 11);
@@ -394,13 +390,6 @@ mod client_tests {
             device.runtime_image_config_path,
             PathBuf::from("/work/overlaybd/image.json")
         );
-
-        let cloned = client
-            .create_overlaybd_runtime_device(request(), SourceStateStrategy::Clone)
-            .await
-            .unwrap();
-        assert_eq!(cloned.dev_id, 12);
-        assert_eq!(cloned.device_path, PathBuf::from("/dev/ublkb12"));
     }
 
     #[tokio::test]
@@ -417,19 +406,16 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .create_overlaybd_runtime_device(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: Path::new("/src/image.json"),
-                    global_config: Path::new("/global.json"),
-                    runtime_dir: Path::new("/work/overlaybd"),
-                    read_only: false,
-                    runtime_upper_mode: UpperMode::LogStructured,
-                    requested_virtual_size: None,
-                    known_source_virtual_size: None,
-                    allow_shrink: false,
-                },
-                SourceStateStrategy::Reuse,
-            )
+            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: Path::new("/src/image.json"),
+                global_config: Path::new("/global.json"),
+                runtime_dir: Path::new("/work/overlaybd"),
+                read_only: false,
+                runtime_upper_mode: UpperMode::LogStructured,
+                requested_virtual_size: None,
+                known_source_virtual_size: None,
+                allow_shrink: false,
+            })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("bad runtime"));
@@ -443,19 +429,16 @@ mod client_tests {
         .await;
         let err = server
             .client()
-            .create_overlaybd_runtime_device(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: Path::new("/src/image.json"),
-                    global_config: Path::new("/global.json"),
-                    runtime_dir: Path::new("/work/overlaybd"),
-                    read_only: false,
-                    runtime_upper_mode: UpperMode::LogStructured,
-                    requested_virtual_size: None,
-                    known_source_virtual_size: None,
-                    allow_shrink: false,
-                },
-                SourceStateStrategy::Reuse,
-            )
+            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: Path::new("/src/image.json"),
+                global_config: Path::new("/global.json"),
+                runtime_dir: Path::new("/work/overlaybd"),
+                read_only: false,
+                runtime_upper_mode: UpperMode::LogStructured,
+                requested_virtual_size: None,
+                known_source_virtual_size: None,
+                allow_shrink: false,
+            })
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<InvalidRequestError>().is_some());
@@ -467,19 +450,16 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .create_overlaybd_runtime_device(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: Path::new("/src/image.json"),
-                    global_config: Path::new("/global.json"),
-                    runtime_dir: Path::new("/work/overlaybd"),
-                    read_only: false,
-                    runtime_upper_mode: UpperMode::LogStructured,
-                    requested_virtual_size: None,
-                    known_source_virtual_size: None,
-                    allow_shrink: false,
-                },
-                SourceStateStrategy::Reuse,
-            )
+            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: Path::new("/src/image.json"),
+                global_config: Path::new("/global.json"),
+                runtime_dir: Path::new("/work/overlaybd"),
+                read_only: false,
+                runtime_upper_mode: UpperMode::LogStructured,
+                requested_virtual_size: None,
+                known_source_virtual_size: None,
+                allow_shrink: false,
+            })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unexpected response"));

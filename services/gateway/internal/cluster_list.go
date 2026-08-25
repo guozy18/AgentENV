@@ -40,6 +40,15 @@ type clusterListResult struct {
 	err   error
 }
 
+type clusterListStatusError struct {
+	statusCode int
+	message    string
+}
+
+func (e *clusterListStatusError) Error() string {
+	return e.message
+}
+
 func isClusterListRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
@@ -71,7 +80,7 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 
 	items, err := s.fetchClusterList(routingCtx, r, resp.GetNodes())
 	if err != nil {
-		var statusErr *gatewayResponseError
+		var statusErr *clusterListStatusError
 		if errors.As(err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
 			http.Error(w, statusErr.message, statusErr.statusCode)
 			return
@@ -186,7 +195,7 @@ func (s *Server) fetchNodeClusterList(ctx context.Context, incoming *http.Reques
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &gatewayResponseError{
+		return nil, &clusterListStatusError{
 			statusCode: resp.StatusCode,
 			message:    http.StatusText(resp.StatusCode),
 		}

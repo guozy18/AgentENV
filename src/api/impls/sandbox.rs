@@ -35,14 +35,6 @@ fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
-fn reusable_snapshot_launch_error_response(error: models::Error) -> SandboxesPostResponse {
-    match error.code {
-        400 => SandboxesPostResponse::Status400_BadRequest(error),
-        503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
-        _ => SandboxesPostResponse::Status500_ServerError(error),
-    }
-}
-
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
@@ -653,7 +645,11 @@ impl Sandboxes<()> for ApiImpl {
             Err(err) => {
                 warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
                 let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(reusable_snapshot_launch_error_response(error));
+                return Ok(match error.code {
+                    400 => SandboxesPostResponse::Status400_BadRequest(error),
+                    503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
+                    _ => SandboxesPostResponse::Status500_ServerError(error),
+                });
             }
         };
 
@@ -1229,9 +1225,7 @@ impl Sandboxes<()> for ApiImpl {
             Err(err) => {
                 let error = if matches!(
                     err,
-                    RepositoryError::Backend { .. }
-                        | RepositoryError::Unavailable { .. }
-                        | RepositoryError::ConcurrentModification { .. }
+                    RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. }
                 ) {
                     Self::reusable_snapshot_error(&err)
                 } else {
@@ -1478,42 +1472,6 @@ mod tests {
             internal_states_for_api_state(models::SandboxState::Paused),
             vec![SandboxState::Pausing, SandboxState::Paused]
         );
-    }
-
-    #[test]
-    fn reusable_snapshot_request_rejects_temporal_type() {
-        let request = serde_json::from_value::<models::SandboxSnapshotRequest>(
-            serde_json::json!({ "snapshotType": "temporal" }),
-        );
-
-        assert!(request.is_err());
-    }
-
-    #[test]
-    fn reusable_snapshot_request_omission_keeps_distributed_default() {
-        let request =
-            serde_json::from_value::<models::SandboxSnapshotRequest>(serde_json::json!({}))
-                .expect("request should deserialize");
-
-        assert_eq!(
-            request
-                .snapshot_type
-                .unwrap_or(models::SnapshotType::Distributed),
-            models::SnapshotType::Distributed
-        );
-    }
-
-    #[test]
-    fn reusable_snapshot_launch_invalid_reference_is_a_bad_request() {
-        let error =
-            ApiImpl::reusable_snapshot_error(&crate::snapshot::RepositoryError::InvalidRequest {
-                reason: "invalid snapshot alias".to_string(),
-            });
-
-        assert!(matches!(
-            reusable_snapshot_launch_error_response(error),
-            SandboxesPostResponse::Status400_BadRequest(error) if error.code == 400
-        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::errors::{RepositoryError, RepositoryResult};
+use super::errors::RepositoryResult;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
@@ -12,9 +12,8 @@ use crate::snapshot::types::{
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all publicly visible
-/// snapshot records, including pending template builds and committed
-/// snapshots.
+/// When all fields are `None`, the filter matches all snapshot records,
+/// including pending template builds and committed snapshots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotListFilter {
     /// Match aliases that start with this prefix.
@@ -131,10 +130,10 @@ impl SnapshotListFilter {
 }
 
 #[async_trait]
-/// Durable snapshot repository.
+/// Repository for canonical snapshot metadata and Distributed artifacts.
 ///
 /// This trait owns the repository truth for [`SnapshotRecord`] values and committed snapshot
-/// artifacts. A record is the catalog identity and lifecycle state for a snapshot:
+/// artifacts. A record is the catalog identity and metadata for a snapshot:
 ///
 /// - template records may exist before build artifacts are committed
 /// - sandbox records are created by publishing an already captured runtime snapshot
@@ -145,7 +144,7 @@ impl SnapshotListFilter {
 ///
 /// - snapshot records and template build state
 /// - alias-to-snapshot bindings
-/// - committed artifacts such as Firecracker snapshots and managed layers
+/// - repository-backed committed artifacts such as Firecracker snapshots and managed layers
 /// - publish / delete visibility rules
 ///
 /// Callers may assume returned records describe durable repository state rather than process-local
@@ -195,13 +194,8 @@ pub trait SnapshotRepository: Send + Sync {
     ) -> RepositoryResult<SnapshotRecord>;
 
     /// Materializes backend-owned remote lowers that a node-local capture
-    /// cannot represent by reference. Implementations may replace transient
-    /// config paths with local copies before the local repository imports them.
-    ///
-    /// The default is sufficient for repositories whose capture inputs are
-    /// already local. A backend must fail closed when it cannot make a
-    /// captured memory closure local; returning a record with a dangling
-    /// remote-only memory layer would make Local recovery non-runnable.
+    /// cannot represent by reference before the local store imports them.
+    /// Repositories whose capture inputs are already local use the default.
     async fn prepare_local_capture(
         &self,
         _manifest: &mut FirecrackerSnapshotManifest,
@@ -213,43 +207,13 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// This is the canonical metadata commit used for Local snapshots: the
     /// node-local POSIX store has already committed the immutable artifact
-    /// closure, while this repository owns public identity, alias, lifecycle,
-    /// and placement. Implementations must keep Preparing records hidden and
-    /// make the alias and Ready record visible as one recoverable operation.
+    /// closure, while this repository owns public identity, alias, and
+    /// placement. Implementations must publish the record only after the
+    /// physical closure is ready.
     async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-
-    /// Loads an exact record, including a hidden Preparing record.
-    ///
-    /// Public callers use [`Self::get`]. This exact read exists for metadata
-    /// commit recovery and must never interpret UUID text as an alias.
-    async fn get_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>;
-
-    /// Loads an exact snapshot record only when its committed artifact closure
-    /// is publicly runnable.
-    ///
-    /// Unlike [`Self::get_record`], this read excludes hidden lifecycle states,
-    /// records without committed artifacts, and backend-specific records whose
-    /// visibility/commit marker is missing.
-    async fn get_committed_record(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        Ok(self
-            .get_record(id)
-            .await?
-            .filter(|record| record.is_ready() && record.committed.is_some()))
-    }
 
     /// Loads one snapshot record by repository id or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
-
-    /// Loads the exact identity selected for a delete, including hidden
-    /// Preparing/Deleting records. The returned ID must be used for the
-    /// subsequent delete so an alias cannot be rebound to a different
-    /// identity between lookup and cleanup.
-    async fn get_for_delete(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.get(id_or_alias).await
-    }
 
     /// Lists snapshot records matching the provided filter.
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
@@ -262,20 +226,6 @@ pub trait SnapshotRepository: Send + Sync {
     /// For committed records, implementations should also remove per-snapshot committed artifacts and
     /// any alias binding that still points at the deleted id.
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
-
-    /// Deletes exactly one snapshot id without interpreting its UUID text as an alias.
-    ///
-    /// This is required when a manager has already resolved a cross-repository identity: aliases
-    /// are allowed to look like UUIDs, so routing the id back through [`Self::delete`] could delete
-    /// an unrelated alias target in a repository where that id is absent.
-    /// Returns whether an exact identity existed and its delete lifecycle was
-    /// completed. Backends may retain a hidden terminal tombstone after
-    /// physical artifacts are removed to fence stale writers.
-    async fn delete_by_id(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
-        Err(RepositoryError::Unsupported {
-            feature: "deleting a snapshot by exact id".to_string(),
-        })
-    }
 
     /// Resolves a human-readable alias to the current snapshot id.
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;

@@ -7,16 +7,6 @@ import (
 	"testing"
 )
 
-func sandboxRequestBodyOfSize(t *testing.T, size int) string {
-	t.Helper()
-	prefix := `{"templateID":"tmpl","pad":"`
-	suffix := `"}`
-	if size < len(prefix)+len(suffix) {
-		t.Fatalf("sandbox body size %d is too small", size)
-	}
-	return prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix
-}
-
 func newHintRequest(t *testing.T, method, target, body string) *http.Request {
 	t.Helper()
 	var r *http.Request
@@ -40,7 +30,7 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
 	}
 	if snapshotRef != "tmpl" {
-		t.Fatalf("snapshot reference = %q, want %q", snapshotRef, "tmpl")
+		t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
 	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint, got %v", hint)
@@ -103,16 +93,19 @@ func TestBuildScheduleHintTrailingSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
 	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
+	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint for trailing slash, got %v", hint)
-	}
-	if snapshotRef != "tmpl" {
-		t.Fatalf("snapshot reference = %q, want %q", snapshotRef, "tmpl")
 	}
 
 	hint, snapshotRef, err = buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes-cold/", `{"image":"img"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	if hint.GetNewColdSandbox() == nil {
 		t.Fatalf("expected cold sandbox hint for trailing slash, got %v", hint)
@@ -127,6 +120,8 @@ func TestBuildScheduleHintNoHint(t *testing.T) {
 		target string
 	}{
 		{"get sandboxes", http.MethodGet, "/sandboxes"},
+		{"get cold", http.MethodGet, "/sandboxes-cold"},
+		{"unrelated path", http.MethodPost, "/snapshots"},
 		{"sandbox detail", http.MethodPost, "/sandboxes/sbx-1/pause"},
 	}
 	for _, tc := range cases {
@@ -145,46 +140,6 @@ func TestBuildScheduleHintNoHint(t *testing.T) {
 	}
 }
 
-func TestBuildScheduleHintNewSandboxRejectsInvalidBody(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "missing templateID", body: `{"metadata":{"team":"alpha"}}`},
-		{name: "malformed JSON", body: `{"templateID":`},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes", tc.body))
-			if err == nil {
-				t.Fatal("expected invalid sandbox body error")
-			}
-		})
-	}
-}
-
-func TestBuildScheduleHintOversizedBodyAllowsReferenceBeyondInspectionBudget(t *testing.T) {
-	templateID := strings.Repeat("t", maxHintBodyBytes+1)
-	reqBody := `{"templateID":"` + templateID + `","pad":"` + strings.Repeat("a", maxHintBodyBytes) + `"}`
-	if len(reqBody) >= maxNewSandboxBodyBytes {
-		t.Fatalf("test body unexpectedly exceeds request limit: %d", len(reqBody))
-	}
-
-	r := newHintRequest(t, http.MethodPost, "/sandboxes", reqBody)
-	hint, snapshotRef, err := buildScheduleHint(r)
-	if err != nil {
-		t.Fatalf("buildScheduleHint returned error: %v", err)
-	}
-	defer r.Body.Close()
-	if hint.GetNewSandbox() == nil {
-		t.Fatalf("expected new_sandbox hint, got %v", hint)
-	}
-	if snapshotRef != templateID {
-		t.Fatalf("snapshot reference length = %d, want %d", len(snapshotRef), len(templateID))
-	}
-}
-
 func TestParseNewColdSandboxHint(t *testing.T) {
 	t.Run("empty body", func(t *testing.T) {
 		hint := parseNewColdSandboxHint(nil)
@@ -193,6 +148,13 @@ func TestParseNewColdSandboxHint(t *testing.T) {
 		}
 		if hint.GetCpuCount() != 0 || hint.GetMemoryMb() != 0 || len(hint.GetImages()) != 0 {
 			t.Fatalf("expected zero-value hint, got %v", hint)
+		}
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		hint := parseNewColdSandboxHint([]byte("{not json"))
+		if hint == nil || len(hint.GetImages()) != 0 {
+			t.Fatalf("expected best-effort empty hint, got %v", hint)
 		}
 	})
 
@@ -209,6 +171,17 @@ func TestParseNewColdSandboxHint(t *testing.T) {
 			t.Fatalf("images = %v", got)
 		}
 	})
+}
+
+func TestCaptureRequestBodyNil(t *testing.T) {
+	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", "")
+	body, err := captureRequestBody(r)
+	if err != nil {
+		t.Fatalf("captureRequestBody returned error: %v", err)
+	}
+	if body != nil {
+		t.Fatalf("expected nil body, got %q", string(body))
+	}
 }
 
 func TestBuildScheduleHintColdSandboxOversizedBodyStreams(t *testing.T) {

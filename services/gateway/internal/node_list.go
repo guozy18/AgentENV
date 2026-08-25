@@ -191,7 +191,8 @@ func (s *Server) handleNodeDetail(
 		return
 	}
 
-	upstreamCtx := requestContextForProxy(r, routingCtx, longLived)
+	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+	defer cancelUpstream()
 
 	s.proxyRequest(
 		w,

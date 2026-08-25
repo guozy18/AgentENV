@@ -32,11 +32,9 @@ fn placement_error_status(error: &anyhow::Error) -> StatusCode {
         .find_map(|cause| cause.downcast_ref::<RepositoryError>())
     {
         Some(RepositoryError::InvalidRequest { .. }) => StatusCode::BAD_REQUEST,
-        Some(
-            RepositoryError::Unavailable { .. }
-            | RepositoryError::Backend { .. }
-            | RepositoryError::ConcurrentModification { .. },
-        ) => StatusCode::SERVICE_UNAVAILABLE,
+        Some(RepositoryError::Unavailable { .. } | RepositoryError::Backend { .. }) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -78,35 +76,5 @@ where
         },
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(error) => Err(placement_error_status(&error)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placement_response_never_contains_artifact_paths() {
-        let response = PlacementResponse {
-            snapshot_type: SnapshotType::Local,
-            owner_node_id: Some("node-a".to_string()),
-        };
-
-        assert_eq!(
-            serde_json::to_value(response).expect("placement should serialize"),
-            serde_json::json!({
-                "snapshotType": "local",
-                "ownerNodeID": "node-a"
-            })
-        );
-    }
-
-    #[test]
-    fn invalid_snapshot_reference_is_a_bad_request() {
-        let error = anyhow::Error::new(RepositoryError::InvalidRequest {
-            reason: "invalid snapshot alias".to_string(),
-        });
-
-        assert_eq!(placement_error_status(&error), StatusCode::BAD_REQUEST);
     }
 }

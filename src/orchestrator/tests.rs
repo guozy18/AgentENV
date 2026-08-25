@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
@@ -72,10 +72,6 @@ async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<Test
     .expect("in-memory orchestrator should not fail to construct")
 }
 
-fn has_sandbox_gate(orchestrator: &TestOrchestrator, sandbox_id: &SandboxId) -> bool {
-    orchestrator.sandbox_gates.contains_key(sandbox_id)
-}
-
 fn make_orchestrator_without_background<S: MetadataStore + 'static>(
     store: S,
 ) -> Arc<TestOrchestrator<S>> {
@@ -112,7 +108,6 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         factory,
         persister,
         sandboxes: RwLock::new(HashMap::new()),
-        sandbox_gates: DashMap::new(),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -771,7 +766,6 @@ type RecordingTestOrchestrator =
 
 async fn paused_recording_sandbox(
     tag: &str,
-    artifacts_are_independent: bool,
 ) -> Result<(
     Arc<RecordingTestOrchestrator>,
     RecordingPersister,
@@ -780,7 +774,6 @@ async fn paused_recording_sandbox(
 )> {
     let persister = RecordingPersister::default();
     let behavior = Arc::new(MockBehavior::new());
-    behavior.set_pause_artifacts_independent(artifacts_are_independent);
     let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(behavior.clone()),
@@ -886,15 +879,6 @@ async fn proxy_target_for_only_returns_running_routes() {
         .await;
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
-        None
-    );
-
-    orchestrator
-        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
-        .await
-        .unwrap();
-    assert_eq!(
-        proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
         Some(target)
     );
 }
@@ -905,10 +889,6 @@ async fn restore_proxy_route_republishes_running_target() {
     let sandbox_id = SandboxId::new();
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 77));
 
-    orchestrator
-        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
-        .await
-        .unwrap();
     orchestrator
         .upsert_proxy_route(sandbox_id, target.clone())
         .await;
@@ -949,9 +929,6 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
 
-    orchestrator
-        .upsert_proxy_route(sandbox_id, ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 43)))
-        .await;
     orchestrator
         .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
         .await
@@ -1036,11 +1013,7 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         .await;
 
     orchestrator
-        .cleanup_failed_launch(
-            &plan,
-            stale_handle,
-            FailedLaunchStage::TransitionalPersisted,
-        )
+        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RunningPersisted)
         .await;
 
     let current_handle = orchestrator
@@ -1417,7 +1390,7 @@ async fn join_concurrent_pause_maps_killing_to_not_found() {
 }
 
 #[tokio::test]
-async fn join_concurrent_resume_rechecks_authoritative_store_after_notification() {
+async fn join_concurrent_resume_maps_unexpected_state() {
     setup();
     let sandbox_id = SandboxId::new();
     let orchestrator = make_orchestrator_without_background(ScriptedWaitStore::with_wait(
@@ -1431,8 +1404,14 @@ async fn join_concurrent_resume_rechecks_authoritative_store_after_notification(
     let err = orchestrator
         .join_concurrent_resume(sandbox_id, NewTimeout::None)
         .await
-        .expect_err("removed metadata should override a stale transition notification");
-    assert!(matches!(err, OrchestratorError::SandboxNotFound(_)));
+        .expect_err("unexpected joined resume state should map to invalid state");
+    assert!(matches!(
+        err,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Creating,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -1566,7 +1545,6 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot
 #[tokio::test]
 async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     setup();
-    let persister = RecordingPersister::default();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Pause,
@@ -1574,11 +1552,8 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
             message: "restack succeeded but snapshot staging failed".to_string(),
         },
     );
-    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(behavior),
-        persister.clone(),
-    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
@@ -1602,13 +1577,6 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::AllocateArtifactRoot,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ]
-    );
     Ok(())
 }
 
@@ -1682,142 +1650,6 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
         .await?
         .expect("metadata should remain after pause");
     assert_eq!(metadata.state, SandboxState::Paused);
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_persistence_failure_cleans_only_independent_artifacts() -> Result<()> {
-    setup();
-    for artifacts_are_independent in [false, true] {
-        let persister = RecordingPersister::default();
-        persister.fail_next(RecordingCall::PersistPaused);
-        let behavior = Arc::new(MockBehavior::new());
-        behavior.set_pause_artifacts_independent(artifacts_are_independent);
-        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::with_behavior(behavior),
-            persister.clone(),
-        );
-        let created = orchestrator
-            .create_sandbox(create_request(Some(60), &[("team", "pause-persist-fail")]))
-            .await?;
-
-        let err = orchestrator
-            .pause_sandbox(created.id)
-            .await
-            .expect_err("pause should fail when persisted paused state cannot be written");
-
-        assert!(matches!(err, OrchestratorError::InternalError(_)));
-        let mut expected_calls = vec![
-            RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused,
-            RecordingCall::DeleteRecord,
-        ];
-        if artifacts_are_independent {
-            expected_calls.push(RecordingCall::DeleteRecordAndArtifacts);
-        }
-        assert_eq!(persister.calls(), expected_calls);
-        let metadata = orchestrator
-            .get_sandbox(&created.id)
-            .await?
-            .expect("metadata should remain after pause persistence failure");
-        assert_eq!(metadata.state, SandboxState::Running);
-        assert!(metadata.paused_state.is_none());
-        assert_proxy_ready(&orchestrator, &created.id).await?;
-        assert_metrics_values(
-            &orchestrator,
-            1,
-            0,
-            1,
-            0,
-            created.resources.cpu_count,
-            created.resources.memory_mib,
-        )
-        .await;
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_persistence_failure_does_not_restore_running_without_a_durable_fence() -> Result<()>
-{
-    setup();
-    let persister = RecordingPersister::default();
-    persister.fail_next(RecordingCall::PersistPaused);
-    persister.fail_next(RecordingCall::DeleteRecord);
-    persister.fail_next(RecordingCall::MarkResuming);
-    let mut orchestrator = make_orchestrator_without_background_with_factory_and_persister(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
-        persister.clone(),
-    );
-    let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
-    Arc::get_mut(&mut orchestrator)
-        .expect("orchestrator should be uniquely owned")
-        .image_refs = image_refs.clone();
-    let sandbox_id = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "pause-fence-fail")]))
-        .await?
-        .id;
-
-    orchestrator
-        .pause_sandbox(sandbox_id)
-        .await
-        .expect_err("pause must fail closed when an ambiguous durable record cannot be fenced");
-
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert!(!image_refs
-        .unpinned()
-        .contains(&RuntimeImageOwner::PausedSandbox(sandbox_id)));
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused,
-            RecordingCall::DeleteRecord,
-            RecordingCall::MarkResuming,
-        ]
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_persistence_and_resume_failure_cleans_artifacts() -> Result<()> {
-    setup();
-    let persister = RecordingPersister::default();
-    persister.fail_next(RecordingCall::PersistPaused);
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Resume,
-        MockAction::Fail {
-            message: "forced resume failure".to_string(),
-        },
-    );
-    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(behavior),
-        persister.clone(),
-    );
-    let sandbox_id = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "pause-cleanup")]))
-        .await?
-        .id;
-
-    orchestrator
-        .pause_sandbox(sandbox_id)
-        .await
-        .expect_err("failed persistence and recovery should fail the pause");
-
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ]
-    );
     Ok(())
 }
 
@@ -1967,34 +1799,6 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
 }
 
 #[tokio::test]
-async fn snapshot_capture_waits_for_in_flight_data_plane_request() -> Result<()> {
-    setup();
-    let orchestrator = make_orchestrator().await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "snapshot-gate")]))
-        .await?;
-    let sandbox_id = created.id;
-
-    let request_guard = orchestrator.acquire_proxy_read(&sandbox_id).await?;
-    let capture_orchestrator = Arc::clone(&orchestrator);
-    let capture =
-        tokio::spawn(async move { capture_orchestrator.capture_snapshot(sandbox_id).await });
-    tokio::task::yield_now().await;
-    assert!(
-        !capture.is_finished(),
-        "snapshot capture must wait while a data-plane request holds its read guard"
-    );
-
-    drop(request_guard);
-    let capture_result = capture.await.expect("snapshot capture task should join");
-    capture_result?;
-    assert!(has_sandbox_gate(&orchestrator, &sandbox_id));
-    orchestrator.delete_sandbox(sandbox_id).await?;
-    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
-    Ok(())
-}
-
-#[tokio::test]
 async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_retry() -> Result<()>
 {
     setup();
@@ -2088,7 +1892,6 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    assert!(!has_sandbox_gate(&orchestrator, &sandbox_id));
     Ok(())
 }
 
@@ -3053,7 +2856,6 @@ async fn orchestrator_delete_paused_sandbox_removes_metadata() -> Result<()> {
         vec![
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
-            RecordingCall::DeleteRecord,
             RecordingCall::DeleteRecordAndArtifacts
         ]
     );
@@ -3137,88 +2939,6 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
         1,
         "recoverable pause failure should resume the backend before returning"
     );
-
-    orchestrator.delete_sandbox(sandbox_id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_drains_in_flight_proxy_and_releases_gate_after_recoverable_failure() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let pause_started = Arc::new(Notify::new());
-    let pause_started_for_hook = Arc::clone(&pause_started);
-    behavior.set_on_operation(
-        MockOperation::Pause,
-        Arc::new(move || pause_started_for_hook.notify_one()),
-    );
-    behavior.push_action(
-        MockOperation::Pause,
-        MockAction::Fail {
-            message: "forced pause failure after proxy drain".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "pause-proxy-drain")]))
-        .await?;
-    let sandbox_id = created.id;
-
-    let request_guard = orchestrator.acquire_proxy_read(&sandbox_id).await?;
-    let pause_orchestrator = Arc::clone(&orchestrator);
-    let pause = tokio::spawn(async move { pause_orchestrator.pause_sandbox(sandbox_id).await });
-
-    let transitional_state = timeout(Duration::from_secs(1), async {
-        loop {
-            let state = orchestrator
-                .get_sandbox(&sandbox_id)
-                .await?
-                .expect("sandbox should exist while pause waits for proxy drain")
-                .state;
-            if state != SandboxState::Running {
-                return Ok::<_, OrchestratorError>(state);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("pause should transition out of Running while waiting for the proxy guard")?;
-    assert_eq!(transitional_state, SandboxState::Pausing);
-    assert!(
-        timeout(Duration::from_millis(50), pause_started.notified())
-            .await
-            .is_err(),
-        "backend pause must not start while an in-flight proxy request holds the read guard"
-    );
-
-    drop(request_guard);
-    let err = timeout(Duration::from_secs(1), pause)
-        .await
-        .expect("pause should finish after the proxy guard is released")
-        .expect("pause task should not panic")
-        .expect_err("configured backend pause failure should reach the caller");
-    assert!(matches!(
-        err,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::Pause,
-            ..
-        }
-    ));
-
-    let metadata = orchestrator
-        .get_sandbox(&sandbox_id)
-        .await?
-        .expect("recoverable pause failure should keep sandbox metadata");
-    assert_eq!(metadata.state, SandboxState::Running);
-    let proxy_guard = timeout(
-        Duration::from_secs(1),
-        orchestrator.acquire_proxy_read(&sandbox_id),
-    )
-    .await
-    .expect("recoverable pause failure must release the lifecycle write guard")?;
-    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
-    drop(proxy_guard);
 
     orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
@@ -3571,7 +3291,7 @@ async fn resume_sandbox_wait_ready_failure_from_launch_rolls_back_to_paused_and_
 async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> {
     setup();
     let (orchestrator, persister, _, sandbox_id) =
-        paused_recording_sandbox("resume-persist", false).await?;
+        paused_recording_sandbox("resume-persist").await?;
 
     orchestrator
         .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
@@ -3604,151 +3324,10 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
 }
 
 #[tokio::test]
-async fn resume_consumes_old_generation_before_immediate_pause_allocates_new_one() -> Result<()> {
-    setup();
-    let (orchestrator, persister, _, sandbox_id) =
-        paused_recording_sandbox("resume-pause-race", true).await?;
-
-    let (old_cleanup_started, release_old_cleanup) =
-        persister.block_next(RecordingCall::DeleteRecordAndArtifacts);
-    let resume_orchestrator = Arc::clone(&orchestrator);
-    let resume = tokio::spawn(async move {
-        resume_orchestrator
-            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-            .await
-    });
-    timeout(Duration::from_secs(1), old_cleanup_started.notified())
-        .await
-        .expect("resume should reach old-generation cleanup");
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("resumed sandbox metadata should be visible")
-            .state,
-        SandboxState::Running
-    );
-
-    let pause_orchestrator = Arc::clone(&orchestrator);
-    let mut pause = tokio::spawn(async move { pause_orchestrator.pause_sandbox(sandbox_id).await });
-    wait_for_state(&orchestrator, &sandbox_id, SandboxState::Pausing).await?;
-    assert!(
-        timeout(Duration::from_millis(50), &mut pause)
-            .await
-            .is_err(),
-        "new pause must wait for old resume cleanup"
-    );
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::MarkResuming,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ],
-        "new pause must not allocate artifacts before old resume cleanup finishes"
-    );
-
-    release_old_cleanup.notify_one();
-    resume
-        .await
-        .expect("resume task should not panic")
-        .expect("resume should succeed");
-    pause
-        .await
-        .expect("pause task should not panic")
-        .expect("pause should succeed after old cleanup");
-
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::MarkResuming,
-            RecordingCall::DeleteRecordAndArtifacts,
-            RecordingCall::AllocateArtifactRoot,
-            RecordingCall::PersistPaused,
-        ]
-    );
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("sandbox should remain after immediate pause")
-            .state,
-        SandboxState::Paused
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn delete_waits_for_resume_finalization_and_preserves_event_order() -> Result<()> {
-    setup();
-    let (orchestrator, persister, _, sandbox_id) =
-        paused_recording_sandbox("resume-delete-order", true).await?;
-    let mut events = orchestrator.sandbox_event_tx.subscribe();
-    let (cleanup_started, release_cleanup) =
-        persister.block_next(RecordingCall::DeleteRecordAndArtifacts);
-
-    let resume_orchestrator = Arc::clone(&orchestrator);
-    let resume = tokio::spawn(async move {
-        resume_orchestrator
-            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-            .await
-    });
-    timeout(Duration::from_secs(1), cleanup_started.notified())
-        .await
-        .expect("resume should reach final cleanup");
-
-    let delete_orchestrator = Arc::clone(&orchestrator);
-    let mut delete =
-        tokio::spawn(async move { delete_orchestrator.delete_sandbox(sandbox_id).await });
-    wait_for_state(&orchestrator, &sandbox_id, SandboxState::Killing).await?;
-    assert!(
-        timeout(Duration::from_millis(50), &mut delete)
-            .await
-            .is_err(),
-        "delete must wait for resume finalization"
-    );
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::MarkResuming,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ]
-    );
-
-    release_cleanup.notify_one();
-    resume
-        .await
-        .expect("resume task should not panic")
-        .expect("resume should finish before delete");
-    delete
-        .await
-        .expect("delete task should not panic")
-        .expect("delete should succeed after resume finalization");
-    assert_eq!(
-        events.recv().await.expect("Resume event").event_type,
-        SandboxLifecycleEventType::Resume
-    );
-    assert_eq!(
-        events.recv().await.expect("Delete event").event_type,
-        SandboxLifecycleEventType::Delete
-    );
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::MarkResuming,
-            RecordingCall::DeleteRecordAndArtifacts,
-            RecordingCall::DeleteRecord,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ]
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
     setup();
     let (orchestrator, persister, _, sandbox_id) =
-        paused_recording_sandbox("resume-mark-fail", false).await?;
+        paused_recording_sandbox("resume-mark-fail").await?;
     persister.fail_next(RecordingCall::MarkResuming);
 
     let err = orchestrator
@@ -3773,87 +3352,10 @@ async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
 }
 
 #[tokio::test]
-async fn failed_resume_rolls_back_durable_state_before_publishing_paused() -> Result<()> {
-    setup();
-    let (orchestrator, persister, behavior, sandbox_id) =
-        paused_recording_sandbox("resume-rollback-order", false).await?;
-    behavior.push_action(
-        MockOperation::WaitForReady,
-        MockAction::Fail {
-            message: "forced resume rollback ordering failure".to_string(),
-        },
-    );
-    let (rollback_started, release_rollback) =
-        persister.block_next(RecordingCall::RollbackResuming);
-
-    let first_orchestrator = Arc::clone(&orchestrator);
-    let first = tokio::spawn(async move {
-        first_orchestrator
-            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-            .await
-    });
-    timeout(Duration::from_secs(1), rollback_started.notified())
-        .await
-        .expect("failed resume should reach durable rollback");
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("sandbox metadata should remain during rollback")
-            .state,
-        SandboxState::Resuming
-    );
-
-    let retry_orchestrator = Arc::clone(&orchestrator);
-    let mut retry = tokio::spawn(async move {
-        retry_orchestrator
-            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-            .await
-    });
-    assert!(
-        timeout(Duration::from_millis(50), &mut retry)
-            .await
-            .is_err(),
-        "retry must not pass the failed leader's durable rollback"
-    );
-    assert_eq!(
-        persister.calls(),
-        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
-    );
-
-    release_rollback.notify_one();
-    first
-        .await
-        .expect("first resume task should not panic")
-        .expect_err("first resume should retain its launch failure");
-    let retry_error = retry
-        .await
-        .expect("retry task should not panic")
-        .expect_err("a concurrent retry joins the failed generation");
-    assert!(matches!(
-        retry_error,
-        OrchestratorError::InvalidSandboxState {
-            state: SandboxState::Paused,
-            ..
-        }
-    ));
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("failed resume should be retryable after rollback")
-            .state,
-        SandboxState::Paused
-    );
-    assert_proxy_paused(&orchestrator, &sandbox_id).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn failed_resume_stays_resuming_when_durable_rollback_fails() -> Result<()> {
     setup();
     let (orchestrator, persister, behavior, sandbox_id) =
-        paused_recording_sandbox("resume-rollback-fail", false).await?;
+        paused_recording_sandbox("resume-rollback-fail").await?;
     persister.fail_next(RecordingCall::RollbackResuming);
     behavior.push_action(
         MockOperation::WaitForReady,
@@ -3929,60 +3431,6 @@ async fn delete_stop_failure_does_not_restore_a_potentially_destroyed_runtime() 
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn delete_requires_a_durable_record_fence_before_success() -> Result<()> {
-    setup();
-    let persister = RecordingPersister::default();
-    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
-        persister.clone(),
-    );
-    let sandbox_id = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "delete-fence")]))
-        .await?
-        .id;
-    orchestrator.pause_sandbox(sandbox_id).await?;
-    persister.clear_calls();
-    persister.fail_next(RecordingCall::DeleteRecord);
-    let mut events = orchestrator.sandbox_event_tx.subscribe();
-
-    orchestrator
-        .delete_sandbox(sandbox_id)
-        .await
-        .expect_err("delete must fail while its durable record remains loadable");
-    assert_eq!(persister.calls(), vec![RecordingCall::DeleteRecord]);
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("failed delete should retain metadata")
-            .state,
-        SandboxState::Paused
-    );
-    assert_proxy_paused(&orchestrator, &sandbox_id).await?;
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-
-    orchestrator.delete_sandbox(sandbox_id).await?;
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_eq!(
-        persister.calls(),
-        vec![
-            RecordingCall::DeleteRecord,
-            RecordingCall::DeleteRecord,
-            RecordingCall::DeleteRecordAndArtifacts,
-        ]
-    );
-    assert_eq!(
-        events.recv().await.expect("Delete event").event_type,
-        SandboxLifecycleEventType::Delete
-    );
     Ok(())
 }
 

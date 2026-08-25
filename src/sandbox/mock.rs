@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{sync::Mutex, thread};
@@ -26,9 +26,7 @@ use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 
 #[derive(Debug, Default)]
-pub struct MockSnapshot {
-    artifacts_are_independent: bool,
-}
+pub struct MockSnapshot;
 
 impl PausedSandboxState for MockSnapshot {
     fn encode(&self) -> Result<serde_json::Value> {
@@ -37,10 +35,6 @@ impl PausedSandboxState for MockSnapshot {
 
     fn runtime_artifacts(&self) -> RuntimeArtifactSet {
         RuntimeArtifactSet::empty()
-    }
-
-    fn artifacts_are_independent_after_resume(&self) -> bool {
-        self.artifacts_are_independent
     }
 }
 
@@ -78,7 +72,6 @@ pub struct MockBehavior {
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
-    pause_artifacts_independent: AtomicBool,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
@@ -126,15 +119,6 @@ impl MockBehavior {
             .lock()
             .expect("source_config_paths mutex poisoned")
             .clone()
-    }
-
-    pub fn set_pause_artifacts_independent(&self, independent: bool) {
-        self.pause_artifacts_independent
-            .store(independent, Ordering::Relaxed);
-    }
-
-    fn pause_artifacts_independent(&self) -> bool {
-        self.pause_artifacts_independent.load(Ordering::Relaxed)
     }
 
     pub fn stop_calls(&self) -> usize {
@@ -308,9 +292,7 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        Ok(Arc::new(MockSnapshot {
-            artifacts_are_independent: self.behavior.pause_artifacts_independent(),
-        }))
+        Ok(Arc::new(MockSnapshot))
     }
 
     async fn resume(&mut self) -> Result<()> {

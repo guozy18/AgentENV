@@ -13,10 +13,7 @@ use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::{CacheHandle, LocalArtifactCache};
 use crate::snapshot::p2p;
-use crate::snapshot::repository::{
-    validate_attached_drive_virtual_size, validate_legacy_artifact_namespace,
-    SnapshotRuntimeResolver,
-};
+use crate::snapshot::repository::{validate_attached_drive_virtual_size, SnapshotRuntimeResolver};
 use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, materialize_image_config_error, parse_firecracker_manifest,
     runtime_image_cache_key, RuntimeImageMaterializer,
@@ -28,21 +25,6 @@ use crate::snapshot::{
 };
 
 const MANAGED_LAYER_EXISTS_CONCURRENCY: usize = 16;
-
-fn use_fixed_p2p(legacy_namespace: Option<&str>) -> bool {
-    legacy_namespace.is_none()
-}
-
-fn runtime_cache_key(
-    snapshot_id: &SnapshotId,
-    legacy_namespace: Option<&str>,
-    relative: &str,
-) -> String {
-    match legacy_namespace {
-        Some(namespace) => format!("runtime/{snapshot_id}/{namespace}/{relative}"),
-        None => runtime_image_cache_key(snapshot_id, relative),
-    }
-}
 
 struct MaterializeSpec<'a> {
     label: &'a str,
@@ -119,25 +101,14 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is not ready", snapshot.id),
                 })?;
-        let legacy_namespace = committed.legacy_artifact_namespace.as_deref();
-        validate_legacy_artifact_namespace(legacy_namespace)?;
-        let layout = match legacy_namespace {
-            Some(namespace) => OssSnapshotArtifactLayout::new(&id).with_legacy_namespace(namespace),
-            None => OssSnapshotArtifactLayout::new(&id),
-        };
-        let runtime_dir = match legacy_namespace {
-            Some(namespace) => self
-                .image_materializer
-                .snapshot_dir_with_legacy_namespace(&id, namespace),
-            None => self.image_materializer.snapshot_dir(&id),
-        };
+        let layout = OssSnapshotArtifactLayout::new(&id);
+        let runtime_dir = self.image_materializer.snapshot_dir(&id);
         let mut handles: Vec<CacheHandle> = Vec::new();
 
         // ── vm state snapshot ───────────────────────────────────────
         let vm_state_key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let vm_state_client = Arc::clone(&self.client);
         let p2p_transport = self.p2p_transport.clone();
-        let use_fixed_p2p = use_fixed_p2p(legacy_namespace);
         let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let vm_state_handle = self
             .cache
@@ -147,17 +118,15 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 let p2p_transport = p2p_transport.clone();
                 let p2p_key = vm_state_p2p_key.clone();
                 async move {
-                    if use_fixed_p2p {
-                        if let Some(transport) = p2p_transport.as_ref() {
-                            match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
-                                Ok(size) => return Ok(size),
-                                Err(error) => {
-                                    debug!(
-                                        key = %p2p_key,
-                                        error = %error,
-                                        "P2P vm_state fetch failed; using backend fallback"
-                                    );
-                                }
+                    if let Some(transport) = p2p_transport.as_ref() {
+                        match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
+                            Ok(size) => return Ok(size),
+                            Err(error) => {
+                                debug!(
+                                    key = %p2p_key,
+                                    error = %error,
+                                    "P2P vm_state fetch failed; using backend fallback"
+                                );
                             }
                         }
                     }
@@ -173,7 +142,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 
         // ── firecracker manifest ───────────────────────────────────
         let committed_manifest = self
-            .load_committed_firecracker_manifest(&layout, &id, use_fixed_p2p)
+            .load_committed_firecracker_manifest(&layout, &id)
             .await?;
 
         // ── memory image config ────────────────────────────────────
@@ -182,7 +151,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             .iter()
             .map(|m| OverlaybdLayerRef::Managed(m.clone()))
             .collect();
-        let mem_cache_key = runtime_cache_key(&id, legacy_namespace, "memory/image.json");
+        let mem_cache_key = runtime_image_cache_key(&id, "memory/image.json");
         let mem_image_config_path = self
             .materialize_layers_and_pin(
                 &memory_layers,
@@ -199,7 +168,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             .await?;
 
         // ── rootfs image config ────────────────────────────────────
-        let rootfs_cache_key = runtime_cache_key(&id, legacy_namespace, "rootfs/image.json");
+        let rootfs_cache_key = runtime_image_cache_key(&id, "rootfs/image.json");
         let rootfs_image_config_path = self
             .materialize_layers_and_pin(
                 &committed.rootfs_layers,
@@ -217,13 +186,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 
         // ── attached drives ────────────────────────────────────────
         let attached_drives = self
-            .resolve_attached_drives(
-                &id,
-                &runtime_dir,
-                legacy_namespace,
-                &committed.attached_drives,
-                &mut handles,
-            )
+            .resolve_attached_drives(&id, &runtime_dir, &committed.attached_drives, &mut handles)
             .await?;
 
         // Runtime artifacts are protected by the sandbox start-window lease (over
@@ -335,7 +298,6 @@ impl OssRuntimeResolver {
         &self,
         id: &SnapshotId,
         runtime_dir: &Path,
-        legacy_namespace: Option<&str>,
         committed_drives: &[CommittedAttachedDrive],
         handles: &mut Vec<CacheHandle>,
     ) -> RepositoryResult<Vec<ResolvedAttachedDrive>> {
@@ -361,9 +323,8 @@ impl OssRuntimeResolver {
                                 .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
                             MaterializeSpec {
                                 label: &format!("drive '{drive_id}'"),
-                                cache_key: &runtime_cache_key(
+                                cache_key: &runtime_image_cache_key(
                                     id,
-                                    legacy_namespace,
                                     &format!("drives/{drive_id}/image.json"),
                                 ),
                                 allow_empty_layers: false,
@@ -394,30 +355,27 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
-        use_fixed_p2p: bool,
     ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        if use_fixed_p2p {
-            if let Some(transport) = self.p2p_transport.as_ref() {
-                match p2p::fetch_artifact_bytes(transport, &p2p_key).await {
-                    Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
-                        Ok(manifest) => return Ok(manifest),
-                        Err(error) => {
-                            debug!(
-                                key = %p2p_key,
-                                error = %error,
-                                "P2P firecracker manifest parse failed; using backend fallback"
-                            );
-                        }
-                    },
+        if let Some(transport) = self.p2p_transport.as_ref() {
+            match p2p::fetch_artifact_bytes(transport, &p2p_key).await {
+                Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
+                    Ok(manifest) => return Ok(manifest),
                     Err(error) => {
                         debug!(
                             key = %p2p_key,
                             error = %error,
-                            "P2P firecracker manifest fetch failed; using backend fallback"
+                            "P2P firecracker manifest parse failed; using backend fallback"
                         );
                     }
+                },
+                Err(error) => {
+                    debug!(
+                        key = %p2p_key,
+                        error = %error,
+                        "P2P firecracker manifest fetch failed; using backend fallback"
+                    );
                 }
             }
         }
@@ -452,34 +410,6 @@ mod tests {
 
     fn digest(index: usize) -> String {
         format!("sha256:{index:064x}")
-    }
-
-    #[test]
-    fn only_legacy_namespaced_closures_skip_fixed_p2p_keys() {
-        assert!(!use_fixed_p2p(Some("attempt-01")));
-        assert!(use_fixed_p2p(None));
-    }
-
-    #[test]
-    fn legacy_namespaced_artifact_keys_are_distinct_from_fixed_layout() {
-        let snapshot_id = SnapshotId::generate();
-        let legacy = OssSnapshotArtifactLayout::new(&snapshot_id)
-            .artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        let namespaced = OssSnapshotArtifactLayout::new(&snapshot_id)
-            .with_legacy_namespace("attempt-01")
-            .artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-
-        assert_ne!(legacy, namespaced);
-        assert!(legacy.starts_with(&format!("artifacts/{snapshot_id}/")));
-        assert!(namespaced.starts_with(&format!("artifacts/{snapshot_id}/attempt-01/")));
-        assert_eq!(
-            runtime_cache_key(&snapshot_id, None, "rootfs/image.json"),
-            format!("runtime/{snapshot_id}/rootfs/image.json")
-        );
-        assert_eq!(
-            runtime_cache_key(&snapshot_id, Some("attempt-01"), "rootfs/image.json"),
-            format!("runtime/{snapshot_id}/attempt-01/rootfs/image.json")
-        );
     }
 
     #[tokio::test]

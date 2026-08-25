@@ -10,7 +10,6 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
-    SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -198,15 +197,16 @@ impl UblkDaemonClient {
             cmd.arg("--p2p-publish-url").arg(url);
         }
 
-        // pool_config is fully resolved; app_config may be a partial TOML.
         if let Some(pool_config) = config.pool_config {
-            cmd.arg("--enable-pool")
-                .arg("--pool-low-watermark")
-                .arg(pool_config.low_watermark.to_string())
-                .arg("--pool-high-watermark")
-                .arg(pool_config.high_watermark.to_string())
-                .arg("--pool-startup-prewarm")
-                .arg(pool_config.startup_prewarm.to_string());
+            if config.app_config.is_none() {
+                cmd.arg("--enable-pool")
+                    .arg("--pool-low-watermark")
+                    .arg(pool_config.low_watermark.to_string())
+                    .arg("--pool-high-watermark")
+                    .arg(pool_config.high_watermark.to_string())
+                    .arg("--pool-startup-prewarm")
+                    .arg(pool_config.startup_prewarm.to_string());
+            }
         }
 
         let mut child = cmd
@@ -386,12 +386,10 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Create an OverlayBD runtime while choosing whether source-owned
-    /// lowers and a writable upper are reused or cloned.
+    /// Create an OverlayBD runtime config and acquire a ublk device for it.
     pub async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
-        source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let request = DaemonRequest::CreateOverlaybdRuntimeDevice {
             source_image_config: request.source_image_config.to_path_buf(),
@@ -402,7 +400,6 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
-            source_state_strategy,
         };
         match self
             .call(request, self.inner.runtime_device_timeout)

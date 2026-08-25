@@ -195,7 +195,7 @@ components:
         - distributed
       description: >-
         Storage availability of a reusable snapshot. Local snapshots are
-        available only on the publishing node; distributed snapshots are
+        available only on the publishing Pod; distributed snapshots are
         published to the primary repository.
 
     SnapshotInfo:

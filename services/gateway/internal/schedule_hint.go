@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 
 	schedulerv1 "agentenv/services/api/proto"
 )
@@ -22,7 +21,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, strin
 	}
 	switch strings.TrimRight(r.URL.Path, "/") {
 	case "/sandboxes-cold":
-		body, _, err := captureRequestBody(r)
+		body, err := captureRequestBody(r)
 		if err != nil {
 			return nil, "", err
 		}
@@ -38,9 +37,6 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, strin
 		}
 		hint, snapshotRef, err := parseNewSandboxHint(body)
 		if err != nil {
-			if buffered, ok := r.Body.(*bufferedBody); ok {
-				_ = buffered.Close()
-			}
 			return nil, "", err
 		}
 		return &schedulerv1.ScheduleRequestHint{
@@ -61,63 +57,57 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, strin
 // arbitrarily large body.
 const maxHintBodyBytes = 64 * 1024
 
-// Large NewSandbox bodies must be retained until placement completes so the
-// proxy can replay their original bytes. Bound both each retained body and the number
-// held concurrently: this is a JSON control-plane request, not a file-upload
-// endpoint, and it is inspected before upstream authentication. The per-body
-// limit matches Axum's downstream Json extractor default, so the gateway does
-// not reject any request that the node would otherwise accept.
-const (
-	maxNewSandboxBodyBytes          = 2 * 1024 * 1024
-	maxConcurrentSandboxBodyBuffers = 4
-)
+// Match Axum's downstream JSON extractor limit so the gateway can inspect a
+// NewSandbox request without rejecting a body the node would accept.
+const maxNewSandboxBodyBytes = 2 * 1024 * 1024
 
-var (
-	errNewSandboxBodyTooLarge = fmt.Errorf("sandbox request body exceeds %d bytes", maxNewSandboxBodyBytes)
-	errSandboxBodyBufferBusy  = errors.New("gateway sandbox request body buffer capacity is exhausted")
-	sandboxBodyBufferSlots    = make(chan struct{}, maxConcurrentSandboxBodyBuffers)
-)
+var errNewSandboxBodyTooLarge = fmt.Errorf("sandbox request body exceeds %d bytes", maxNewSandboxBodyBytes)
 
 func captureNewSandboxBody(r *http.Request) ([]byte, error) {
 	if r.ContentLength > maxNewSandboxBodyBytes {
 		return nil, errNewSandboxBodyTooLarge
 	}
-	body, oversized, err := captureRequestBody(r)
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+	orig := r.Body
+	body, err := io.ReadAll(io.LimitReader(orig, maxNewSandboxBodyBytes+1))
+	_ = orig.Close()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read sandbox request body: %w", err)
 	}
-	if !oversized {
-		return body, nil
+	if len(body) > maxNewSandboxBodyBytes {
+		return nil, errNewSandboxBodyTooLarge
 	}
-	return bufferOversizedSandboxBody(r)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	return body, nil
 }
 
 // captureRequestBody buffers up to maxHintBodyBytes of the request body so a
 // scheduling hint can be extracted, then restores r.Body so the full body
 // remains available for the upstream request. If the body exceeds the budget,
 // the buffered prefix is stitched back in front of the unread remainder (no
-// full buffering) and oversized is returned so callers can choose a bounded
-// streaming/spooling path.
-func captureRequestBody(r *http.Request) ([]byte, bool, error) {
+// full buffering) and a nil body is returned so hint extraction is skipped.
+func captureRequestBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return nil, false, nil
+		return nil, nil
 	}
 	orig := r.Body
 	buf, err := io.ReadAll(io.LimitReader(orig, maxHintBodyBytes+1))
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if int64(len(buf)) > maxHintBodyBytes {
-		// Too large for the in-memory inspection budget: restore the full
-		// stream without buffering the remainder and let the caller choose a
-		// bounded buffering path.
+		// Too large to inspect: restore the full stream without buffering the
+		// remainder and skip hint extraction.
 		r.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(buf), orig), closer: orig}
-		return nil, true, nil
+		return nil, nil
 	}
 	_ = orig.Close()
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))
-	return buf, false, nil
+	return buf, nil
 }
 
 // prefixedBody re-presents an already-partially-read body as a single
@@ -129,51 +119,6 @@ type prefixedBody struct {
 }
 
 func (b *prefixedBody) Close() error { return b.closer.Close() }
-
-// bufferedBody replays an oversized request body after its bounded inspection.
-// The slot stays held until the proxy closes the body, which bounds retained
-// memory even when placement or the upstream request is slow.
-type bufferedBody struct {
-	*bytes.Reader
-	release   func()
-	closeOnce sync.Once
-}
-
-func (b *bufferedBody) Close() error {
-	b.closeOnce.Do(func() {
-		if b.release != nil {
-			b.release()
-			b.release = nil
-		}
-	})
-	return nil
-}
-
-func bufferOversizedSandboxBody(r *http.Request) ([]byte, error) {
-	if err := r.Context().Err(); err != nil {
-		return nil, err
-	}
-	select {
-	case sandboxBodyBufferSlots <- struct{}{}:
-	default:
-		return nil, errSandboxBodyBufferBusy
-	}
-	release := func() { <-sandboxBodyBufferSlots }
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxNewSandboxBodyBytes+1))
-	if err != nil {
-		_ = r.Body.Close()
-		release()
-		return nil, fmt.Errorf("buffer sandbox request body: %w", err)
-	}
-	_ = r.Body.Close()
-	if len(body) > maxNewSandboxBodyBytes {
-		release()
-		return nil, errNewSandboxBodyTooLarge
-	}
-	r.Body = &bufferedBody{Reader: bytes.NewReader(body), release: release}
-	r.ContentLength = int64(len(body))
-	return body, nil
-}
 
 // newColdSandboxBody mirrors the subset of NewColdSandbox
 // (src/api/openapi.yml) that is relevant for scheduling.

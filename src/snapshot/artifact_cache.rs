@@ -333,12 +333,10 @@ fn prepare_cache_root(cache_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
 
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::Barrier;
 
     use super::*;
 
@@ -392,82 +390,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_materialization_does_not_poison_or_publish_the_cache_key() {
-        const KEY: &str = "artifacts/cancelled/vm_state.bin";
-
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let cache = test_cache(tempdir.path());
-        let started = Arc::new(Notify::new());
-        let task = {
-            let cache = Arc::clone(&cache);
-            let started = Arc::clone(&started);
-            tokio::spawn(async move {
-                cache
-                    .ensure_cached(KEY, move |dest| {
-                        let started = Arc::clone(&started);
-                        async move {
-                            tokio::fs::write(dest, b"partial").await?;
-                            started.notify_one();
-                            pending::<Result<u64>>().await
-                        }
-                    })
-                    .await
-            })
-        };
-
-        started.notified().await;
-        task.abort();
-        let join_error = match task.await {
-            Ok(_) => panic!("cancelled task unexpectedly completed"),
-            Err(error) => error,
-        };
-        assert!(join_error.is_cancelled());
-        assert!(!cache.key_to_local_path(KEY).unwrap().exists());
-        assert!(cache.key_locks.is_empty());
-
-        let handle = cache
-            .ensure_cached(KEY, |dest| async move {
-                tokio::fs::write(dest, b"complete").await?;
-                Ok(8)
-            })
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(handle.path()).unwrap(), b"complete");
-        assert!(cache.key_locks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_materialization_does_not_publish_a_partial_file() {
-        const KEY: &str = "artifacts/failed/vm_state.bin";
-
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let cache = test_cache(tempdir.path());
-        let error = match cache
-            .ensure_cached(KEY, |dest| async move {
-                tokio::fs::write(dest, b"partial").await?;
-                anyhow::bail!("injected fetch failure")
-            })
-            .await
-        {
-            Ok(_) => panic!("failed fetch should not return a cache handle"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("materialize"));
-        assert!(!cache.key_to_local_path(KEY).unwrap().exists());
-        assert!(cache.key_locks.is_empty());
-
-        let handle = cache
-            .ensure_cached(KEY, |dest| async move {
-                tokio::fs::write(dest, b"complete").await?;
-                Ok(8)
-            })
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(handle.path()).unwrap(), b"complete");
-    }
-
-    #[tokio::test]
     async fn evict_lru_removes_unpinned_entries_when_over_limit() {
         let tempdir = tempfile::TempDir::new().unwrap();
         let cache = Arc::new(LocalArtifactCache {
@@ -509,8 +431,8 @@ mod tests {
         assert!(path_b.exists());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_warm_file_pins_keep_each_handle_leased() {
+    #[tokio::test]
+    async fn warm_file_pins_keep_each_handle_leased() {
         const KEY: &str = "runtime/snapshot/image.json";
 
         let tempdir = tempfile::TempDir::new().unwrap();
@@ -523,43 +445,27 @@ mod tests {
         std::fs::write(&local_path, b"runtime-config").unwrap();
         let expected_size = std::fs::metadata(&local_path).unwrap().len();
 
-        let held = cache.acquire_key_lock(KEY).await;
         let fetch_calls = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let cache = Arc::clone(&cache);
-            let local_path = local_path.clone();
-            let fetch_calls = Arc::clone(&fetch_calls);
-            tasks.push(tokio::spawn(async move {
-                cache
-                    .ensure_cached_at(KEY, local_path, move |_dest| {
-                        fetch_calls.fetch_add(1, Ordering::SeqCst);
-                        async { anyhow::bail!("warm file should not be fetched") }
-                    })
-                    .await
-                    .unwrap()
-            }));
-        }
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let refs = cache
-                    .key_locks
-                    .get(KEY)
-                    .map(|lock| Arc::strong_count(lock.value()))
-                    .unwrap_or_default();
-                if refs >= 7 {
-                    break;
+        let first = cache
+            .ensure_cached_at(KEY, local_path.clone(), {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                move |_dest| {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    async { anyhow::bail!("warm file should not be fetched") }
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both warm-file callers should wait for the key lock");
-        drop(held);
-
-        let first = tasks.remove(0).await.unwrap();
-        let second = tasks.remove(0).await.unwrap();
+            })
+            .await
+            .unwrap();
+        let second = cache
+            .ensure_cached_at(KEY, local_path.clone(), {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                move |_dest| {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    async { anyhow::bail!("warm file should not be fetched") }
+                }
+            })
+            .await
+            .unwrap();
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
 
         {

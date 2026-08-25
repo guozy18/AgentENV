@@ -45,15 +45,7 @@ spec:
             - name: AENV_NODE_ID
               valueFrom:
                 fieldRef:
-                  # Local snapshot bytes live on the hostPath-backed workspace;
-                  # bind their owner identity to the host, not to an ephemeral
-                  # Pod name that changes during replacement.
-                  fieldPath: spec.nodeName
-            - name: AENV_SERVICE_INSTANCE_ID
-              valueFrom:
-                fieldRef:
-                  # The Pod UID fences heartbeats from a replaced process.
-                  fieldPath: metadata.uid
+                  fieldPath: metadata.name
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT

@@ -14,8 +14,7 @@ pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
     OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
-    SnapshotAlias, SnapshotId, SnapshotLifecycle, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotType,
-    StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotType, StartupCommand,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };

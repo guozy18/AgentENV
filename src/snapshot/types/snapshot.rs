@@ -23,11 +23,10 @@ pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
     /// Storage availability requested for this reusable snapshot.
     ///
-    /// The value is persisted with the record so a node restart does not
-    /// have to infer local-vs-distributed semantics from the configured
-    /// repository backend.
+    /// The value is persisted with the record so readers do not infer
+    /// availability from the configured repository backend.
     pub snapshot_type: SnapshotType,
-    /// Node that owns the immutable bytes for a Local snapshot.
+    /// Serving Pod identity that owns the immutable bytes for a Local snapshot.
     ///
     /// Distributed snapshots and template records never carry placement.
     pub owner_node_id: Option<String>,
@@ -76,24 +75,6 @@ pub enum SnapshotType {
     Local,
     #[default]
     Distributed,
-}
-
-/// Visibility state of canonical reusable-snapshot metadata.
-///
-/// Preparing records reserve an identity and optional alias while the metadata
-/// commit is incomplete. Public get/list/resolve operations expose only Ready
-/// records. Older records predate this field and are therefore Ready.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotLifecycle {
-    Preparing,
-    #[default]
-    Ready,
-    /// The public record is no longer launchable while its owner and artifact
-    /// cleanup is being completed.  Keeping this state in the catalog closes
-    /// the delete/recreate race: a new writer cannot reuse the identity until
-    /// the old closure has finished cleaning up.
-    Deleting,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,21 +178,6 @@ impl SnapshotSource {
         match self {
             Self::Template { .. } => SnapshotSourceKind::Template,
             Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-        }
-    }
-
-    pub(crate) fn same_origin(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Sandbox {
-                    source_sandbox_id: left,
-                },
-                Self::Sandbox {
-                    source_sandbox_id: right,
-                },
-            ) => left == right,
-            (Self::Template { .. }, Self::Template { .. }) => true,
-            _ => false,
         }
     }
 
@@ -409,14 +375,6 @@ pub struct CommittedSnapshot {
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
     pub disk_publications: Vec<PersistedDiskImagePublication>,
-    /// Physical prefix retained only for records written by the former
-    /// per-attempt OSS layout. New records use the snapshot-id prefix.
-    #[serde(
-        default,
-        rename = "artifact_namespace",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub legacy_artifact_namespace: Option<String>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -440,22 +398,12 @@ impl CommittedSnapshot {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            legacy_artifact_namespace: None,
             custom_extension_params: None,
         }
     }
 }
 
 impl CommittedSnapshot {
-    pub(crate) fn same_logical_metadata(&self, other: &Self) -> bool {
-        self.context == other.context
-            && self.startup == other.startup
-            && self.runtime_versions == other.runtime_versions
-            && self.virtualization_mode == other.virtualization_mode
-            && self.image_configs == other.image_configs
-            && self.custom_extension_params == other.custom_extension_params
-    }
-
     pub(crate) fn matches_publish_metadata(&self, metadata: &SnapshotPublishMetadata) -> bool {
         self.context == metadata.context
             && self.startup == metadata.startup
@@ -475,12 +423,10 @@ pub struct SnapshotRecord {
     /// durable (distributed) form.
     #[serde(default)]
     pub snapshot_type: SnapshotType,
-    /// Durable placement for Local snapshot bytes.
+    /// Placement for Local snapshot bytes. The owner is the publishing Pod;
+    /// if that Pod is deleted, the Local snapshot is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_node_id: Option<String>,
-    /// Canonical metadata visibility. Only Ready records are public.
-    #[serde(default)]
-    pub lifecycle: SnapshotLifecycle,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotSource,
     pub resources: SandboxResources,
@@ -512,7 +458,6 @@ impl SnapshotRecord {
             id: metadata.id.clone(),
             snapshot_type: metadata.snapshot_type,
             owner_node_id: metadata.owner_node_id.clone(),
-            lifecycle: SnapshotLifecycle::Ready,
             alias: metadata.alias.clone(),
             source,
             resources: metadata.resources,
@@ -522,47 +467,13 @@ impl SnapshotRecord {
         }
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.lifecycle == SnapshotLifecycle::Ready
-    }
-
-    pub(crate) fn is_terminal_tombstone(&self) -> bool {
-        self.lifecycle == SnapshotLifecycle::Deleting && self.committed.is_none()
-    }
-
-    pub(crate) fn same_stable_identity(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.alias == other.alias
-            && self.resources == other.resources
-            && self.created_at_unix_ms == other.created_at_unix_ms
-            && self.source.same_origin(&other.source)
-    }
-
-    pub(crate) fn same_logical_identity(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.snapshot_type == other.snapshot_type
-            && self.owner_node_id == other.owner_node_id
-            && self.alias == other.alias
-            && self.resources == other.resources
-            && self.source.same_origin(&other.source)
-    }
-
-    pub(crate) fn same_committed_logical_metadata(&self, other: &Self) -> bool {
-        self.committed
-            .as_ref()
-            .zip(other.committed.as_ref())
-            .is_some_and(|(left, right)| left.same_logical_metadata(right))
-    }
-
     fn normalized_catalog_record(&self) -> Self {
         let mut record = self.clone();
-        record.lifecycle = SnapshotLifecycle::Ready;
         record.updated_at_unix_ms = 0;
         record
     }
 
-    /// Compares durable catalog contents while ignoring lifecycle bookkeeping
-    /// that changes during an equivalent retry.
+    /// Compares catalog contents while ignoring the update timestamp.
     pub(crate) fn same_catalog_contents(&self, other: &Self) -> bool {
         self.normalized_catalog_record() == other.normalized_catalog_record()
     }
@@ -575,29 +486,6 @@ impl SnapshotRecord {
                 .committed
                 .as_ref()
                 .is_none_or(|committed| committed.matches_publish_metadata(metadata))
-    }
-
-    pub(crate) fn matches_pending_template(&self, metadata: &SnapshotPublishMetadata) -> bool {
-        self.id == metadata.id
-            && self.committed.is_none()
-            && self.snapshot_type == SnapshotType::Distributed
-            && metadata.snapshot_type == SnapshotType::Distributed
-            && self.owner_node_id.is_none()
-            && metadata.owner_node_id.is_none()
-            && self.alias == metadata.alias
-            && self.source.matches_publish_source(&metadata.source)
-            && self.resources.cpu_count == metadata.resources.cpu_count
-            && self.resources.memory_mib == metadata.resources.memory_mib
-            && (self.resources.disk_size_mib == 0
-                || self.resources.disk_size_mib == metadata.resources.disk_size_mib)
-    }
-
-    pub(crate) fn same_publish_identity(&self, metadata: &SnapshotPublishMetadata) -> bool {
-        self.id == metadata.id
-            && self.snapshot_type == metadata.snapshot_type
-            && self.owner_node_id == metadata.owner_node_id
-            && self.committed.is_some()
-            && self.matches_publish_metadata(metadata)
     }
 
     pub(crate) fn validate_committed_metadata(&self) -> Result<(), String> {
@@ -617,8 +505,6 @@ impl SnapshotRecord {
             Some("only template snapshots can be pre-created")
         } else if self.committed.is_some() {
             Some("pre-created template snapshots must not already be committed")
-        } else if self.lifecycle != SnapshotLifecycle::Ready {
-            Some("pre-created template snapshots must request Ready lifecycle")
         } else {
             None
         };
@@ -631,13 +517,6 @@ impl SnapshotRecord {
     }
 
     pub(crate) fn start_template_build(&mut self, now_unix_ms: i64) -> Result<(), String> {
-        if !self.is_ready() {
-            return Err(format!(
-                "template build '{}' is not publicly ready",
-                self.id
-            ));
-        }
-
         let SnapshotSource::Template { build } = &mut self.source else {
             return Err(format!("snapshot '{}' is not a template build", self.id));
         };
@@ -660,10 +539,6 @@ impl SnapshotRecord {
         reason: &TemplateBuildErrorReason,
         now_unix_ms: i64,
     ) -> Result<bool, String> {
-        if self.lifecycle == SnapshotLifecycle::Deleting {
-            return Err(format!("template build '{}' is being deleted", self.id));
-        }
-
         let SnapshotSource::Template { build } = &mut self.source else {
             return Err(format!("snapshot '{}' is not a template build", self.id));
         };
@@ -697,7 +572,6 @@ impl SnapshotRecord {
             id,
             snapshot_type: SnapshotType::Distributed,
             owner_node_id: None,
-            lifecycle: SnapshotLifecycle::Ready,
             alias,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
@@ -728,7 +602,6 @@ impl SnapshotRecord {
         self.alias = metadata.alias.clone();
         self.snapshot_type = metadata.snapshot_type;
         self.owner_node_id = metadata.owner_node_id.clone();
-        self.lifecycle = SnapshotLifecycle::Ready;
         self.resources = metadata.resources;
         self.updated_at_unix_ms = now_unix_ms;
         self.committed = Some(committed);
@@ -752,7 +625,6 @@ impl SnapshotRecord {
             id: SnapshotId::generate(),
             snapshot_type: SnapshotType::Distributed,
             owner_node_id: None,
-            lifecycle: SnapshotLifecycle::Ready,
             alias: None,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo {
@@ -1003,34 +875,6 @@ mod tests {
         );
         metadata.alias = None;
         metadata.validate().expect("aliasless Local must be valid");
-    }
-
-    #[test]
-    fn legacy_artifact_namespace_survives_record_rewrite() {
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        let mut legacy = serde_json::to_value(&record).expect("record should serialize");
-        legacy["revision"] = serde_json::json!(27);
-        legacy["committed"]["artifact_namespace"] = serde_json::json!("attempt-old");
-
-        let mut decoded: SnapshotRecord =
-            serde_json::from_value(legacy).expect("legacy record should deserialize");
-        assert_eq!(
-            decoded
-                .committed
-                .as_ref()
-                .and_then(|committed| committed.legacy_artifact_namespace.as_deref()),
-            Some("attempt-old")
-        );
-        decoded.lifecycle = super::SnapshotLifecycle::Preparing;
-        let rewritten = serde_json::to_value(decoded).expect("record should reserialize");
-        assert_eq!(
-            rewritten["committed"]["artifact_namespace"],
-            serde_json::json!("attempt-old")
-        );
-        assert!(rewritten.get("revision").is_none());
-
-        let fresh = serde_json::to_value(record).expect("new record should serialize");
-        assert!(fresh["committed"].get("artifact_namespace").is_none());
     }
 
     #[test]
