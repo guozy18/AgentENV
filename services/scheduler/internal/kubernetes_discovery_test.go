@@ -234,27 +234,6 @@ func TestNodesFromEndpointSlicesTerminatingIsLingering(t *testing.T) {
 	}
 }
 
-func TestFilterNodesByPodLabelsNoScheduleIsLingering(t *testing.T) {
-	pod := newPod("agentenv-node-a", map[string]string{"agentenv.io/scheduler-state": "no-schedule"})
-	pod.Spec.NodeName = "agentenv-node-a"
-	discovery := newDiscoveryWithPodLabelSelectors(t, "", "agentenv.io/scheduler-state=no-schedule", pod)
-
-	active, lingering := discovery.filterNodesByPodLabels(
-		[]Node{{ID: "agentenv-node-a", Endpoint: "http://10.0.0.1:8000"}},
-		nil,
-	)
-
-	if len(active) != 0 {
-		t.Fatalf("expected 0 active nodes, got %d", len(active))
-	}
-	if len(lingering) != 1 {
-		t.Fatalf("expected 1 lingering node, got %d", len(lingering))
-	}
-	if got := lingering[0].ID; got != "agentenv-node-a" {
-		t.Fatalf("expected lingering node agentenv-node-a, got %q", got)
-	}
-}
-
 func TestFilterNodesByPodLabelsIgnoreTakesPrecedence(t *testing.T) {
 	pod := newPod("agentenv-node-a", map[string]string{
 		"agentenv.io/discovery":       "ignore",

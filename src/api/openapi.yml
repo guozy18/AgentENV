@@ -674,7 +674,7 @@ components:
       properties:
         name:
           type: string
-          description: Optional human-readable alias for the reusable snapshot. The alias must not already identify a different snapshot.
+          description: Optional human-readable alias for a Distributed reusable snapshot. Local snapshots reject aliases.
         snapshotType:
           $ref: "#/components/schemas/SnapshotType"
           default: distributed

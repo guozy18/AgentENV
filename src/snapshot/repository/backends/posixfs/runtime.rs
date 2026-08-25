@@ -100,7 +100,7 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
                 &committed.rootfs_layers,
                 &self
                     .image_materializer
-                    .rootfs_image_config_path_with_namespace(&snapshot.id, None),
+                    .rootfs_image_config_path(&snapshot.id),
                 MaterializeSpec {
                     label: &rootfs_label,
                     cache_key: &rootfs_cache_key,
@@ -189,11 +189,7 @@ impl PosixFsRuntimeResolver {
                             layers,
                             &self
                                 .image_materializer
-                                .drive_image_config_path_with_namespace(
-                                    snapshot_id,
-                                    drive_id,
-                                    None,
-                                ),
+                                .drive_image_config_path(snapshot_id, drive_id),
                             MaterializeSpec {
                                 label: &label,
                                 cache_key: &cache_key,
@@ -311,7 +307,7 @@ impl PosixFsRuntimeResolver {
     ) -> RepositoryResult<PathBuf> {
         let destination = self
             .image_materializer
-            .memory_image_config_path_with_namespace(snapshot_id, None);
+            .memory_image_config_path(snapshot_id);
         let label = format!("memory for snapshot '{snapshot_id}'");
         let cache_key = runtime_image_cache_key(snapshot_id, "memory/image.json");
         let layers = snapshot

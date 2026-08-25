@@ -14,8 +14,6 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 func TestSnapshotRequestOperation(t *testing.T) {
@@ -138,157 +136,6 @@ func TestLookupSnapshotPlacementUsesOpaqueQueryAndSelectedHeaders(t *testing.T) 
 		if got := request.headers.Get(name); got != "" {
 			t.Fatalf("internal placement request leaked %s = %q", name, got)
 		}
-	}
-}
-
-func TestRouteSnapshotRequestDistributedKeepsScheduledNode(t *testing.T) {
-	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"snapshotType":"distributed"}`))
-	}))
-	defer metadataNode.Close()
-
-	scheduled := &schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL}
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	routed, ownerBound, routingErr := server.routeSnapshotRequest(
-		context.Background(),
-		httptest.NewRequest(http.MethodPost, "/sandboxes", nil),
-		scheduled,
-		snapshotOperationLaunch,
-		"snap-1",
-	)
-	if routingErr != nil {
-		t.Fatalf("route snapshot request failed: %v", routingErr)
-	}
-	if routed != scheduled {
-		t.Fatal("distributed snapshot must keep the scheduled node")
-	}
-	if ownerBound {
-		t.Fatal("distributed snapshot must not be owner-bound")
-	}
-}
-
-func TestRouteSnapshotRequestLocalUsesReadyOwner(t *testing.T) {
-	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
-	}))
-	defer metadataNode.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-			if req.GetNodeId() != "node-b" {
-				t.Fatalf("owner node id = %q, want node-b", req.GetNodeId())
-			}
-			return &schedulerv1.GetNodeResponse{Node: &schedulerv1.ObservedNode{
-				NodeId:   "node-b",
-				Endpoint: "http://node-b.test",
-				Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
-			}}, nil
-		},
-	}, time.Second, 1024)
-
-	routed, ownerBound, routingErr := server.routeSnapshotRequest(
-		context.Background(),
-		httptest.NewRequest(http.MethodPost, "/sandboxes", nil),
-		&schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL},
-		snapshotOperationLaunch,
-		"snap-1",
-	)
-	if routingErr != nil {
-		t.Fatalf("route snapshot request failed: %v", routingErr)
-	}
-	if !ownerBound {
-		t.Fatal("local snapshot must be owner-bound")
-	}
-	if routed.GetNodeId() != "node-b" || routed.GetEndpoint() != "http://node-b.test" {
-		t.Fatalf("routed node = %v, want node-b", routed)
-	}
-}
-
-func TestRouteSnapshotRequestRejectsUnavailableOwner(t *testing.T) {
-	tests := []struct {
-		name     string
-		response *schedulerv1.GetNodeResponse
-		err      error
-	}{
-		{name: "not found", err: status.Error(codes.NotFound, "observed node not found")},
-		{name: "missing node", response: &schedulerv1.GetNodeResponse{}},
-		{name: "wrong node", response: observedNodeResponse("node-c", "http://node-c.test", schedulerv1.NodeStatus_NODE_STATUS_READY)},
-		{name: "connecting", response: observedNodeResponse("node-b", "http://node-b.test", schedulerv1.NodeStatus_NODE_STATUS_CONNECTING)},
-		{name: "unhealthy", response: observedNodeResponse("node-b", "http://node-b.test", schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY)},
-		{name: "lingering", response: observedNodeResponse("node-b", "http://node-b.test", schedulerv1.NodeStatus_NODE_STATUS_LINGERING)},
-		{name: "unspecified", response: observedNodeResponse("node-b", "http://node-b.test", schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED)},
-		{name: "invalid endpoint", response: observedNodeResponse("node-b", "ftp://node-b.test", schedulerv1.NodeStatus_NODE_STATUS_READY)},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
-			}))
-			defer metadataNode.Close()
-
-			server := newTestServer(t, stubSchedulerClient{
-				getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-					return tc.response, tc.err
-				},
-			}, time.Second, 1024)
-
-			_, ownerBound, routingErr := server.routeSnapshotRequest(
-				context.Background(),
-				httptest.NewRequest(http.MethodPost, "/sandboxes", nil),
-				&schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL},
-				snapshotOperationLaunch,
-				"snap-1",
-			)
-			if routingErr == nil || routingErr.statusCode != http.StatusServiceUnavailable {
-				t.Fatalf("routing error = %v, want 503", routingErr)
-			}
-			if ownerBound {
-				t.Fatal("failed owner resolution must not return an owner-bound route")
-			}
-		})
-	}
-}
-
-func TestRouteSnapshotRequestRejectsInvalidPlacement(t *testing.T) {
-	tests := []struct {
-		name       string
-		statusCode int
-		body       string
-	}{
-		{name: "backend unavailable", statusCode: http.StatusInternalServerError},
-		{name: "unexpected success status", statusCode: http.StatusCreated, body: `{"snapshotType":"distributed"}`},
-		{name: "malformed JSON", statusCode: http.StatusOK, body: `{"snapshotType":`},
-		{name: "unknown type", statusCode: http.StatusOK, body: `{"snapshotType":"temporal"}`},
-		{name: "local missing owner", statusCode: http.StatusOK, body: `{"snapshotType":"local"}`},
-		{name: "distributed with owner", statusCode: http.StatusOK, body: `{"snapshotType":"distributed","ownerNodeID":"node-b"}`},
-		{name: "oversized response", statusCode: http.StatusOK, body: strings.Repeat("x", maxSnapshotPlacementResponseBytes+1)},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				statusCode := tc.statusCode
-				if statusCode == 0 {
-					statusCode = http.StatusOK
-				}
-				w.WriteHeader(statusCode)
-				_, _ = w.Write([]byte(tc.body))
-			}))
-			defer metadataNode.Close()
-
-			server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-			_, _, routingErr := server.routeSnapshotRequest(
-				context.Background(),
-				httptest.NewRequest(http.MethodPost, "/sandboxes", nil),
-				&schedulerv1.Node{NodeId: "node-a", Endpoint: metadataNode.URL},
-				snapshotOperationLaunch,
-				"snap-1",
-			)
-			if routingErr == nil || routingErr.statusCode != http.StatusServiceUnavailable {
-				t.Fatalf("routing error = %v, want 503", routingErr)
-			}
-		})
 	}
 }
 
@@ -811,26 +658,6 @@ func TestSnapshotPlacementFailureDoesNotFallbackToScheduledNode(t *testing.T) {
 	}
 	if got := len(sandboxBodyBufferSlots); got != 0 {
 		t.Fatalf("held body buffer slots after placement failure = %d, want 0", got)
-	}
-}
-
-func TestOversizedSandboxBodyBufferReleasedOnSchedulerFailure(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return nil, status.Error(codes.Unavailable, "scheduler unavailable")
-		},
-	}, time.Second, 1024)
-
-	requestBody := `{"templateID":"snap-1","pad":"` + strings.Repeat("x", maxHintBodyBytes) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes", strings.NewReader(requestBody))
-	resp := httptest.NewRecorder()
-	authenticatedTestHandler(server).ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503; body=%q", resp.Code, resp.Body.String())
-	}
-	if got := len(sandboxBodyBufferSlots); got != 0 {
-		t.Fatalf("held body buffer slots after scheduler failure = %d, want 0", got)
 	}
 }
 

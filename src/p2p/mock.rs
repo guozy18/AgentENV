@@ -27,6 +27,7 @@ pub(crate) struct MockTransport {
     pub(crate) fetch_range_count: Arc<AtomicUsize>,
     pub(crate) publish_count: Arc<AtomicUsize>,
     pub(crate) lookup_delay: Option<Duration>,
+    pub(crate) publish_delay: Option<Duration>,
     pub(crate) fetch_range_delay: Option<Duration>,
     pub(crate) fail_lookup: Arc<AtomicBool>,
     pub(crate) fail_publish: Arc<AtomicBool>,
@@ -153,6 +154,9 @@ impl P2pTransport for MockTransport {
     async fn publish(&self, request: &P2pPublishRequest) -> P2pResult<()> {
         debug!(key = ?request.key, "publishing");
         self.publish_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(delay) = self.publish_delay {
+            tokio::time::sleep(delay).await;
+        }
         if self.fail_publish.load(Ordering::Relaxed) {
             warn!(key = ?request.key, "publish forced failure");
             return Err(P2pError::Internal(anyhow!("forced publish failure")));

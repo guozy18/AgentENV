@@ -361,10 +361,7 @@ impl UblkDeviceManager {
         let mut metric =
             MetricGuard::operation(UBLK_OPERATION_DURATION, "create_runtime_overlaybd");
         let created = client
-            .create_overlaybd_runtime_device_with_source_state_strategy(
-                request,
-                source_state_strategy,
-            )
+            .create_overlaybd_runtime_device(request, source_state_strategy)
             .await
             .context("create overlaybd runtime device via daemon");
         metric.finish(&created);

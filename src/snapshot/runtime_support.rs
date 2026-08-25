@@ -32,49 +32,36 @@ impl RuntimeImageMaterializer {
         }
     }
 
-    /// Returns a namespace-scoped runtime directory for backends whose
-    /// immutable artifact closure can change while retaining the public ID.
-    pub(crate) fn snapshot_dir_with_namespace(
-        &self,
-        snapshot_id: &SnapshotId,
-        namespace: Option<&str>,
-    ) -> PathBuf {
-        match namespace {
-            Some(namespace) => self
-                .runtime_root
-                .join(snapshot_id.to_string())
-                .join(namespace),
-            None => self.runtime_root.join(snapshot_id.to_string()),
-        }
+    pub(crate) fn snapshot_dir(&self, snapshot_id: &SnapshotId) -> PathBuf {
+        self.runtime_root.join(snapshot_id.to_string())
     }
 
-    pub(crate) fn rootfs_image_config_path_with_namespace(
+    pub(crate) fn snapshot_dir_with_legacy_namespace(
         &self,
         snapshot_id: &SnapshotId,
-        namespace: Option<&str>,
+        namespace: &str,
     ) -> PathBuf {
-        self.snapshot_dir_with_namespace(snapshot_id, namespace)
+        self.snapshot_dir(snapshot_id).join(namespace)
+    }
+
+    pub(crate) fn rootfs_image_config_path(&self, snapshot_id: &SnapshotId) -> PathBuf {
+        self.snapshot_dir(snapshot_id)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file)
     }
 
-    pub(crate) fn memory_image_config_path_with_namespace(
-        &self,
-        snapshot_id: &SnapshotId,
-        namespace: Option<&str>,
-    ) -> PathBuf {
-        self.snapshot_dir_with_namespace(snapshot_id, namespace)
+    pub(crate) fn memory_image_config_path(&self, snapshot_id: &SnapshotId) -> PathBuf {
+        self.snapshot_dir(snapshot_id)
             .join("memory")
             .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file)
     }
 
-    pub(crate) fn drive_image_config_path_with_namespace(
+    pub(crate) fn drive_image_config_path(
         &self,
         snapshot_id: &SnapshotId,
         drive_id: &str,
-        namespace: Option<&str>,
     ) -> PathBuf {
-        self.snapshot_dir_with_namespace(snapshot_id, namespace)
+        self.snapshot_dir(snapshot_id)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
             .join(drive_id)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file)
@@ -108,17 +95,6 @@ impl RuntimeImageMaterializer {
 
 pub(crate) fn runtime_image_cache_key(snapshot_id: &SnapshotId, relative: &str) -> String {
     format!("runtime/{snapshot_id}/{relative}")
-}
-
-pub(crate) fn runtime_image_cache_key_with_namespace(
-    snapshot_id: &SnapshotId,
-    namespace: Option<&str>,
-    relative: &str,
-) -> String {
-    match namespace {
-        Some(namespace) => format!("runtime/{snapshot_id}/{namespace}/{relative}"),
-        None => runtime_image_cache_key(snapshot_id, relative),
-    }
 }
 
 pub(crate) fn materialize_image_config_error(label: &str, error: anyhow::Error) -> RepositoryError {

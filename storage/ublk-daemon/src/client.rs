@@ -386,24 +386,9 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Create an OverlayBD runtime config and acquire a ublk device for it.
-    ///
-    /// This is the sandbox rootfs/extra-drive path. The daemon owns runtime
-    /// materialization and returns the generated runtime image config path.
+    /// Create an OverlayBD runtime while choosing whether source-owned
+    /// lowers and a writable upper are reused or cloned.
     pub async fn create_overlaybd_runtime_device(
-        &self,
-        request: CreateOverlaybdRuntimeDeviceRequest<'_>,
-    ) -> Result<OverlaybdRuntimeDevice> {
-        self.create_overlaybd_runtime_device_with_source_state_strategy(
-            request,
-            SourceStateStrategy::Reuse,
-        )
-        .await
-    }
-
-    /// Create an OverlayBD runtime while explicitly choosing whether
-    /// source-owned lowers and a writable upper are reused or adopted.
-    pub async fn create_overlaybd_runtime_device_with_source_state_strategy(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
         source_state_strategy: SourceStateStrategy,

@@ -6275,7 +6275,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxRefre
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxSnapshotRequest {
-    /// Optional human-readable alias for the reusable snapshot. The alias must not already identify a different snapshot.
+    /// Optional human-readable alias for a Distributed reusable snapshot. Local snapshots reject aliases.
     #[serde(rename = "name")]
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -136,7 +136,7 @@ impl PosixFsSnapshotRepository {
             attached_drives: built.attached_drives,
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
-            artifact_namespace: None,
+            legacy_artifact_namespace: None,
         }
     }
 
@@ -1093,7 +1093,7 @@ mod tests {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            artifact_namespace: None,
+            legacy_artifact_namespace: None,
             custom_extension_params: None,
         };
         let snapshot_dir = tempdir
@@ -1166,7 +1166,7 @@ mod tests {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            artifact_namespace: None,
+            legacy_artifact_namespace: None,
             custom_extension_params: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));

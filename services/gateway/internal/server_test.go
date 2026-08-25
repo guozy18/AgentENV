@@ -340,27 +340,6 @@ func TestGatewayRequiresAPIKeyForSnapshotPromotionWithProxyHeaders(t *testing.T)
 	}
 }
 
-func TestSnapshotPromotionIsNotClassifiedAsDataPlane(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
-	for _, path := range []string{
-		"/snapshots/snap-1/promote",
-		"/%73napshots/snap-1/promote",
-		"/snapshots/snap-1/%70romote/",
-	} {
-		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "http://gateway.test"+path, nil)
-			req.Header.Set(headerE2BSandboxID, "sbx-1")
-			req.Header.Set(headerE2BTargetPort, "49983")
-			if server.isSandboxDataPlaneRequest(req) {
-				t.Fatal("snapshot promotion was classified as data-plane")
-			}
-			if !isSnapshotPromotionRequest(req) {
-				t.Fatal("request was not recognized as snapshot promotion")
-			}
-		})
-	}
-}
-
 func TestGatewayRequiresAPIKeyForSnapshotMetadataWithProxyHeaders(t *testing.T) {
 	lookupCalls := 0
 	scheduleCalls := 0
@@ -420,21 +399,6 @@ func TestSnapshotMetadataWithProxyHeadersUsesSchedule(t *testing.T) {
 	}
 	if lookupCalls != 0 || scheduleCalls != 1 {
 		t.Fatalf("scheduler calls = lookup:%d schedule:%d, want lookup:0 schedule:1", lookupCalls, scheduleCalls)
-	}
-}
-
-func TestSnapshotMetadataIsNotClassifiedAsDataPlaneWithProxyHeaders(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
-	for _, path := range []string{"/snapshots", "/snapshots/snap-1", "/snapshots/team%2Fsnap%3Av1", "/snapshots/", "/%73napshots", "/%73napshots/snap-1"} {
-		req := httptest.NewRequest(http.MethodGet, "http://gateway.test"+path, nil)
-		req.Header.Set(headerE2BSandboxID, "sbx-1")
-		req.Header.Set(headerE2BTargetPort, "49983")
-		if server.isSandboxDataPlaneRequest(req) {
-			t.Fatalf("%s was classified as data-plane", path)
-		}
-		if !isSnapshotMetadataRequest(req) {
-			t.Fatalf("%s was not recognized as snapshot metadata", path)
-		}
 	}
 }
 

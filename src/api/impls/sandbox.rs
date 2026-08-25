@@ -1146,27 +1146,31 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
 
-        let alias = match &body.name {
-            Some(name) => match SnapshotAlias::parse(name) {
-                Ok(alias) => Some(alias),
-                Err(err) => {
-                    return Ok(
-                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                            400,
-                            format!("invalid snapshot alias: {}", err),
-                        )),
-                    );
-                }
-            },
-            None => None,
-        };
-
         let snapshot_type = match body
             .snapshot_type
             .unwrap_or(models::SnapshotType::Distributed)
         {
             models::SnapshotType::Local => SnapshotType::Local,
             models::SnapshotType::Distributed => SnapshotType::Distributed,
+        };
+        if snapshot_type == SnapshotType::Local && body.name.is_some() {
+            return Ok(
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    "Local snapshots do not support aliases",
+                )),
+            );
+        }
+        let alias = match body.name.as_deref().map(SnapshotAlias::parse).transpose() {
+            Ok(alias) => alias,
+            Err(error) => {
+                return Ok(
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        format!("invalid snapshot alias: {error}"),
+                    )),
+                )
+            }
         };
 
         let capture = match timer

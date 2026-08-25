@@ -14,11 +14,12 @@ use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::{CacheHandle, LocalArtifactCache};
 use crate::snapshot::p2p;
 use crate::snapshot::repository::{
-    validate_artifact_namespace, validate_attached_drive_virtual_size, SnapshotRuntimeResolver,
+    validate_attached_drive_virtual_size, validate_legacy_artifact_namespace,
+    SnapshotRuntimeResolver,
 };
 use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, materialize_image_config_error, parse_firecracker_manifest,
-    runtime_image_cache_key_with_namespace, RuntimeImageMaterializer,
+    runtime_image_cache_key, RuntimeImageMaterializer,
 };
 use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
@@ -28,12 +29,19 @@ use crate::snapshot::{
 
 const MANAGED_LAYER_EXISTS_CONCURRENCY: usize = 16;
 
-/// Fixed P2P keys predate immutable per-publish namespaces.  They are safe
-/// only for legacy records: a namespaced closure must be fetched from its
-/// canonical object key so a stale fixed-key advertisement cannot hydrate a
-/// different attempt under the same public snapshot ID.
-fn use_legacy_fixed_p2p(artifact_namespace: Option<&str>) -> bool {
-    artifact_namespace.is_none()
+fn use_fixed_p2p(legacy_namespace: Option<&str>) -> bool {
+    legacy_namespace.is_none()
+}
+
+fn runtime_cache_key(
+    snapshot_id: &SnapshotId,
+    legacy_namespace: Option<&str>,
+    relative: &str,
+) -> String {
+    match legacy_namespace {
+        Some(namespace) => format!("runtime/{snapshot_id}/{namespace}/{relative}"),
+        None => runtime_image_cache_key(snapshot_id, relative),
+    }
 }
 
 struct MaterializeSpec<'a> {
@@ -111,11 +119,17 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is not ready", snapshot.id),
                 })?;
-        let artifact_namespace = committed.artifact_namespace.as_deref();
-        validate_artifact_namespace(artifact_namespace)?;
-        let layout = match artifact_namespace {
-            Some(namespace) => OssSnapshotArtifactLayout::new(&id).with_namespace(namespace),
+        let legacy_namespace = committed.legacy_artifact_namespace.as_deref();
+        validate_legacy_artifact_namespace(legacy_namespace)?;
+        let layout = match legacy_namespace {
+            Some(namespace) => OssSnapshotArtifactLayout::new(&id).with_legacy_namespace(namespace),
             None => OssSnapshotArtifactLayout::new(&id),
+        };
+        let runtime_dir = match legacy_namespace {
+            Some(namespace) => self
+                .image_materializer
+                .snapshot_dir_with_legacy_namespace(&id, namespace),
+            None => self.image_materializer.snapshot_dir(&id),
         };
         let mut handles: Vec<CacheHandle> = Vec::new();
 
@@ -123,7 +137,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let vm_state_key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let vm_state_client = Arc::clone(&self.client);
         let p2p_transport = self.p2p_transport.clone();
-        let use_legacy_fixed_p2p = use_legacy_fixed_p2p(artifact_namespace);
+        let use_fixed_p2p = use_fixed_p2p(legacy_namespace);
         let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let vm_state_handle = self
             .cache
@@ -133,7 +147,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 let p2p_transport = p2p_transport.clone();
                 let p2p_key = vm_state_p2p_key.clone();
                 async move {
-                    if use_legacy_fixed_p2p {
+                    if use_fixed_p2p {
                         if let Some(transport) = p2p_transport.as_ref() {
                             match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
                                 Ok(size) => return Ok(size),
@@ -159,7 +173,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 
         // ── firecracker manifest ───────────────────────────────────
         let committed_manifest = self
-            .load_committed_firecracker_manifest(&layout, &id, use_legacy_fixed_p2p)
+            .load_committed_firecracker_manifest(&layout, &id, use_fixed_p2p)
             .await?;
 
         // ── memory image config ────────────────────────────────────
@@ -168,14 +182,13 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             .iter()
             .map(|m| OverlaybdLayerRef::Managed(m.clone()))
             .collect();
-        let mem_cache_key =
-            runtime_image_cache_key_with_namespace(&id, artifact_namespace, "memory/image.json");
+        let mem_cache_key = runtime_cache_key(&id, legacy_namespace, "memory/image.json");
         let mem_image_config_path = self
             .materialize_layers_and_pin(
                 &memory_layers,
-                &self
-                    .image_materializer
-                    .memory_image_config_path_with_namespace(&id, artifact_namespace),
+                &runtime_dir
+                    .join("memory")
+                    .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
                 MaterializeSpec {
                     label: "memory",
                     cache_key: &mem_cache_key,
@@ -186,14 +199,13 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             .await?;
 
         // ── rootfs image config ────────────────────────────────────
-        let rootfs_cache_key =
-            runtime_image_cache_key_with_namespace(&id, artifact_namespace, "rootfs/image.json");
+        let rootfs_cache_key = runtime_cache_key(&id, legacy_namespace, "rootfs/image.json");
         let rootfs_image_config_path = self
             .materialize_layers_and_pin(
                 &committed.rootfs_layers,
-                &self
-                    .image_materializer
-                    .rootfs_image_config_path_with_namespace(&id, artifact_namespace),
+                &runtime_dir
+                    .join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir)
+                    .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
                 MaterializeSpec {
                     label: "rootfs",
                     cache_key: &rootfs_cache_key,
@@ -207,7 +219,8 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let attached_drives = self
             .resolve_attached_drives(
                 &id,
-                artifact_namespace,
+                &runtime_dir,
+                legacy_namespace,
                 &committed.attached_drives,
                 &mut handles,
             )
@@ -321,7 +334,8 @@ impl OssRuntimeResolver {
     async fn resolve_attached_drives(
         &self,
         id: &SnapshotId,
-        artifact_namespace: Option<&str>,
+        runtime_dir: &Path,
+        legacy_namespace: Option<&str>,
         committed_drives: &[CommittedAttachedDrive],
         handles: &mut Vec<CacheHandle>,
     ) -> RepositoryResult<Vec<ResolvedAttachedDrive>> {
@@ -341,18 +355,15 @@ impl OssRuntimeResolver {
                     let image_config_path = self
                         .materialize_layers_and_pin(
                             layers,
-                            &self
-                                .image_materializer
-                                .drive_image_config_path_with_namespace(
-                                    id,
-                                    drive_id,
-                                    artifact_namespace,
-                                ),
+                            &runtime_dir
+                                .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
+                                .join(drive_id)
+                                .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
                             MaterializeSpec {
                                 label: &format!("drive '{drive_id}'"),
-                                cache_key: &runtime_image_cache_key_with_namespace(
+                                cache_key: &runtime_cache_key(
                                     id,
-                                    artifact_namespace,
+                                    legacy_namespace,
                                     &format!("drives/{drive_id}/image.json"),
                                 ),
                                 allow_empty_layers: false,
@@ -383,11 +394,11 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
-        use_legacy_fixed_p2p: bool,
+        use_fixed_p2p: bool,
     ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        if use_legacy_fixed_p2p {
+        if use_fixed_p2p {
             if let Some(transport) = self.p2p_transport.as_ref() {
                 match p2p::fetch_artifact_bytes(transport, &p2p_key).await {
                     Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
@@ -444,23 +455,31 @@ mod tests {
     }
 
     #[test]
-    fn namespaced_closures_never_use_legacy_fixed_p2p_keys() {
-        assert!(!use_legacy_fixed_p2p(Some("attempt-01")));
-        assert!(use_legacy_fixed_p2p(None));
+    fn only_legacy_namespaced_closures_skip_fixed_p2p_keys() {
+        assert!(!use_fixed_p2p(Some("attempt-01")));
+        assert!(use_fixed_p2p(None));
     }
 
     #[test]
-    fn namespaced_artifact_keys_are_distinct_from_legacy_fixed_layout() {
+    fn legacy_namespaced_artifact_keys_are_distinct_from_fixed_layout() {
         let snapshot_id = SnapshotId::generate();
         let legacy = OssSnapshotArtifactLayout::new(&snapshot_id)
             .artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         let namespaced = OssSnapshotArtifactLayout::new(&snapshot_id)
-            .with_namespace("attempt-01")
+            .with_legacy_namespace("attempt-01")
             .artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
 
         assert_ne!(legacy, namespaced);
         assert!(legacy.starts_with(&format!("artifacts/{snapshot_id}/")));
         assert!(namespaced.starts_with(&format!("artifacts/{snapshot_id}/attempt-01/")));
+        assert_eq!(
+            runtime_cache_key(&snapshot_id, None, "rootfs/image.json"),
+            format!("runtime/{snapshot_id}/rootfs/image.json")
+        );
+        assert_eq!(
+            runtime_cache_key(&snapshot_id, Some("attempt-01"), "rootfs/image.json"),
+            format!("runtime/{snapshot_id}/attempt-01/rootfs/image.json")
+        );
     }
 
     #[tokio::test]

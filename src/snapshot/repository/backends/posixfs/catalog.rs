@@ -13,7 +13,7 @@ use serde::Serialize;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use super::{persist_atomic_file, sync_dir};
 use crate::snapshot::repository::SnapshotListFilter;
-use crate::snapshot::types::{next_revision, now_unix_ms};
+use crate::snapshot::types::now_unix_ms;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, RepositoryError,
     RepositoryResult, SnapshotAlias, SnapshotId, SnapshotLifecycle, SnapshotPublishMetadata,
@@ -183,10 +183,9 @@ impl PosixFsCatalogStore {
 
     /// Commits one imported snapshot into the catalog and makes it visible via an atomic record write.
     ///
-    /// New identities are first persisted as Preparing, then receive their
-    /// marker and alias, and become Ready last. Existing template completions
-    /// and Local-to-Distributed promotions keep their prior Ready record
-    /// visible while the replacement is committed.
+    /// Alias-bearing identities use a hidden Preparing record while binding
+    /// their second catalog object. Aliasless identities need only the marker
+    /// plus one atomic Ready record write.
     pub(crate) fn commit_publish(
         &self,
         session: &PublishSession,
@@ -218,9 +217,6 @@ impl PosixFsCatalogStore {
             })
         } else {
             (|| {
-                if is_new {
-                    self.write_record_unlocked(&preparing)?;
-                }
                 self.write_commit_marker(&session.snapshot_id)?;
                 self.write_record_unlocked(&record)
             })()
@@ -235,9 +231,8 @@ impl PosixFsCatalogStore {
                 // record back here could therefore undo a successful
                 // promotion. Preserve the current catalog state and let an
                 // exact retry or startup reconciliation converge it. Keep an
-                // existing Preparing identity even when alias reservation
-                // fails: its closure may already be durable, and deleting it
-                // would make a later retry destructive.
+                // existing alias-bearing Preparing identity when reservation
+                // fails: its closure may already be durable.
                 // Only remove the physical staging directory when it is not
                 // backed by a committed marker/record. Never roll back catalog
                 // metadata after a write has been attempted.
@@ -252,14 +247,14 @@ impl PosixFsCatalogStore {
         self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id)
     }
 
-    pub(crate) fn create(&self, mut record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+    pub(crate) fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.ensure_layout()?;
         record
             .validate_template_create()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
 
         let _record_guard = self.acquire_record_lock(&record.id)?;
-        let preparing = if let Some(existing) = self.load_record_by_id_unlocked(&record.id)? {
+        if let Some(existing) = self.load_record_by_id_unlocked(&record.id)? {
             if existing.lifecycle == SnapshotLifecycle::Deleting {
                 return Err(RepositoryError::ConcurrentModification {
                     resource: format!("snapshot '{}' is being deleted", record.id),
@@ -286,16 +281,13 @@ impl PosixFsCatalogStore {
             }
             // Deleting was fenced above; the remaining non-Ready state is
             // Preparing and can be completed by this exact retry.
-            existing
         } else {
             let mut preparing = record.clone();
             preparing.lifecycle = SnapshotLifecycle::Preparing;
             self.write_record_unlocked(&preparing)?;
-            preparing
-        };
+        }
 
-        let mut ready = record.clone();
-        ready.revision = next_revision(preparing.revision);
+        let ready = record.clone();
 
         let write_result = if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
@@ -329,14 +321,9 @@ impl PosixFsCatalogStore {
     /// Persists canonical logical metadata without importing snapshot bytes.
     ///
     /// Local artifact publication has already completed before this method is
-    /// called. A new identity is first persisted as Preparing, then receives
-    /// its marker and alias, and only then becomes Ready. Any I/O failure after
-    /// the Preparing write leaves a hidden record that a later exact retry can
-    /// complete.
-    pub(crate) fn commit_record(
-        &self,
-        mut record: SnapshotRecord,
-    ) -> RepositoryResult<SnapshotRecord> {
+    /// called. Local records are aliasless, so visibility needs only the
+    /// marker and one atomic Ready record write.
+    pub(crate) fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         if record.snapshot_type != SnapshotType::Local {
             return Err(RepositoryError::InvalidRequest {
                 reason: "metadata-only commits are supported only for Local snapshots".to_string(),
@@ -382,75 +369,20 @@ impl PosixFsCatalogStore {
         }
 
         let snapshot_id = record.id.clone();
-        let is_new = previous_record.is_none();
-        if is_new {
-            // A record decoded from a pre-revision legacy payload may carry
-            // zero. New identities cannot choose their catalog revision; the
-            // hidden Preparing write starts at one and the Ready transition
-            // advances it, matching the OSS CAS lifecycle.
-            record.revision = 1;
-        }
         let repairs_ready = previous_record
             .as_ref()
             .is_some_and(SnapshotRecord::is_ready);
-        let mut preparing = record.clone();
-        preparing.lifecycle = SnapshotLifecycle::Preparing;
-        let mut ready = record.clone();
-        ready.revision = if repairs_ready {
-            record.revision
-        } else {
-            next_revision(
-                previous_record
-                    .as_ref()
-                    .map_or(preparing.revision, |previous| previous.revision),
-            )
-        };
-        let write_result = if let Some(alias) = record.alias.as_ref() {
-            self.with_alias_lock(alias, |store| {
-                // Check deterministic conflicts before creating a new hidden
-                // identity. I/O failures after this point intentionally retain
-                // Preparing state for recovery.
-                store.ensure_alias_available(alias, &snapshot_id)?;
-                if is_new {
-                    store.write_record_unlocked(&preparing)?;
-                }
-                let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                if repairs_ready {
-                    // A missing marker hides the exact Ready record. Restore
-                    // its alias first so making the ID visible cannot expose
-                    // an unbound canonical identity.
-                    store.write_json(&alias_path, &snapshot_id)?;
-                    store.write_commit_marker(&snapshot_id)?;
-                } else {
-                    store.write_commit_marker(&snapshot_id)?;
-                    store.write_json(&alias_path, &snapshot_id)?;
-                    store.write_record_unlocked(&ready)?;
-                }
-                Ok(())
-            })
-        } else {
-            (|| {
-                if is_new {
-                    self.write_record_unlocked(&preparing)?;
-                }
-                self.write_commit_marker(&snapshot_id)?;
-                if !repairs_ready {
-                    self.write_record_unlocked(&ready)?;
-                }
-                Ok(())
-            })()
-        };
-
-        // Preserve an existing Preparing record on every failure. The
-        // immutable closure may already be durable and a later exact retry
-        // must be able to finish the same identity.
-        write_result?;
+        let ready = record.clone();
+        self.write_commit_marker(&snapshot_id)?;
+        if !repairs_ready {
+            self.write_record_unlocked(&ready)?;
+        }
 
         // A Ready record is never overwritten by this path: it is only
         // repaired when its marker or alias binding is missing.  Return the
         // persisted canonical value rather than the caller's retry payload;
-        // revision and update time are deliberately ignored for identity
-        // comparison, so the two values may otherwise disagree with storage.
+        // update time is deliberately ignored for identity comparison, so
+        // the two values may otherwise disagree with storage.
         if repairs_ready {
             Ok(previous_record.expect("repairs_ready implies an existing record"))
         } else {
@@ -823,7 +755,6 @@ impl PosixFsCatalogStore {
                 let mut deleting = record;
                 deleting.lifecycle = SnapshotLifecycle::Deleting;
                 deleting.updated_at_unix_ms = now_unix_ms();
-                deleting.revision = next_revision(deleting.revision);
                 self.write_record_unlocked(&deleting)?;
             }
         }
@@ -862,7 +793,6 @@ impl PosixFsCatalogStore {
                 let mut tombstone = record.clone();
                 tombstone.committed = None;
                 tombstone.updated_at_unix_ms = now_unix_ms();
-                tombstone.revision = next_revision(tombstone.revision);
                 store.write_record_unlocked(&tombstone)?;
             } else if !retain_tombstone {
                 store.remove_file_if_exists(&store.record_path(id))?;
@@ -1245,9 +1175,9 @@ impl PosixFsCatalogStore {
     ) -> RepositoryResult<()> {
         let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias);
         if let Some(existing) = self.load_alias_target(alias)? {
-            let existing_record = self.load_record_by_id_unlocked(&existing)?;
             if &existing == new_id {
-                if existing_record
+                if self
+                    .load_record_by_id_unlocked(&existing)?
                     .as_ref()
                     .is_some_and(SnapshotRecord::is_terminal_tombstone)
                 {
@@ -1257,15 +1187,64 @@ impl PosixFsCatalogStore {
                 }
                 return Ok(());
             }
-            if existing_record
-                .as_ref()
-                .is_some_and(|record| !record.is_terminal_tombstone())
-            {
-                return Err(RepositoryError::AliasConflict {
-                    alias: alias.to_string(),
-                    existing,
-                    new_id: new_id.clone(),
-                });
+            if let Some(observed) = self.load_record_by_id_unlocked(&existing)? {
+                let claims_alias = observed
+                    .alias
+                    .as_ref()
+                    .is_some_and(|record_alias| record_alias == alias);
+                if observed.is_ready() {
+                    return Err(RepositoryError::AliasConflict {
+                        alias: alias.to_string(),
+                        existing,
+                        new_id: new_id.clone(),
+                    });
+                }
+                if claims_alias
+                    && (observed.lifecycle == SnapshotLifecycle::Preparing
+                        || observed.lifecycle == SnapshotLifecycle::Deleting)
+                {
+                    let Some(_target_guard) = self.try_acquire_record_lock(&existing)? else {
+                        return Err(RepositoryError::AliasConflict {
+                            alias: alias.to_string(),
+                            existing,
+                            new_id: new_id.clone(),
+                        });
+                    };
+                    let Some(mut current) = self.load_record_by_id_unlocked(&existing)? else {
+                        self.remove_file_if_exists(&alias_path)?;
+                        return Ok(());
+                    };
+                    if current.is_ready() {
+                        return Err(RepositoryError::AliasConflict {
+                            alias: alias.to_string(),
+                            existing,
+                            new_id: new_id.clone(),
+                        });
+                    }
+                    let current_claims_alias = current
+                        .alias
+                        .as_ref()
+                        .is_some_and(|record_alias| record_alias == alias);
+                    if !current_claims_alias {
+                        self.remove_file_if_exists(&alias_path)?;
+                        return Ok(());
+                    }
+                    if current_claims_alias && current.lifecycle == SnapshotLifecycle::Preparing {
+                        current.lifecycle = SnapshotLifecycle::Deleting;
+                        current.committed = None;
+                        current.updated_at_unix_ms = now_unix_ms();
+                        self.write_record_unlocked(&current)?;
+                    }
+                    if current.lifecycle == SnapshotLifecycle::Deleting {
+                        self.remove_file_if_exists(&self.commit_marker_path(&existing))?;
+                        self.remove_dir_if_exists(&self.layout(&existing).snapshot_dir())?;
+                        if current.committed.is_some() {
+                            current.committed = None;
+                            current.updated_at_unix_ms = now_unix_ms();
+                            self.write_record_unlocked(&current)?;
+                        }
+                    }
+                }
             }
             self.remove_file_if_exists(&alias_path)?;
         }
@@ -1324,13 +1303,7 @@ fn is_canonical_managed_layer_file_name(name: &OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::ffi::OsString;
     use std::fs;
-    use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::symlink;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::Duration;
 
     use tempfile::TempDir;
 
@@ -1343,17 +1316,13 @@ mod tests {
         SnapshotSourceKind, SnapshotType, TemplateBuildStatus,
     };
 
-    fn local_record(
-        id: SnapshotId,
-        alias: SnapshotAlias,
-        lifecycle: SnapshotLifecycle,
-    ) -> SnapshotRecord {
+    fn local_record(id: SnapshotId, lifecycle: SnapshotLifecycle) -> SnapshotRecord {
         let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
         record.id = id;
         record.snapshot_type = SnapshotType::Local;
         record.owner_node_id = Some("node-a".to_string());
         record.lifecycle = lifecycle;
-        record.alias = Some(alias);
+        record.alias = None;
         record.source = SnapshotSource::Sandbox {
             source_sandbox_id: "sandbox-a".to_string(),
         };
@@ -1403,151 +1372,6 @@ mod tests {
     }
 
     #[test]
-    fn persisted_preparing_record_is_exactly_readable_but_publicly_hidden() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("canonical-local").expect("alias should parse");
-        let preparing = local_record(
-            snapshot_id.clone(),
-            alias.clone(),
-            SnapshotLifecycle::Preparing,
-        );
-
-        persist_preparing_record(&store, &preparing);
-        store
-            .write_commit_marker(&snapshot_id)
-            .expect("commit marker should persist");
-        store
-            .write_json(
-                &PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias),
-                &snapshot_id,
-            )
-            .expect("alias binding should persist");
-
-        assert_eq!(
-            store
-                .get_record(&snapshot_id)
-                .expect("exact read should work")
-                .expect("exact read should include Preparing")
-                .lifecycle,
-            SnapshotLifecycle::Preparing
-        );
-        assert!(store
-            .get(&snapshot_id.to_string())
-            .expect("public id read should work")
-            .is_none());
-        assert!(store
-            .get(alias.as_ref())
-            .expect("public alias read should work")
-            .is_none());
-        assert!(store
-            .resolve_alias(alias.as_ref())
-            .expect("public alias resolution should work")
-            .is_none());
-        assert!(store
-            .list(SnapshotListFilter::matches_all())
-            .expect("public list should work")
-            .is_empty());
-        assert!(store.commit_marker_path(&snapshot_id).exists());
-
-        let mut ready = preparing;
-        ready.lifecycle = SnapshotLifecycle::Ready;
-        store
-            .commit_record(ready)
-            .expect("equivalent Ready transition should commit");
-
-        assert!(store
-            .get(&snapshot_id.to_string())
-            .expect("public id read should work")
-            .is_some());
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("public alias resolution should work"),
-            Some(snapshot_id.clone())
-        );
-        assert_eq!(
-            store
-                .list(SnapshotListFilter::matches_all())
-                .expect("public list should work")
-                .len(),
-            1
-        );
-        assert!(store.commit_marker_path(&snapshot_id).exists());
-    }
-
-    #[test]
-    fn recovery_candidates_include_hidden_lifecycle_records() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let preparing_id = SnapshotId::generate();
-        let deleting_id = SnapshotId::generate();
-
-        let preparing = local_record(
-            preparing_id.clone(),
-            SnapshotAlias::parse("hidden-preparing").expect("alias should parse"),
-            SnapshotLifecycle::Preparing,
-        );
-        persist_preparing_record(&store, &preparing);
-
-        let mut deleting = local_record(
-            deleting_id.clone(),
-            SnapshotAlias::parse("hidden-deleting").expect("alias should parse"),
-            SnapshotLifecycle::Deleting,
-        );
-        deleting.committed = None;
-        store.ensure_layout().expect("catalog layout should exist");
-        store
-            .write_record_unlocked(&deleting)
-            .expect("deleting record should persist");
-
-        assert!(store
-            .list(SnapshotListFilter::matches_all())
-            .expect("public list should work")
-            .is_empty());
-        let candidates = store
-            .list_recovery_candidates()
-            .expect("recovery candidate list should work");
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|record| record.id.clone())
-                .collect::<HashSet<_>>(),
-            HashSet::from([preparing_id, deleting_id])
-        );
-    }
-
-    #[test]
-    fn try_start_rejects_hidden_preparing_identity() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let mut preparing = SnapshotRecord::template_waiting(
-            snapshot_id.clone(),
-            Some(SnapshotAlias::parse("hidden-start").expect("alias should parse")),
-            Default::default(),
-        );
-        preparing.lifecycle = SnapshotLifecycle::Preparing;
-        persist_preparing_record(&store, &preparing);
-
-        let error = store
-            .try_start(&snapshot_id)
-            .expect_err("hidden identities must not start template builds");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-        let unchanged = store
-            .get_record(&snapshot_id)
-            .expect("exact read should work")
-            .expect("Preparing identity should remain");
-        assert_eq!(unchanged.lifecycle, SnapshotLifecycle::Preparing);
-        assert_eq!(unchanged.revision, preparing.revision);
-        assert!(matches!(
-            unchanged.source,
-            SnapshotSource::Template { ref build } if build.status == TemplateBuildStatus::Waiting
-        ));
-    }
-
-    #[test]
     fn canonical_metadata_commit_rejects_distributed_records() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
@@ -1561,143 +1385,52 @@ mod tests {
     }
 
     #[test]
-    fn canonical_metadata_commit_rejects_preparing_input() {
+    fn canonical_local_metadata_commit_rejects_alias() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let preparing = local_record(
-            SnapshotId::generate(),
-            SnapshotAlias::parse("invalid-preparing").expect("alias should parse"),
-            SnapshotLifecycle::Preparing,
-        );
+        let mut record = local_record(SnapshotId::generate(), SnapshotLifecycle::Ready);
+        record.alias = Some(SnapshotAlias::parse("local-alias").expect("alias should parse"));
 
         let error = store
-            .commit_record(preparing)
-            .expect_err("callers must submit a complete Ready record");
+            .commit_record(record)
+            .expect_err("Local alias must not reach canonical storage");
 
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
         assert!(!PosixFsSnapshotArtifactLayout::catalog_dir(tempdir.path()).exists());
     }
 
     #[test]
-    fn equivalent_ready_metadata_retry_repairs_marker_and_alias() {
+    fn equivalent_ready_metadata_retry_repairs_commit_and_returns_canonical_record() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
         let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("repair-local").expect("alias should parse");
-        let record = local_record(snapshot_id.clone(), alias.clone(), SnapshotLifecycle::Ready);
-        store
-            .commit_record(record.clone())
-            .expect("initial Local metadata should commit");
-
-        fs::remove_file(store.commit_marker_path(&snapshot_id))
-            .expect("commit marker should exist");
-        fs::remove_file(PosixFsSnapshotArtifactLayout::alias_path(
-            tempdir.path(),
-            &alias,
-        ))
-        .expect("alias binding should exist");
-
-        store
-            .commit_record(record)
-            .expect("equivalent retry should repair the commit");
-
-        assert!(store.commit_marker_path(&snapshot_id).exists());
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("alias resolution should work"),
-            Some(snapshot_id)
-        );
-    }
-
-    #[test]
-    fn ready_metadata_repair_returns_persisted_canonical_record() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("canonical-return").expect("alias should parse");
-        let canonical = local_record(snapshot_id.clone(), alias.clone(), SnapshotLifecycle::Ready);
+        let record = local_record(snapshot_id.clone(), SnapshotLifecycle::Ready);
         let persisted_initial = store
-            .commit_record(canonical.clone())
+            .commit_record(record)
             .expect("initial Local metadata should commit");
 
         fs::remove_file(store.commit_marker_path(&snapshot_id))
             .expect("commit marker should exist");
-        fs::remove_file(PosixFsSnapshotArtifactLayout::alias_path(
-            tempdir.path(),
-            &alias,
-        ))
-        .expect("alias binding should exist");
 
+        // Updated timestamps do not change identity; the persisted canonical
+        // record wins over an equivalent retry payload.
         let mut retry = persisted_initial.clone();
-        retry.revision = persisted_initial.revision.saturating_add(9);
         retry.updated_at_unix_ms = persisted_initial.updated_at_unix_ms.saturating_add(9_999);
         let returned = store
             .commit_record(retry)
             .expect("equivalent retry should repair the commit");
+
+        assert!(store.commit_marker_path(&snapshot_id).exists());
         let persisted = store
             .get_record(&snapshot_id)
             .expect("exact read should work")
             .expect("canonical record should remain present");
-
         assert_eq!(returned.id, persisted.id);
         assert_eq!(returned.lifecycle, persisted.lifecycle);
         assert_eq!(returned.committed, persisted.committed);
-        assert_eq!(returned.revision, persisted_initial.revision);
         assert_eq!(
             returned.updated_at_unix_ms,
             persisted_initial.updated_at_unix_ms
-        );
-    }
-
-    #[test]
-    fn new_metadata_commit_upgrades_legacy_revision_zero() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let mut record = local_record(
-            SnapshotId::generate(),
-            SnapshotAlias::parse("revision-zero").expect("alias should parse"),
-            SnapshotLifecycle::Ready,
-        );
-        record.revision = 0;
-
-        let committed = store
-            .commit_record(record)
-            .expect("new metadata commit should succeed");
-        assert_eq!(committed.revision, 2);
-        assert_eq!(
-            store
-                .get_record(&committed.id)
-                .expect("exact read should work")
-                .expect("record should persist")
-                .revision,
-            2
-        );
-    }
-
-    #[test]
-    fn preparing_metadata_commit_advances_existing_revision() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("preparing-revision").expect("alias should parse");
-        let mut preparing = local_record(snapshot_id, alias, SnapshotLifecycle::Preparing);
-        preparing.revision = 7;
-        persist_preparing_record(&store, &preparing);
-
-        let mut ready = preparing.clone();
-        ready.lifecycle = SnapshotLifecycle::Ready;
-        let committed = store
-            .commit_record(ready)
-            .expect("Preparing metadata should become Ready");
-        assert_eq!(committed.revision, 8);
-        assert_eq!(
-            store
-                .get_record(&committed.id)
-                .expect("exact read should work")
-                .expect("record should persist")
-                .revision,
-            8
         );
     }
 
@@ -1730,7 +1463,6 @@ mod tests {
             .expect("exact read should work")
             .expect("the loser identity should be retained");
         assert_eq!(pending.lifecycle, SnapshotLifecycle::Preparing);
-        assert_eq!(pending.revision, 1);
         assert!(pending.committed.is_none());
         assert!(store
             .get(&loser.id.to_string())
@@ -1756,7 +1488,6 @@ mod tests {
             .expect("the exact retry should complete after alias release");
         assert_eq!(retried.id, loser.id);
         assert_eq!(retried.lifecycle, SnapshotLifecycle::Ready);
-        assert_eq!(retried.revision, 2);
         assert_eq!(
             store
                 .resolve_alias(alias.as_ref())
@@ -1766,55 +1497,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_record_match_ignores_revision_and_update_time() {
-        let mut legacy = SnapshotRecord::template_waiting(
-            SnapshotId::generate(),
-            Some(SnapshotAlias::parse("legacy-retry").expect("alias should parse")),
-            Default::default(),
-        );
-        legacy.lifecycle = SnapshotLifecycle::Preparing;
-        legacy.revision = 0;
-        legacy.updated_at_unix_ms = 1;
-
-        let mut retry = legacy.clone();
-        retry.lifecycle = SnapshotLifecycle::Ready;
-        retry.revision = 27;
-        retry.updated_at_unix_ms = 999;
-
-        assert!(legacy.same_catalog_contents(&retry));
-
-        retry.resources.cpu_count += 1;
-        assert!(!legacy.same_catalog_contents(&retry));
-    }
-
-    #[test]
-    fn template_build_mutations_increment_revision() {
+    fn template_build_mutations_persist_status() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
         let snapshot_id = SnapshotId::generate();
         let waiting = SnapshotRecord::template_waiting(
             snapshot_id.clone(),
-            Some(SnapshotAlias::parse("build-revision").expect("alias should parse")),
+            Some(SnapshotAlias::parse("build-status").expect("alias should parse")),
             Default::default(),
         );
         store.create(waiting).expect("template should be created");
-        let created = store
-            .get_record(&snapshot_id)
-            .expect("exact read should work")
-            .expect("template should exist");
-        assert_eq!(created.revision, 2);
-
-        // Simulate a legacy Ready record decoded without the revision field.
-        let mut legacy = created;
-        legacy.revision = 0;
-        store
-            .write_record_unlocked(&legacy)
-            .expect("legacy revision should persist");
 
         let started = store
             .try_start(&snapshot_id)
             .expect("waiting template should start");
-        assert_eq!(started.revision, 1);
+        assert!(matches!(
+            started.source,
+            SnapshotSource::Template { ref build }
+                if build.status == TemplateBuildStatus::Building
+        ));
 
         store
             .mark_error(
@@ -1826,7 +1527,11 @@ mod tests {
             .get_record(&snapshot_id)
             .expect("exact read should work")
             .expect("failed template should remain");
-        assert_eq!(failed.revision, 2);
+        assert!(matches!(
+            failed.source,
+            SnapshotSource::Template { ref build }
+                if build.status == TemplateBuildStatus::Error
+        ));
     }
 
     #[test]
@@ -1850,7 +1555,6 @@ mod tests {
             .get_record(&snapshot_id)
             .expect("exact read should work")
             .expect("failed template should remain");
-        assert_eq!(failed.revision, 3);
         assert!(matches!(
             failed.source,
             SnapshotSource::Template { ref build }
@@ -1859,16 +1563,18 @@ mod tests {
         ));
 
         store
-            .mark_error(&snapshot_id, reason)
+            .mark_error(&snapshot_id, reason.clone())
             .expect("repeating the same error should be idempotent");
-        assert_eq!(
+        assert!(matches!(
             store
                 .get_record(&snapshot_id)
                 .expect("exact read should work")
                 .expect("failed template should remain")
-                .revision,
-            failed.revision
-        );
+                .source,
+            SnapshotSource::Template { ref build }
+                if build.status == TemplateBuildStatus::Error
+                    && build.error_reason.as_ref() == Some(&reason)
+        ));
 
         let different = store
             .mark_error(
@@ -1896,7 +1602,6 @@ mod tests {
             .get_record(&snapshot_id)
             .expect("exact read should work")
             .expect("completed template should remain");
-        assert_eq!(completed_after.revision, completed.revision);
         assert!(matches!(
             completed_after.source,
             SnapshotSource::Template { ref build } if build.status == TemplateBuildStatus::Ready
@@ -1918,128 +1623,6 @@ mod tests {
             .expect("exact read should work")
             .expect("deleting record should remain");
         assert_eq!(unchanged.lifecycle, SnapshotLifecycle::Deleting);
-        assert_eq!(unchanged.revision, completed.revision);
-    }
-
-    #[test]
-    fn new_alias_conflict_does_not_leave_a_preparing_identity() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let alias = SnapshotAlias::parse("canonical-conflict").expect("alias should parse");
-        let existing = local_record(
-            SnapshotId::generate(),
-            alias.clone(),
-            SnapshotLifecycle::Ready,
-        );
-        store
-            .commit_record(existing.clone())
-            .expect("existing Local metadata should commit");
-
-        let candidate = local_record(
-            SnapshotId::generate(),
-            alias.clone(),
-            SnapshotLifecycle::Ready,
-        );
-        let error = store
-            .commit_record(candidate.clone())
-            .expect_err("live alias conflict must reject the new identity");
-
-        assert!(matches!(error, RepositoryError::AliasConflict { .. }));
-        assert!(store
-            .get_record(&candidate.id)
-            .expect("exact lookup should work")
-            .is_none());
-        assert!(!store.commit_marker_path(&candidate.id).exists());
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("alias resolution should work"),
-            Some(existing.id)
-        );
-    }
-
-    #[test]
-    fn alias_conflict_preserves_preparing_identity_for_exact_retry() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let alias = SnapshotAlias::parse("recover-conflict").expect("alias should parse");
-        let preparing = local_record(
-            SnapshotId::generate(),
-            alias.clone(),
-            SnapshotLifecycle::Preparing,
-        );
-        persist_preparing_record(&store, &preparing);
-        store
-            .write_commit_marker(&preparing.id)
-            .expect("simulate marker persisted before alias binding");
-
-        let conflicting = local_record(
-            SnapshotId::generate(),
-            alias.clone(),
-            SnapshotLifecycle::Ready,
-        );
-        store
-            .commit_record(conflicting.clone())
-            .expect("replacement should claim the unbound alias");
-
-        let mut ready = preparing.clone();
-        ready.lifecycle = SnapshotLifecycle::Ready;
-        let error = store
-            .commit_record(ready.clone())
-            .expect_err("conflicting recovery must be rejected");
-        assert!(matches!(error, RepositoryError::AliasConflict { .. }));
-        let preserved = store
-            .get_record(&preparing.id)
-            .expect("exact lookup should work")
-            .expect("alias conflict must preserve the Preparing identity");
-        assert_eq!(preserved.lifecycle, SnapshotLifecycle::Preparing);
-        assert!(preserved.committed.is_some());
-        assert!(store.commit_marker_path(&preparing.id).exists());
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("conflicting alias should remain intact"),
-            Some(conflicting.id.clone())
-        );
-
-        store
-            .delete_record(&conflicting.id)
-            .expect("conflicting identity should delete");
-        store
-            .commit_record(ready)
-            .expect("exact retry should complete after the conflict is gone");
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("alias resolution should work"),
-            Some(preparing.id)
-        );
-    }
-
-    #[test]
-    fn startup_reconcile_keeps_preparing_record_without_marker() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("restart-preparing").expect("alias should parse");
-        let preparing = local_record(snapshot_id.clone(), alias, SnapshotLifecycle::Preparing);
-        persist_preparing_record(&store, &preparing);
-        fs::create_dir_all(store.layout(&snapshot_id).snapshot_dir())
-            .expect("simulate a partial snapshot directory");
-
-        store
-            .reconcile_startup()
-            .expect("startup reconcile should work");
-
-        assert_eq!(
-            store
-                .get_record(&snapshot_id)
-                .expect("exact lookup should work")
-                .expect("Preparing identity should survive")
-                .lifecycle,
-            SnapshotLifecycle::Preparing
-        );
-        assert!(!store.layout(&snapshot_id).snapshot_dir().exists());
     }
 
     #[test]
@@ -2203,57 +1786,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_layer_gc_preserves_hidden_preparing_record_references() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let layer = |hex: char| ManagedLayer {
-            digest: format!("sha256:{}", hex.to_string().repeat(64)),
-            size: 1,
-            uuid: None,
-        };
-        let referenced = layer('a');
-        let orphan = layer('b');
-        let managed_dir = PosixFsSnapshotArtifactLayout::managed_layers_dir(tempdir.path());
-        fs::create_dir_all(&managed_dir).expect("managed layer directory should exist");
-        for managed in [&referenced, &orphan] {
-            fs::write(
-                PosixFsSnapshotArtifactLayout::managed_layer_path(tempdir.path(), &managed.digest),
-                b"layer",
-            )
-            .expect("managed layer should write");
-        }
-
-        let mut preparing = local_record(
-            SnapshotId::generate(),
-            SnapshotAlias::parse("gc-preparing").expect("alias should parse"),
-            SnapshotLifecycle::Preparing,
-        );
-        preparing
-            .committed
-            .as_mut()
-            .expect("local record should have committed metadata")
-            .rootfs_layers
-            .push(OverlaybdLayerRef::Managed(referenced.clone()));
-        persist_preparing_record(&store, &preparing);
-
-        assert_eq!(
-            store
-                .gc_unreferenced_managed_layers()
-                .expect("GC should work"),
-            1
-        );
-        assert!(PosixFsSnapshotArtifactLayout::managed_layer_path(
-            tempdir.path(),
-            &referenced.digest
-        )
-        .exists());
-        assert!(
-            !PosixFsSnapshotArtifactLayout::managed_layer_path(tempdir.path(), &orphan.digest)
-                .exists()
-        );
-    }
-
-    #[test]
     fn managed_layer_gc_aborts_before_sweep_when_a_record_is_unreadable() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
@@ -2273,93 +1805,6 @@ mod tests {
             .expect_err("an unreadable record must conservatively abort GC");
 
         assert!(orphan.exists());
-    }
-
-    #[test]
-    fn active_publish_session_blocks_managed_layer_gc() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let session = store
-            .begin_publish(&SnapshotId::generate())
-            .expect("publish should begin");
-        let managed_dir = PosixFsSnapshotArtifactLayout::managed_layers_dir(tempdir.path());
-        fs::create_dir_all(&managed_dir).expect("managed layer directory should exist");
-        let orphan = PosixFsSnapshotArtifactLayout::managed_layer_path(
-            tempdir.path(),
-            &format!("sha256:{}", "d".repeat(64)),
-        );
-        fs::write(&orphan, b"orphan").expect("managed layer should write");
-
-        let root = tempdir.path().to_path_buf();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (completed_tx, completed_rx) = mpsc::channel();
-        let gc_thread = std::thread::spawn(move || {
-            started_tx.send(()).expect("start signal should send");
-            completed_tx
-                .send(PosixFsCatalogStore::new(root).gc_unreferenced_managed_layers())
-                .expect("GC result should send");
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("GC thread should start");
-        assert!(matches!(
-            completed_rx.recv_timeout(Duration::from_millis(200)),
-            Err(RecvTimeoutError::Timeout)
-        ));
-        assert!(orphan.exists());
-
-        drop(session);
-        assert_eq!(
-            completed_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("GC should finish after publish releases its lock")
-                .expect("GC should succeed"),
-            1
-        );
-        gc_thread.join().expect("GC thread should join");
-        assert!(!orphan.exists());
-    }
-
-    #[test]
-    fn managed_layer_gc_retains_noncanonical_and_nonregular_entries() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let managed_dir = PosixFsSnapshotArtifactLayout::managed_layers_dir(tempdir.path());
-        fs::create_dir_all(&managed_dir).expect("managed layer directory should exist");
-        let canonical = |hex: char| {
-            managed_dir.join(format!(
-                "sha256_{}.overlaybd.commit",
-                hex.to_string().repeat(64)
-            ))
-        };
-
-        let removable = canonical('e');
-        fs::write(&removable, b"orphan").expect("canonical orphan should write");
-        let noncanonical = managed_dir.join("sharedfs_orphan.overlaybd.commit");
-        fs::write(&noncanonical, b"keep").expect("noncanonical file should write");
-        let target = managed_dir.join("symlink-target");
-        fs::write(&target, b"keep").expect("symlink target should write");
-        let symlink_path = canonical('f');
-        symlink(&target, &symlink_path).expect("symlink should write");
-        let directory = canonical('1');
-        fs::create_dir(&directory).expect("canonical-looking directory should write");
-        let mut non_utf8 = b"sha256_".to_vec();
-        non_utf8.extend(std::iter::repeat_n(b'2', 64));
-        non_utf8.extend_from_slice(b".overlaybd.commit");
-        non_utf8.push(0xff);
-        let non_utf8 = managed_dir.join(OsString::from_vec(non_utf8));
-        fs::write(&non_utf8, b"keep").expect("non-UTF8 file should write");
-
-        assert_eq!(
-            PosixFsCatalogStore::new(tempdir.path().to_path_buf())
-                .gc_unreferenced_managed_layers()
-                .expect("GC should work"),
-            1
-        );
-        assert!(!removable.exists());
-        for retained in [noncanonical, target, symlink_path, directory, non_utf8] {
-            assert!(fs::symlink_metadata(retained).is_ok());
-        }
     }
 
     #[test]
@@ -2422,487 +1867,6 @@ mod tests {
             .commit_publish(&session, metadata, committed)
             .expect("equivalent recovery should restore the marker");
         assert!(store.commit_marker_path(&snapshot_id).exists());
-    }
-
-    #[test]
-    fn canonical_ready_record_rejects_overwrite_but_allows_same_id_promotion() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("promoted-local").expect("alias should parse");
-        let local = local_record(snapshot_id.clone(), alias.clone(), SnapshotLifecycle::Ready);
-        store
-            .commit_record(local.clone())
-            .expect("Local metadata should commit");
-
-        let mut overwritten = local.clone();
-        overwritten.owner_node_id = Some("node-b".to_string());
-        let error = store
-            .commit_record(overwritten)
-            .expect_err("Ready metadata overwrite must be rejected");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-        assert_eq!(
-            store
-                .get_record(&snapshot_id)
-                .expect("exact read should work")
-                .expect("Local record should remain")
-                .owner_node_id
-                .as_deref(),
-            Some("node-a")
-        );
-
-        let promotion = SnapshotPublishMetadata {
-            id: snapshot_id.clone(),
-            snapshot_type: SnapshotType::Distributed,
-            owner_node_id: None,
-            alias: Some(alias.clone()),
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "sandbox-a".to_string(),
-            },
-            resources: local.resources,
-            ..SnapshotPublishMetadata::mock()
-        };
-        let mut invalid_promotion = promotion.clone();
-        invalid_promotion.source = SnapshotPublishSource::Sandbox {
-            source_sandbox_id: "sandbox-b".to_string(),
-        };
-        let invalid_session = store
-            .begin_publish(&snapshot_id)
-            .expect("invalid promotion should acquire the record lock");
-        let error = store
-            .commit_publish(
-                &invalid_session,
-                invalid_promotion,
-                CommittedSnapshot::mock(),
-            )
-            .expect_err("promotion must not overwrite provenance");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-        drop(invalid_session);
-        let unchanged = store
-            .get_record(&snapshot_id)
-            .expect("exact read should work")
-            .expect("Local record should survive failed promotion");
-        assert_eq!(unchanged.snapshot_type, SnapshotType::Local);
-        assert_eq!(unchanged.owner_node_id.as_deref(), Some("node-a"));
-        assert!(store.commit_marker_path(&snapshot_id).exists());
-
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("promotion should begin");
-        let promoted = store
-            .commit_publish(&session, promotion, CommittedSnapshot::mock())
-            .expect("Local record should promote in place");
-
-        assert_eq!(promoted.id, snapshot_id);
-        assert_eq!(promoted.alias.as_ref(), Some(&alias));
-        assert_eq!(promoted.snapshot_type, SnapshotType::Distributed);
-        assert!(promoted.owner_node_id.is_none());
-        assert_eq!(promoted.lifecycle, SnapshotLifecycle::Ready);
-        assert!(store.commit_marker_path(&promoted.id).exists());
-
-        drop(session);
-        let retry_session = store
-            .begin_publish(&promoted.id)
-            .expect("idempotent retry should acquire the record lock");
-        let existing = store
-            .validate_publish_transition(
-                &retry_session,
-                &SnapshotPublishMetadata {
-                    id: promoted.id.clone(),
-                    snapshot_type: SnapshotType::Distributed,
-                    owner_node_id: None,
-                    alias: promoted.alias.clone(),
-                    source: SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: "sandbox-a".to_string(),
-                    },
-                    resources: promoted.resources,
-                    ..SnapshotPublishMetadata::mock()
-                },
-            )
-            .expect("idempotent retry should validate")
-            .expect("idempotent retry should return the existing record");
-        assert_eq!(existing.id, promoted.id);
-        assert_eq!(existing.snapshot_type, SnapshotType::Distributed);
-    }
-
-    #[test]
-    fn failed_commit_restores_pending_template_identity() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("pending-template").expect("alias should parse");
-        store
-            .create(SnapshotRecord::template_waiting(
-                snapshot_id.clone(),
-                Some(alias.clone()),
-                Default::default(),
-            ))
-            .expect("pending template should be created");
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("publish should begin");
-        let snapshot_dir = store.layout(&snapshot_id).snapshot_dir();
-        std::fs::remove_dir_all(&snapshot_dir).expect("staging directory should be removable");
-        std::fs::write(&snapshot_dir, b"block commit marker")
-            .expect("marker parent should be replaced with a file");
-
-        store
-            .commit_publish(
-                &session,
-                committed_metadata(
-                    snapshot_id.clone(),
-                    alias.as_ref(),
-                    SnapshotPublishSource::Template,
-                ),
-                CommittedSnapshot::mock(),
-            )
-            .expect_err("commit marker creation should fail");
-
-        let restored = store
-            .get(alias.as_ref())
-            .expect("pending template lookup should work")
-            .expect("failed publication must preserve the pending template and alias");
-        assert!(restored.committed.is_none());
-        assert!(matches!(
-            restored.source,
-            SnapshotSource::Template { ref build }
-                if build.status == TemplateBuildStatus::Waiting
-        ));
-    }
-
-    #[test]
-    fn marker_before_record_preserves_pending_template_on_restart() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("restart-safe-template").expect("alias should parse");
-        store
-            .create(SnapshotRecord::template_waiting(
-                snapshot_id.clone(),
-                Some(alias.clone()),
-                Default::default(),
-            ))
-            .expect("pending template should be created");
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("begin should work");
-        store
-            .write_commit_marker(&snapshot_id)
-            .expect("commit marker should write");
-
-        let pending = store
-            .get(alias.as_ref())
-            .expect("pending template lookup should work")
-            .expect("marker alone must not replace the pending template");
-        assert!(pending.committed.is_none());
-
-        store
-            .reconcile_startup()
-            .expect("active startup reconcile should work");
-        assert!(
-            PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id)
-                .snapshot_dir()
-                .exists()
-        );
-
-        // Simulate a publisher exiting after the marker but before the atomic
-        // record replacement. Reconciliation removes only staged artifacts.
-        drop(session);
-        store
-            .reconcile_startup()
-            .expect("startup reconcile should work");
-        assert!(
-            !PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id)
-                .snapshot_dir()
-                .exists()
-        );
-        let pending = store
-            .get(alias.as_ref())
-            .expect("pending template lookup after reconcile should work")
-            .expect("pending template identity and alias must survive restart");
-        assert!(pending.committed.is_none());
-    }
-
-    #[test]
-    fn hidden_record_keeps_alias_reserved_until_delete_finishes() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let alias = "delete-in-progress";
-        let original_id = commit_record(
-            &store,
-            committed_metadata(
-                SnapshotId::generate(),
-                alias,
-                SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: "sandbox".to_string(),
-                },
-            ),
-        );
-        std::fs::remove_file(store.commit_marker_path(&original_id))
-            .expect("record should be hidden while delete is incomplete");
-
-        let replacement_id = SnapshotId::generate();
-        let session = store
-            .begin_publish(&replacement_id)
-            .expect("replacement publish should begin");
-        let error = store
-            .commit_publish(
-                &session,
-                committed_metadata(
-                    replacement_id.clone(),
-                    alias,
-                    SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: "sandbox".to_string(),
-                    },
-                ),
-                CommittedSnapshot::mock(),
-            )
-            .expect_err("an incomplete delete must retain its alias reservation");
-
-        assert!(matches!(
-            error,
-            RepositoryError::AliasConflict {
-                existing,
-                new_id,
-                ..
-            } if existing == original_id && new_id == replacement_id
-        ));
-        assert_eq!(
-            store
-                .load_alias_target(&SnapshotAlias::parse(alias).expect("alias should remain valid"))
-                .expect("alias lookup should work"),
-            Some(original_id)
-        );
-    }
-
-    #[test]
-    fn deleting_tombstone_rejects_publish_transition() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("deleting-tombstone").expect("alias should parse");
-        let mut tombstone = SnapshotRecord::template_waiting(
-            snapshot_id.clone(),
-            Some(alias.clone()),
-            Default::default(),
-        );
-        tombstone.lifecycle = SnapshotLifecycle::Deleting;
-        store.ensure_layout().expect("catalog layout should exist");
-        store
-            .write_record_unlocked(&tombstone)
-            .expect("tombstone should persist");
-
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("publish should acquire the identity lock");
-        let error = store
-            .validate_publish_transition(
-                &session,
-                &SnapshotPublishMetadata {
-                    id: snapshot_id,
-                    alias: Some(alias),
-                    source: SnapshotPublishSource::Template,
-                    ..SnapshotPublishMetadata::mock()
-                },
-            )
-            .expect_err("a deleting identity must not be resurrected");
-        assert!(matches!(
-            error,
-            RepositoryError::ConcurrentModification { .. }
-        ));
-        store
-            .abort_publish(&session)
-            .expect("rejected publish staging should be cleaned");
-    }
-
-    #[test]
-    fn delete_fences_identity_and_releases_alias_after_cleanup() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("delete-fence").expect("alias should parse");
-
-        store
-            .create(SnapshotRecord::template_waiting(
-                snapshot_id.clone(),
-                Some(alias.clone()),
-                Default::default(),
-            ))
-            .expect("template identity should be created");
-        store
-            .delete_record(&snapshot_id)
-            .expect("delete should complete");
-
-        let tombstone = store
-            .get_record(&snapshot_id)
-            .expect("terminal identity lookup should work")
-            .expect("delete should retain a terminal identity tombstone");
-        assert_eq!(tombstone.lifecycle, SnapshotLifecycle::Deleting);
-        assert!(tombstone.committed.is_none());
-        assert!(store
-            .get(&snapshot_id.to_string())
-            .expect("public lookup should work")
-            .is_none());
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("deleted alias lookup should work"),
-            None
-        );
-        assert!(!PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias).exists());
-
-        // Simulate a crash after the terminal tombstone was durable but
-        // before alias cleanup. A retry must remove only this stale binding,
-        // making the alias safe to reclaim by a different identity.
-        store
-            .write_json(
-                &PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias),
-                &snapshot_id,
-            )
-            .expect("stale alias should be writable for the crash simulation");
-        let replacement_id = SnapshotId::generate();
-        store
-            .create(SnapshotRecord::template_waiting(
-                replacement_id.clone(),
-                Some(alias.clone()),
-                Default::default(),
-            ))
-            .expect("a different identity should reclaim a stale tombstone alias");
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("rebound alias lookup should work"),
-            Some(replacement_id.clone())
-        );
-        store
-            .delete_record(&snapshot_id)
-            .expect("retry should not remove a newer alias binding");
-        assert_eq!(
-            store
-                .resolve_alias(alias.as_ref())
-                .expect("new alias binding should remain"),
-            Some(replacement_id)
-        );
-
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("late publisher should acquire the identity lock");
-        let error = store
-            .commit_publish(
-                &session,
-                committed_metadata(
-                    snapshot_id.clone(),
-                    alias.as_ref(),
-                    SnapshotPublishSource::Template,
-                ),
-                CommittedSnapshot::mock(),
-            )
-            .expect_err("late publish must not resurrect a deleted identity");
-        assert!(matches!(
-            error,
-            RepositoryError::ConcurrentModification { .. }
-        ));
-        store
-            .abort_publish(&session)
-            .expect("failed late publish staging should be cleaned");
-    }
-
-    #[test]
-    fn active_record_lock_cannot_be_stolen_from_an_old_lock_file() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let snapshot_id = SnapshotId::generate();
-        let session = store
-            .begin_publish(&snapshot_id)
-            .expect("publish should hold the record lock");
-        let lock_path =
-            PosixFsSnapshotArtifactLayout::record_lock_path(tempdir.path(), &snapshot_id);
-        std::fs::File::options()
-            .write(true)
-            .open(&lock_path)
-            .expect("record lock file should exist")
-            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
-            .expect("record lock mtime should be adjustable");
-
-        assert!(store
-            .try_acquire_record_lock(&snapshot_id)
-            .expect("competing lock attempt should be observable")
-            .is_none());
-
-        drop(session);
-        assert!(store
-            .try_acquire_record_lock(&snapshot_id)
-            .expect("orphaned lock path should remain reusable")
-            .is_some());
-    }
-
-    #[test]
-    fn reconcile_does_not_remove_an_alias_rebound_by_a_live_writer() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
-        let orphan_id = commit_record(
-            &store,
-            committed_metadata(
-                SnapshotId::generate(),
-                "reconcile-race",
-                SnapshotPublishSource::Template,
-            ),
-        );
-        std::fs::remove_file(store.commit_marker_path(&orphan_id))
-            .expect("orphan should be hidden before reconciliation");
-        let replacement_id = SnapshotId::generate();
-        store
-            .create(SnapshotRecord::template_waiting(
-                replacement_id.clone(),
-                None,
-                Default::default(),
-            ))
-            .expect("replacement record should exist");
-        let alias = SnapshotAlias::parse("reconcile-race").expect("alias should parse");
-        let alias_guard = store
-            .acquire_alias_lock(&alias)
-            .expect("writer should own the alias lock");
-
-        let root = tempdir.path().to_path_buf();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let reconcile = std::thread::spawn(move || {
-            result_tx
-                .send(PosixFsCatalogStore::new(root).reconcile_startup())
-                .expect("test receiver should remain available");
-        });
-        let record_path = PosixFsSnapshotArtifactLayout::record_path(tempdir.path(), &orphan_id);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while record_path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            !record_path.exists(),
-            "reconcile should reach alias cleanup"
-        );
-        assert!(matches!(
-            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-
-        store
-            .write_json(
-                &PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias),
-                &replacement_id,
-            )
-            .expect("writer should rebind the alias while holding its lock");
-        drop(alias_guard);
-        result_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("reconcile should finish after alias unlock")
-            .expect("reconcile should succeed");
-        reconcile.join().expect("reconcile thread should join");
-
-        assert_eq!(
-            store
-                .load_alias_target(&alias)
-                .expect("alias lookup should work"),
-            Some(replacement_id)
-        );
     }
 
     fn committed_metadata(

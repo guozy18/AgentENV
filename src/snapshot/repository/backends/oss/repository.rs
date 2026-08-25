@@ -19,8 +19,10 @@ use crate::snapshot::repository::backends::common::{
     overlaybd_layer_uuid, validate_attached_drives, write_dense_overlaybd_layer_to_file,
 };
 use crate::snapshot::repository::interfaces::SnapshotRepository;
-use crate::snapshot::repository::{validate_artifact_namespace, RepositoryError, RepositoryResult};
-use crate::snapshot::types::{next_revision, now_unix_ms};
+use crate::snapshot::repository::{
+    validate_legacy_artifact_namespace, RepositoryError, RepositoryResult,
+};
+use crate::snapshot::types::now_unix_ms;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotLifecycle,
@@ -45,7 +47,6 @@ pub(crate) struct OssSnapshotRepository {
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
-const MAX_RECORD_CAS_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 struct StoredRecord {
@@ -82,11 +83,11 @@ impl OssSnapshotRepository {
         match record
             .committed
             .as_ref()
-            .and_then(|committed| committed.artifact_namespace.as_deref())
+            .and_then(|committed| committed.legacy_artifact_namespace.as_deref())
         {
             Some(namespace) => {
-                validate_artifact_namespace(Some(namespace))?;
-                Ok(self.layout(&record.id).with_namespace(namespace))
+                validate_legacy_artifact_namespace(Some(namespace))?;
+                Ok(self.layout(&record.id).with_legacy_namespace(namespace))
             }
             None => Ok(self.layout(&record.id)),
         }
@@ -98,10 +99,6 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
         reason: format!("invalid alias '{alias}': {e}"),
     })?;
     Ok(OssSnapshotArtifactLayout::alias_key(alias))
-}
-
-fn new_artifact_namespace() -> String {
-    format!("attempt-{}", Uuid::now_v7())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,8 +132,7 @@ fn ready_distributed_publish_retry(
 
 /// Validates an existing catalog identity before any per-snapshot object is
 /// uploaded.  A retry must not import a different closure before this check:
-/// even with per-attempt artifact namespaces, doing so would create an
-/// unowned publish attempt and could race an earlier `Preparing` record.
+/// fixed keys are safe only after the existing logical identity matches.
 fn validate_publish_preflight(
     existing: Option<&SnapshotRecord>,
     metadata: &SnapshotPublishMetadata,
@@ -232,10 +228,8 @@ fn metadata_commit_plan(
         });
     }
 
-    // A concurrent publisher may have materialized the same logical snapshot
-    // under a different attempt namespace.  The first Ready metadata commit is
-    // the winner; a retry must return it rather than treating its private
-    // artifact namespace as a metadata conflict.
+    // An equivalent Ready record is an acknowledged or ambiguous-response
+    // retry. The persisted canonical record wins.
     if existing.lifecycle == SnapshotLifecycle::Ready
         && existing.same_logical_identity(requested)
         && existing.same_committed_logical_metadata(requested)
@@ -252,19 +246,6 @@ fn metadata_commit_plan(
     }
 
     if existing.lifecycle == SnapshotLifecycle::Preparing {
-        if existing.same_committed_logical_metadata(requested)
-            && existing.same_logical_identity(requested)
-            && existing
-                .committed
-                .as_ref()
-                .zip(requested.committed.as_ref())
-                .is_some_and(|(left, right)| left.artifact_namespace == right.artifact_namespace)
-        {
-            // A Preparing closure is already durable under one immutable
-            // attempt namespace. Resume may repair its lifecycle marker, but
-            // must never redirect the canonical record to another attempt.
-            return Ok(MetadataCommitPlan::Update);
-        }
         return Err(RepositoryError::InvalidRequest {
             reason: format!(
                 "snapshot '{}' has different Preparing metadata",
@@ -330,34 +311,6 @@ fn canonicalize_managed_layer(source: &Path) -> RepositoryResult<PathBuf> {
             error,
         )
     })
-}
-
-/// Decide whether an attempted namespace is proven unreferenced by the
-/// canonical catalog record.  A missing or unreadable record is intentionally
-/// treated as unknown: cleanup must retain the attempt until a later
-/// reconciliation pass can establish ownership safely. A terminal identity
-/// tombstone is the opposite: its delete fence proves that no attempt for the
-/// identity can become canonical.
-fn attempt_namespace_is_unreferenced(
-    canonical: RepositoryResult<Option<SnapshotRecord>>,
-    namespace: &str,
-) -> RepositoryResult<bool> {
-    let Some(record) = canonical? else {
-        return Ok(false);
-    };
-    if record.is_terminal_tombstone() {
-        // The delete fence makes every in-flight publish attempt for this
-        // identity uncommittable. Its private namespace can therefore be
-        // cleaned without touching any canonical closure or managed layer.
-        return Ok(true);
-    }
-    let Some(committed) = record.committed else {
-        return Ok(false);
-    };
-    Ok(committed
-        .artifact_namespace
-        .as_deref()
-        .is_none_or(|owned_namespace| owned_namespace != namespace))
 }
 
 fn memory_layer_digest(index: usize, layer: &LayerConfig) -> RepositoryResult<&str> {
@@ -512,100 +465,55 @@ fn fallback_to_object_storage_would_mix_sources(
 
 #[async_trait]
 impl SnapshotRepository for OssSnapshotRepository {
-    async fn create(&self, mut record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         record
             .validate_template_create()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let existing = self.read_record_state(&record.id).await?;
-            let stored = if let Some(existing) = existing {
-                if existing.record.lifecycle == SnapshotLifecycle::Deleting {
-                    return Err(RepositoryError::ConcurrentModification {
-                        resource: format!("snapshot '{}' is being deleted", record.id),
-                    });
-                }
-                if !existing.record.same_catalog_contents(&record) {
-                    return Err(RepositoryError::InvalidRequest {
-                        reason: format!(
-                            "snapshot '{}' already exists with different metadata",
-                            record.id
-                        ),
-                    });
-                }
-                if existing.record.is_ready() {
-                    self.bind_record_alias(&record).await?;
-                    return Ok(existing.record);
-                }
-                existing
-            } else if record.alias.is_none() {
-                match self.write_record(&record, None).await {
-                    Ok(_) => return Ok(record),
-                    Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                    Err(error) => return Err(error),
-                }
-            } else {
-                let preparing = preparing_record(&record);
-                match self.write_record(&preparing, None).await {
-                    Ok(etag) => StoredRecord {
-                        record: preparing,
-                        etag,
-                    },
-                    Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                    Err(error) => return Err(error),
-                }
-            };
-
-            let Some(alias) = record.alias.as_ref() else {
+        let existing = self.read_record_state(&record.id).await?;
+        let stored = if let Some(existing) = existing {
+            if existing.record.lifecycle == SnapshotLifecycle::Deleting {
+                return Err(RepositoryError::ConcurrentModification {
+                    resource: format!("snapshot '{}' is being deleted", record.id),
+                });
+            }
+            if !existing.record.same_catalog_contents(&record) {
                 return Err(RepositoryError::InvalidRequest {
                     reason: format!(
-                        "snapshot '{}' template create reservation is missing its alias",
+                        "snapshot '{}' already exists with different metadata",
                         record.id
                     ),
                 });
-            };
-            // Keep the hidden Preparing record for an exact retry. The alias
-            // conflict may be transient (the current owner can be deleted
-            // later), and no public Ready identity or artifacts exist yet
-            // that would justify fencing this SnapshotId with a tombstone.
-            self.bind_alias(alias.as_ref(), &record.id).await?;
-
-            let mut ready = record.clone();
-            ready.revision = next_revision(stored.record.revision);
-            match self.write_record(&ready, Some(&stored.etag)).await {
-                Ok(_) => return Ok(ready),
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => {
-                    // A failed response may hide a successful conditional PUT.
-                    // Re-read before rollback so an acknowledged-by-storage
-                    // Ready record is never replaced by a tombstone.
-                    match self.read_record_state(&record.id).await {
-                        Ok(Some(current))
-                            if current.record.is_ready()
-                                && current.record.same_catalog_contents(&record) =>
-                        {
-                            return Ok(current.record);
-                        }
-                        Ok(Some(_)) | Ok(None) => {
-                            // Keep the Preparing record unchanged.  A
-                            // non-conditional backend error is ambiguous, so
-                            // removing or tombstoning it could race a writer
-                            // whose commit was accepted after the error.
-                        }
-                        Err(read_error) => {
-                            warn!(
-                                snapshot_id = %record.id,
-                                error = %read_error,
-                                "retaining hidden template create record after ambiguous commit failure"
-                            );
-                        }
-                    }
-                    return Err(error);
-                }
             }
-        }
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{}'", record.id),
-        })
+            if existing.record.is_ready() {
+                self.bind_record_alias(&record).await?;
+                return Ok(existing.record);
+            }
+            existing
+        } else if record.alias.is_none() {
+            self.write_record(&record, None).await?;
+            return Ok(record);
+        } else {
+            let preparing = preparing_record(&record);
+            let etag = self.write_record(&preparing, None).await?;
+            StoredRecord {
+                record: preparing,
+                etag,
+            }
+        };
+
+        let Some(alias) = record.alias.as_ref() else {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "snapshot '{}' template create reservation is missing its alias",
+                    record.id
+                ),
+            });
+        };
+        // Keep the hidden Preparing record for an exact retry. The alias
+        // conflict may be transient (the current owner can be deleted later).
+        self.bind_alias(alias.as_ref(), &record.id).await?;
+
+        self.write_ready_record(record, Some(&stored.etag)).await
     }
 
     async fn prepare_local_capture(
@@ -682,12 +590,13 @@ impl SnapshotRepository for OssSnapshotRepository {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
+        metadata
+            .validate()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let id = &metadata.id;
-        // Non-content-addressed per-snapshot objects are isolated by an
-        // immutable attempt namespace.  This keeps concurrent publishers for
-        // one logical ID from ever sharing `vm_state` or manifest keys.
-        let artifact_namespace = new_artifact_namespace();
-        let layout = self.layout(id).with_namespace(&artifact_namespace);
+        // Snapshot IDs are system allocated and have one active artifact
+        // publisher. Retries for the same ID reuse these fixed keys.
+        let layout = self.layout(id);
 
         // 0. Validate attached-drive identity and virtual sizes.
         validate_attached_drives(&manifest)?;
@@ -789,12 +698,13 @@ impl SnapshotRepository for OssSnapshotRepository {
                 attached_drives,
                 memory_layers,
                 disk_publications: disk_publications.clone(),
-                artifact_namespace: Some(artifact_namespace.clone()),
+                legacy_artifact_namespace: None,
             };
 
             // 5. Commit metadata only after the complete artifact closure is
-            // durable. New identities remain Preparing until the alias is
-            // reserved; Local promotion keeps the previous record visible.
+            // durable. Only alias-bearing identities need Preparing while
+            // reserving their second catalog object; Local promotion keeps
+            // the previous record visible.
             let record = self.build_committed_record(&metadata, committed, previous_record.clone());
             let record = self.commit_record(record).await?;
 
@@ -805,140 +715,81 @@ impl SnapshotRepository for OssSnapshotRepository {
         let record = match publish_result {
             Ok(record) => record,
             Err(error) => {
-                // The attempt namespace is never shared by another publisher.
-                // Clean it only when the canonical record does not reference
-                // it; a lost commit response therefore remains safe.
-                // Distinguish an absent record from an unreadable catalog.
-                // If the read fails, this attempt may already be canonical;
-                // deleting its private namespace would destroy a successful
-                // commit during a transient OSS outage.
-                match attempt_namespace_is_unreferenced(
-                    self.read_record(id).await,
-                    &artifact_namespace,
-                ) {
-                    Ok(unreferenced) => {
-                        if unreferenced {
-                            if let Err(cleanup_error) =
-                                self.client.delete_prefix(&layout.artifact_prefix()).await
-                            {
-                                warn!(
-                                    snapshot_id = %id,
-                                    error = %cleanup_error,
-                                    "failed to clean unreferenced snapshot publish attempt"
-                                );
-                            }
-                            // ACR publications are addressed by a registry-wide
-                            // manifest digest, while the publication tag is shared
-                            // by retries of the same SnapshotId.  A failed publisher
-                            // cannot atomically prove that no concurrent publisher
-                            // has committed the same digest between its catalog read
-                            // and a registry DELETE.  Never roll back here: retaining
-                            // the publication is safe, and a catalog-aware registry
-                            // GC can reclaim it once no Ready record references it.
-                            if !disk_publications.is_empty() {
-                                warn!(
-                                    snapshot_id = %id,
-                                    publications = disk_publications.len(),
-                                    "retaining ACR publications after failed publish; ownership is not atomically provable"
-                                );
-                            }
-                        } else {
-                            warn!(
-                                snapshot_id = %id,
-                                namespace = %artifact_namespace,
-                                "retaining failed publish attempt because catalog ownership is not proven"
-                            );
-                        }
-                    }
+                // A failed response can hide a successful metadata commit.
+                // Delete fixed artifacts only when a fresh canonical read
+                // proves that no record was ever created.
+                let cleanup_fixed = match self.read_record(id).await {
+                    Ok(None) => true,
+                    Ok(Some(record)) => record.lifecycle == SnapshotLifecycle::Deleting,
                     Err(read_error) => {
                         warn!(
                             snapshot_id = %id,
                             error = %read_error,
-                            "retaining failed publish artifacts because canonical OSS record could not be read"
+                            "retaining fixed snapshot artifacts because canonical ownership is unknown"
+                        );
+                        false
+                    }
+                };
+                if cleanup_fixed {
+                    if let Err(cleanup_error) =
+                        self.client.delete_prefix(&layout.artifact_prefix()).await
+                    {
+                        warn!(
+                            snapshot_id = %id,
+                            error = %cleanup_error,
+                            "failed to clean unowned fixed snapshot artifacts"
                         );
                     }
+                }
+                if !disk_publications.is_empty() {
+                    warn!(
+                        snapshot_id = %id,
+                        publications = disk_publications.len(),
+                        "retaining ACR publications after failed publish; ownership is not atomically provable"
+                    );
                 }
                 warn!(
                     snapshot_id = %id,
                     error = %error,
-                    "retaining OSS snapshot artifacts after publish failure for exact retry or reconciliation"
+                    "OSS snapshot publication failed"
                 );
                 return Err(error);
             }
         };
-
-        // A concurrent publisher may have won the catalog CAS with another
-        // attempt namespace.  Its logical record is the successful result for
-        // this caller, but this attempt's non-content-addressed objects are no
-        // longer reachable and must not accumulate indefinitely.  The
-        // namespace is private to this publisher, so deleting only its prefix
-        // cannot affect the canonical winner or shared managed layers.
-        let canonical_namespace = record
-            .committed
-            .as_ref()
-            .and_then(|committed| committed.artifact_namespace.as_deref());
-        if canonical_namespace != Some(artifact_namespace.as_str()) {
-            if let Err(cleanup_error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                warn!(
-                    snapshot_id = %id,
-                    namespace = %artifact_namespace,
-                    error = %cleanup_error,
-                    "failed to clean losing snapshot publish attempt"
-                );
-            }
-        }
 
         debug!(snapshot_id = %id, "published snapshot to oss");
         Ok(record)
     }
 
     async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let existing = self.read_record_state(&record.id).await?;
-            let plan =
-                metadata_commit_plan(existing.as_ref().map(|stored| &stored.record), &record)?;
+        let existing = self.read_record_state(&record.id).await?;
+        let plan = metadata_commit_plan(existing.as_ref().map(|stored| &stored.record), &record)?;
 
-            let stored = match plan {
-                MetadataCommitPlan::AlreadyCommitted => {
-                    self.bind_record_alias(&record).await?;
-                    return Ok(existing
-                        .expect("commit plan requires an existing record")
-                        .record);
-                }
-                MetadataCommitPlan::Create => {
-                    let mut preparing = preparing_record(&record);
-                    preparing.revision = preparing.revision.max(1);
-                    let preparing_etag = match self.write_record(&preparing, None).await {
-                        Ok(etag) => etag,
-                        Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    StoredRecord {
-                        record: preparing,
-                        etag: preparing_etag,
-                    }
-                }
-                MetadataCommitPlan::Update => {
-                    existing.expect("non-create commit plan requires record")
-                }
-            };
-
-            // Keep the alias hidden until the final Ready CAS succeeds. A
-            // retry observes the same Preparing record and reuses its
-            // immutable closure rather than recapturing artifacts.
-            self.bind_record_alias(&record).await?;
-            let mut ready = record.clone();
-            ready.revision = next_revision(stored.record.revision);
-            match self.write_record(&ready, Some(&stored.etag)).await {
-                Ok(_) => return Ok(ready),
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => return Err(error),
+        let stored = match plan {
+            MetadataCommitPlan::AlreadyCommitted => {
+                self.bind_record_alias(&record).await?;
+                return Ok(existing
+                    .expect("commit plan requires an existing record")
+                    .record);
             }
-        }
+            MetadataCommitPlan::Create => {
+                if record.alias.is_none() {
+                    return self.write_ready_record(record, None).await;
+                }
+                let preparing = preparing_record(&record);
+                let etag = self.write_record(&preparing, None).await?;
+                StoredRecord {
+                    record: preparing,
+                    etag,
+                }
+            }
+            MetadataCommitPlan::Update => existing.expect("non-create commit plan requires record"),
+        };
 
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{}'", record.id),
-        })
+        // Keep the alias hidden until the final Ready CAS succeeds. A caller
+        // retry re-reads the same Preparing record and completes it.
+        self.bind_record_alias(&record).await?;
+        self.write_ready_record(record, Some(&stored.etag)).await
     }
 
     async fn get_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -1078,25 +929,18 @@ impl SnapshotRepository for OssSnapshotRepository {
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let stored = self.read_record_state(id).await?.ok_or_else(|| {
-                RepositoryError::SnapshotNotFound {
+        let stored =
+            self.read_record_state(id)
+                .await?
+                .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
-                }
-            })?;
-            let mut record = stored.record.clone();
-            record
-                .start_template_build(now_unix_ms())
-                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-            match self.write_record(&record, Some(&stored.etag)).await {
-                Ok(_) => return Ok(record),
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{id}'"),
-        })
+                })?;
+        let mut record = stored.record;
+        record
+            .start_template_build(now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        self.write_record(&record, Some(&stored.etag)).await?;
+        Ok(record)
     }
 
     async fn mark_build_error(
@@ -1104,28 +948,20 @@ impl SnapshotRepository for OssSnapshotRepository {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let stored = self.read_record_state(id).await?.ok_or_else(|| {
-                RepositoryError::SnapshotNotFound {
+        let stored =
+            self.read_record_state(id)
+                .await?
+                .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
-                }
-            })?;
-            let mut record = stored.record.clone();
-            let changed = record
-                .mark_template_build_error(&reason, now_unix_ms())
-                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-            if !changed {
-                return Ok(());
-            }
-            match self.write_record(&record, Some(&stored.etag)).await {
-                Ok(_) => return Ok(()),
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => return Err(error),
-            }
+                })?;
+        let mut record = stored.record;
+        let changed = record
+            .mark_template_build_error(&reason, now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        if changed {
+            self.write_record(&record, Some(&stored.etag)).await?;
         }
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{id}'"),
-        })
+        Ok(())
     }
 }
 
@@ -1166,42 +1002,25 @@ impl OssSnapshotRepository {
             .map_err(|error| RepositoryError::backend("delete oss snapshot artifacts", error))?;
 
         // Retain a tiny hidden terminal record instead of deleting the catalog
-        // key.  This is an identity tombstone: no future writer may reuse the
-        // same SnapshotId, while alias reclamation can still replace the
-        // stale alias object by ETag CAS.
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let Some(current) = self.read_record_state(id).await? else {
-                return Ok(());
-            };
-            if current.record.lifecycle == SnapshotLifecycle::Deleting
-                && current.record.committed.is_none()
-            {
-                return Ok(());
-            }
-            if current.record.lifecycle != SnapshotLifecycle::Deleting
-                || current.record.revision != record.revision
-            {
-                return Err(RepositoryError::ConcurrentModification {
-                    resource: format!("snapshot record '{id}'"),
-                });
-            }
-            let mut terminal = current.record.clone();
-            terminal.committed = None;
-            terminal.updated_at_unix_ms = now_unix_ms();
-            terminal.revision = next_revision(current.record.revision);
-            match self.write_record(&terminal, Some(&current.etag)).await {
-                Ok(_) => {
-                    debug!(snapshot_id = %id, "deleted snapshot artifacts and retained identity tombstone");
-                    return Ok(());
-                }
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => return Err(error),
-            }
+        // key. This fences late Template publishers until build/delete writer
+        // ownership is coordinated explicitly.
+        let Some(current) = self.read_record_state(id).await? else {
+            return Ok(());
+        };
+        if current.record.is_terminal_tombstone() {
+            return Ok(());
         }
-
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{id}'"),
-        })
+        if current.record.lifecycle != SnapshotLifecycle::Deleting {
+            return Err(RepositoryError::ConcurrentModification {
+                resource: format!("snapshot record '{id}'"),
+            });
+        }
+        let mut terminal = current.record;
+        terminal.committed = None;
+        terminal.updated_at_unix_ms = now_unix_ms();
+        self.write_record(&terminal, Some(&current.etag)).await?;
+        debug!(snapshot_id = %id, "deleted snapshot artifacts and retained identity tombstone");
+        Ok(())
     }
 
     async fn begin_delete(
@@ -1209,36 +1028,25 @@ impl OssSnapshotRepository {
         id: &SnapshotId,
         expected_etag: Option<&str>,
     ) -> RepositoryResult<Option<StoredRecord>> {
-        for _attempt in 0..MAX_RECORD_CAS_ATTEMPTS {
-            let Some(stored) = self.read_record_state(id).await? else {
-                return Ok(None);
-            };
-            if expected_etag.is_some_and(|expected| expected != stored.etag) {
-                return Err(RepositoryError::ConcurrentModification {
-                    resource: format!("snapshot record '{id}'"),
-                });
-            }
-            if stored.record.lifecycle == SnapshotLifecycle::Deleting {
-                return Ok(Some(stored));
-            }
-            let mut deleting = stored.record.clone();
-            deleting.lifecycle = SnapshotLifecycle::Deleting;
-            deleting.updated_at_unix_ms = now_unix_ms();
-            deleting.revision = next_revision(stored.record.revision);
-            match self.write_record(&deleting, Some(&stored.etag)).await {
-                Ok(etag) => {
-                    return Ok(Some(StoredRecord {
-                        record: deleting,
-                        etag,
-                    }))
-                }
-                Err(RepositoryError::ConcurrentModification { .. }) => continue,
-                Err(error) => return Err(error),
-            }
+        let Some(stored) = self.read_record_state(id).await? else {
+            return Ok(None);
+        };
+        if expected_etag.is_some_and(|expected| expected != stored.etag) {
+            return Err(RepositoryError::ConcurrentModification {
+                resource: format!("snapshot record '{id}'"),
+            });
         }
-        Err(RepositoryError::ConcurrentModification {
-            resource: format!("snapshot record '{id}'"),
-        })
+        if stored.record.lifecycle == SnapshotLifecycle::Deleting {
+            return Ok(Some(stored));
+        }
+        let mut deleting = stored.record;
+        deleting.lifecycle = SnapshotLifecycle::Deleting;
+        deleting.updated_at_unix_ms = now_unix_ms();
+        let etag = self.write_record(&deleting, Some(&stored.etag)).await?;
+        Ok(Some(StoredRecord {
+            record: deleting,
+            etag,
+        }))
     }
 
     async fn read_record_state(&self, id: &SnapshotId) -> RepositoryResult<Option<StoredRecord>> {
@@ -1332,6 +1140,34 @@ impl OssSnapshotRepository {
         .await
     }
 
+    async fn write_ready_record(
+        &self,
+        record: SnapshotRecord,
+        expected_etag: Option<&str>,
+    ) -> RepositoryResult<SnapshotRecord> {
+        match self.write_record(&record, expected_etag).await {
+            Ok(_) => Ok(record),
+            Err(error @ RepositoryError::ConcurrentModification { .. }) => Err(error),
+            Err(error) => match self.read_record_state(&record.id).await {
+                Ok(Some(current))
+                    if current.record.is_ready()
+                        && current.record.same_catalog_contents(&record) =>
+                {
+                    Ok(current.record)
+                }
+                Ok(Some(_)) | Ok(None) => Err(error),
+                Err(read_error) => {
+                    warn!(
+                        snapshot_id = %record.id,
+                        error = %read_error,
+                        "could not verify an ambiguous Ready metadata commit"
+                    );
+                    Err(error)
+                }
+            },
+        }
+    }
+
     async fn read_alias_state(&self, alias: &str) -> RepositoryResult<Option<StoredAlias>> {
         let key = validated_alias_key(alias)?;
         let Some(etag) = self
@@ -1405,10 +1241,10 @@ impl OssSnapshotRepository {
     /// The algorithm is:
     ///   1. Read the current alias target.
     ///   2. If it already points to `id`, return success (idempotent).
-    ///   3. If it points to a live snapshot, return `AliasConflict`.
-    ///   4. If it points to a terminal identity tombstone, replace the alias
-    ///      with an ETag CAS; an in-progress deletion remains a conflict.
-    ///   5. Write our binding only when the ETag read in step 1 still matches.
+    ///   3. If it points to a Ready snapshot, return `AliasConflict`.
+    ///   4. Fence a superseded Preparing target with its record ETag; Deleting
+    ///      and missing targets are already reclaimable.
+    ///   5. Write our binding only when the alias ETag from step 1 still matches.
     ///
     /// A backend without conditional writes fails closed in
     /// [`OssClient::put_bytes_if_match`]; it must not silently fall back to an
@@ -1464,15 +1300,38 @@ impl OssSnapshotRepository {
                 }
             }
 
-            // Preparing and Deleting records reserve the identity. Only an
-            // alias whose target record is truly absent can be reclaimed.
-            if let Some(target) = self.read_record_state(&existing.target).await? {
-                if !target.record.is_terminal_tombstone() {
+            if let Some(mut target) = self.read_record_state(&existing.target).await? {
+                let claims_alias = target
+                    .record
+                    .alias
+                    .as_ref()
+                    .is_some_and(|target_alias| target_alias.as_ref() == alias);
+                if claims_alias && target.record.is_ready() {
                     return Err(RepositoryError::AliasConflict {
                         alias: alias.to_string(),
                         existing: existing.target,
                         new_id: id.clone(),
                     });
+                }
+                if claims_alias && target.record.lifecycle == SnapshotLifecycle::Preparing {
+                    let mut deleting = target.record;
+                    deleting.lifecycle = SnapshotLifecycle::Deleting;
+                    deleting.updated_at_unix_ms = now_unix_ms();
+                    let etag = match self.write_record(&deleting, Some(&target.etag)).await {
+                        Ok(etag) => etag,
+                        Err(RepositoryError::ConcurrentModification { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    target = StoredRecord {
+                        record: deleting,
+                        etag,
+                    };
+                }
+                if claims_alias && target.record.lifecycle == SnapshotLifecycle::Deleting {
+                    // Cleanup owns the lifecycle until it reaches the terminal
+                    // fence; do not make the alias available while artifacts
+                    // have no future retry owner.
+                    self.delete_record(target).await?;
                 }
             }
 
@@ -1994,11 +1853,10 @@ mod tests {
     fn local_record() -> SnapshotRecord {
         SnapshotRecord {
             id: SnapshotId::generate(),
-            revision: 1,
             snapshot_type: SnapshotType::Local,
             owner_node_id: Some("node-a".to_string()),
             lifecycle: SnapshotLifecycle::Ready,
-            alias: Some(SnapshotAlias::parse("snapshot-a").expect("valid alias")),
+            alias: None,
             source: SnapshotSource::Sandbox {
                 source_sandbox_id: "sandbox-a".to_string(),
             },
@@ -2034,23 +1892,6 @@ mod tests {
     }
 
     #[test]
-    fn new_metadata_commit_starts_hidden_and_preparing_retry_resumes() {
-        let ready = local_record();
-        assert_eq!(
-            metadata_commit_plan(None, &ready).expect("new commit plan"),
-            MetadataCommitPlan::Create
-        );
-
-        let mut preparing = preparing_record(&ready);
-        preparing.updated_at_unix_ms = ready.updated_at_unix_ms - 1;
-        assert_eq!(preparing.lifecycle, SnapshotLifecycle::Preparing);
-        assert_eq!(
-            metadata_commit_plan(Some(&preparing), &ready).expect("retry plan"),
-            MetadataCommitPlan::Update
-        );
-    }
-
-    #[test]
     fn publish_preflight_rejects_changed_preparing_metadata_before_artifact_import() {
         let ready = local_record();
         let mut preparing = preparing_record(&ready);
@@ -2065,38 +1906,6 @@ mod tests {
         changed.context.workdir = "/different".to_string();
         let error = validate_publish_preflight(Some(&preparing), &changed)
             .expect_err("changed Preparing metadata must fail before upload");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-    }
-
-    #[test]
-    fn publish_preflight_rejects_changed_pending_template_identity_before_artifact_import() {
-        let id = SnapshotId::generate();
-        let alias = SnapshotAlias::parse("pending-template").expect("valid alias");
-        let resources = crate::types::SandboxResources {
-            disk_size_mib: 0,
-            ..Default::default()
-        };
-        let pending = SnapshotRecord::template_waiting(id.clone(), Some(alias.clone()), resources);
-        let metadata = SnapshotPublishMetadata {
-            id,
-            alias: Some(alias),
-            resources,
-            ..SnapshotPublishMetadata::mock()
-        };
-
-        validate_publish_preflight(Some(&pending), &metadata)
-            .expect("equivalent pending template retry should be allowed");
-
-        let mut changed_alias = metadata.clone();
-        changed_alias.alias = Some(SnapshotAlias::parse("different").expect("valid alias"));
-        let error = validate_publish_preflight(Some(&pending), &changed_alias)
-            .expect_err("changed pending alias must fail before upload");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-
-        let mut changed_cpu = metadata;
-        changed_cpu.resources.cpu_count += 1;
-        let error = validate_publish_preflight(Some(&pending), &changed_cpu)
-            .expect_err("changed pending CPU must fail before upload");
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
@@ -2182,67 +1991,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_commit_preserves_template_completion() {
-        let id = SnapshotId::generate();
-        let pending_resources = crate::types::SandboxResources {
-            disk_size_mib: 0,
-            ..Default::default()
-        };
-        let mut waiting = SnapshotRecord::template_waiting(
-            id,
-            Some(SnapshotAlias::parse("template-a").expect("valid alias")),
-            pending_resources,
-        );
-        waiting.created_at_unix_ms = 1;
-        waiting.updated_at_unix_ms = 1;
-
-        let mut completed = waiting.clone();
-        let mut completed_resources = pending_resources;
-        completed_resources.disk_size_mib = 2048;
-        let metadata = SnapshotPublishMetadata {
-            id: waiting.id.clone(),
-            alias: waiting.alias.clone(),
-            resources: completed_resources,
-            ..SnapshotPublishMetadata::mock()
-        };
-        completed.mark_committed(&metadata, CommittedSnapshot::mock(), 2);
-
-        assert_eq!(
-            metadata_commit_plan(Some(&waiting), &completed).expect("template completion plan"),
-            MetadataCommitPlan::Update
-        );
-
-        let mut changed_cpu = completed;
-        changed_cpu.resources.cpu_count += 1;
-        let error = metadata_commit_plan(Some(&waiting), &changed_cpu)
-            .expect_err("template completion must preserve requested CPU");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-    }
-
-    #[test]
-    fn preparing_resume_rejects_a_changed_artifact_namespace() {
-        let ready = local_record();
-        let mut preparing = preparing_record(&ready);
-        preparing
-            .committed
-            .as_mut()
-            .expect("local record is committed")
-            .artifact_namespace = Some("attempt-a".to_string());
-
-        let mut changed = preparing.clone();
-        changed.lifecycle = SnapshotLifecycle::Ready;
-        changed
-            .committed
-            .as_mut()
-            .expect("local record is committed")
-            .artifact_namespace = Some("attempt-b".to_string());
-
-        let error = metadata_commit_plan(Some(&preparing), &changed)
-            .expect_err("a retry must not redirect to another artifact namespace");
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-    }
-
-    #[test]
     fn legacy_record_without_lifecycle_is_ready() {
         let record = local_record();
         let mut value = serde_json::to_value(record).expect("serialize record");
@@ -2253,57 +2001,6 @@ mod tests {
 
         let decoded: SnapshotRecord = serde_json::from_value(value).expect("decode legacy record");
         assert!(decoded.is_ready());
-    }
-
-    #[test]
-    fn terminal_tombstone_is_distinct_from_in_progress_delete() {
-        let mut record = local_record();
-        record.lifecycle = SnapshotLifecycle::Deleting;
-        assert!(!record.is_terminal_tombstone());
-
-        record.committed = None;
-        assert!(record.is_terminal_tombstone());
-    }
-
-    #[test]
-    fn publish_cleanup_requires_proven_unreferenced_catalog_state() {
-        let mut record = local_record();
-        record
-            .committed
-            .as_mut()
-            .expect("local record is committed")
-            .artifact_namespace = Some("attempt-a".to_string());
-
-        assert!(
-            !attempt_namespace_is_unreferenced(Ok(Some(record.clone())), "attempt-a")
-                .expect("matching namespace must be retained")
-        );
-        assert!(
-            attempt_namespace_is_unreferenced(Ok(Some(record)), "attempt-b")
-                .expect("different namespace should be proven unreferenced")
-        );
-        assert!(!attempt_namespace_is_unreferenced(Ok(None), "attempt-a")
-            .expect("missing record must be retained until ownership is known"));
-
-        let mut tombstone = local_record();
-        tombstone.lifecycle = SnapshotLifecycle::Deleting;
-        tombstone.committed = None;
-        assert!(
-            attempt_namespace_is_unreferenced(Ok(Some(tombstone)), "attempt-a")
-                .expect("terminal tombstone authorizes private attempt cleanup")
-        );
-
-        let error = attempt_namespace_is_unreferenced(
-            Err(RepositoryError::ConcurrentModification {
-                resource: "catalog read".to_string(),
-            }),
-            "attempt-a",
-        )
-        .expect_err("catalog read errors must propagate");
-        assert!(matches!(
-            error,
-            RepositoryError::ConcurrentModification { .. }
-        ));
     }
 
     fn write_test_image(path: &Path, value: serde_json::Value) {

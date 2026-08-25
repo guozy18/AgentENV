@@ -384,7 +384,7 @@ mod client_tests {
             allow_shrink: false,
         };
         let device = client
-            .create_overlaybd_runtime_device(request())
+            .create_overlaybd_runtime_device(request(), SourceStateStrategy::Reuse)
             .await
             .unwrap();
         assert_eq!(device.dev_id, 11);
@@ -396,10 +396,7 @@ mod client_tests {
         );
 
         let cloned = client
-            .create_overlaybd_runtime_device_with_source_state_strategy(
-                request(),
-                SourceStateStrategy::Clone,
-            )
+            .create_overlaybd_runtime_device(request(), SourceStateStrategy::Clone)
             .await
             .unwrap();
         assert_eq!(cloned.dev_id, 12);
@@ -420,16 +417,19 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::LogStructured,
-                requested_virtual_size: None,
-                known_source_virtual_size: None,
-                allow_shrink: false,
-            })
+            .create_overlaybd_runtime_device(
+                CreateOverlaybdRuntimeDeviceRequest {
+                    source_image_config: Path::new("/src/image.json"),
+                    global_config: Path::new("/global.json"),
+                    runtime_dir: Path::new("/work/overlaybd"),
+                    read_only: false,
+                    runtime_upper_mode: UpperMode::LogStructured,
+                    requested_virtual_size: None,
+                    known_source_virtual_size: None,
+                    allow_shrink: false,
+                },
+                SourceStateStrategy::Reuse,
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("bad runtime"));
@@ -443,16 +443,19 @@ mod client_tests {
         .await;
         let err = server
             .client()
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::LogStructured,
-                requested_virtual_size: None,
-                known_source_virtual_size: None,
-                allow_shrink: false,
-            })
+            .create_overlaybd_runtime_device(
+                CreateOverlaybdRuntimeDeviceRequest {
+                    source_image_config: Path::new("/src/image.json"),
+                    global_config: Path::new("/global.json"),
+                    runtime_dir: Path::new("/work/overlaybd"),
+                    read_only: false,
+                    runtime_upper_mode: UpperMode::LogStructured,
+                    requested_virtual_size: None,
+                    known_source_virtual_size: None,
+                    allow_shrink: false,
+                },
+                SourceStateStrategy::Reuse,
+            )
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<InvalidRequestError>().is_some());
@@ -464,16 +467,19 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::LogStructured,
-                requested_virtual_size: None,
-                known_source_virtual_size: None,
-                allow_shrink: false,
-            })
+            .create_overlaybd_runtime_device(
+                CreateOverlaybdRuntimeDeviceRequest {
+                    source_image_config: Path::new("/src/image.json"),
+                    global_config: Path::new("/global.json"),
+                    runtime_dir: Path::new("/work/overlaybd"),
+                    read_only: false,
+                    runtime_upper_mode: UpperMode::LogStructured,
+                    requested_virtual_size: None,
+                    known_source_virtual_size: None,
+                    allow_shrink: false,
+                },
+                SourceStateStrategy::Reuse,
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("unexpected response"));
@@ -1143,12 +1149,18 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn acquire_overlaybd_exclusive_success() {
+    async fn acquire_overlaybd_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
-                dev_id: 10,
-                device_path: PathBuf::from("/dev/ublkb10"),
-            },
+            DaemonRequest::AcquireOverlaybd { access_mode, .. } => {
+                let dev_id = match access_mode {
+                    uvm_ublk_daemon::AccessMode::Exclusive => 10,
+                    uvm_ublk_daemon::AccessMode::Shared => 20,
+                };
+                DaemonResponse::DeviceAcquired {
+                    dev_id,
+                    device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
+                }
+            }
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
@@ -1167,25 +1179,7 @@ mod server_tests {
             .unwrap();
         assert_eq!(dev_id, 10);
         assert_eq!(path, PathBuf::from("/dev/ublkb10"));
-    }
 
-    #[tokio::test]
-    async fn acquire_overlaybd_shared_success() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::AcquireOverlaybd { access_mode, .. } => {
-                assert_eq!(access_mode, uvm_ublk_daemon::AccessMode::Shared);
-                DaemonResponse::DeviceAcquired {
-                    dev_id: 20,
-                    device_path: PathBuf::from("/dev/ublkb20"),
-                }
-            }
-            _ => DaemonResponse::Error {
-                message: "unexpected request".into(),
-            },
-        }))
-        .await;
-
-        let client = server.client();
         let (dev_id, path) = client
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),

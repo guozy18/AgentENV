@@ -3,19 +3,19 @@ use crate::snapshot::SnapshotId;
 /// Committed object layout for the OSS snapshot backend.
 pub(crate) struct OssSnapshotArtifactLayout<'a> {
     snapshot_id: &'a SnapshotId,
-    namespace: Option<&'a str>,
+    legacy_namespace: Option<&'a str>,
 }
 
 impl<'a> OssSnapshotArtifactLayout<'a> {
     pub(super) fn new(snapshot_id: &'a SnapshotId) -> Self {
         Self {
             snapshot_id,
-            namespace: None,
+            legacy_namespace: None,
         }
     }
 
-    pub(super) fn with_namespace(mut self, namespace: &'a str) -> Self {
-        self.namespace = Some(namespace);
+    pub(super) fn with_legacy_namespace(mut self, namespace: &'a str) -> Self {
+        self.legacy_namespace = Some(namespace);
         self
     }
 
@@ -32,7 +32,7 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
     }
 
     pub(super) fn artifact_prefix(&self) -> String {
-        match self.namespace {
+        match self.legacy_namespace {
             Some(namespace) => format!("artifacts/{}/{namespace}/", self.snapshot_id),
             None => format!("artifacts/{}/", self.snapshot_id),
         }

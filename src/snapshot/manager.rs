@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use dashmap::DashMap;
 use futures::{stream, StreamExt};
-use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 
 use super::p2p::{fixed_artifact_key, SnapshotP2pArtifact};
@@ -28,46 +26,6 @@ const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
 /// Local closures without canonical metadata are retained long enough for an
 /// operator or a subsequent startup to recover a partial metadata commit.
 const LOCAL_ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
-
-#[derive(Default)]
-struct SnapshotLifecycleLocks {
-    locks: DashMap<SnapshotId, Arc<Mutex<()>>>,
-}
-
-impl SnapshotLifecycleLocks {
-    async fn acquire(self: &Arc<Self>, snapshot_id: &SnapshotId) -> SnapshotLifecycleLock {
-        let lock = self
-            .locks
-            .entry(snapshot_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let guard = lock.clone().lock_owned().await;
-        SnapshotLifecycleLock {
-            locks: Arc::clone(self),
-            snapshot_id: snapshot_id.clone(),
-            lock,
-            guard: Some(guard),
-        }
-    }
-}
-
-struct SnapshotLifecycleLock {
-    locks: Arc<SnapshotLifecycleLocks>,
-    snapshot_id: SnapshotId,
-    lock: Arc<Mutex<()>>,
-    guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl Drop for SnapshotLifecycleLock {
-    fn drop(&mut self) {
-        drop(self.guard.take());
-        self.locks
-            .locks
-            .remove_if(&self.snapshot_id, |_, existing| {
-                Arc::ptr_eq(existing, &self.lock) && Arc::strong_count(existing) <= 2
-            });
-    }
-}
 
 fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
     layers
@@ -122,7 +80,6 @@ pub struct SnapshotManager {
     primary: SnapshotStore,
     local: Option<SnapshotStore>,
     node_id: String,
-    lifecycle_locks: Arc<SnapshotLifecycleLocks>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 }
 
@@ -138,7 +95,6 @@ impl SnapshotManager {
             primary: SnapshotStore::new(repository, runtime_resolver),
             local: Some(SnapshotStore::new(local_repository, local_runtime_resolver)),
             node_id,
-            lifecycle_locks: Arc::new(SnapshotLifecycleLocks::default()),
             p2p_transport,
         })
     }
@@ -153,7 +109,6 @@ impl SnapshotManager {
             primary: SnapshotStore::new(repository, runtime_resolver),
             local: None,
             node_id: String::new(),
-            lifecycle_locks: Arc::new(SnapshotLifecycleLocks::default()),
             p2p_transport,
         }
     }
@@ -171,17 +126,11 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let record = {
-            // Keep the repository transition and a same-process delete (or
-            // another publish) in one lifecycle order. The repository still
-            // supplies the cross-process fence; this lock only closes the
-            // in-process gap and avoids an avoidable retry race.
-            let _guard = self.lifecycle_locks.acquire(&metadata.id).await;
-            self.primary
-                .repository
-                .publish(metadata.clone(), manifest.clone())
-                .await?
-        };
+        let record = self
+            .primary
+            .repository
+            .publish(metadata, manifest.clone())
+            .await?;
         self.publish_p2p_artifacts(&record, &manifest).await;
         Ok(record)
     }
@@ -208,6 +157,11 @@ impl SnapshotManager {
         mut manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let requested_type = metadata.snapshot_type;
+        if requested_type == SnapshotType::Local && metadata.alias.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "Local snapshots do not support aliases".to_string(),
+            });
+        }
         let Some(local) = self.local.as_ref() else {
             return match requested_type {
                 SnapshotType::Local => Err(RepositoryError::Unsupported {
@@ -222,24 +176,41 @@ impl SnapshotManager {
         // it never captures the live sandbox a second time.
         metadata.snapshot_type = SnapshotType::Local;
         metadata.owner_node_id = Some(self.node_id.clone());
-        let canonical_alias = metadata.alias.take();
+        let requested_alias = metadata.alias.take();
         self.primary
             .repository
             .prepare_local_capture(&mut manifest)
             .await?;
         let snapshot_id = metadata.id.clone();
-        let canonical_local = {
-            let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
-            let mut local_record = local.repository.publish(metadata, manifest).await?;
-
+        let local_record = local.repository.publish(metadata, manifest).await?;
+        match requested_type {
             // The configured primary repository is the only public metadata
             // authority, even when the immutable bytes remain node-local.
-            local_record.alias = canonical_alias;
-            self.primary.repository.commit_record(local_record).await?
-        };
-        match requested_type {
-            SnapshotType::Local => Ok(canonical_local),
-            SnapshotType::Distributed => self.promote_record(canonical_local).await,
+            SnapshotType::Local => self.primary.repository.commit_record(local_record).await,
+            SnapshotType::Distributed => {
+                let runnable = local
+                    .runtime_resolver
+                    .resolve(Arc::new(local_record.clone()))
+                    .await
+                    .map_err(|error| RepositoryError::Unavailable {
+                        reason: format!(
+                            "resolve private local closure for snapshot '{snapshot_id}': {error}"
+                        ),
+                    })?;
+                let distributed = self
+                    .publish_distributed_closure(
+                        &local_record,
+                        requested_alias,
+                        runnable.manifest(),
+                    )
+                    .await?;
+
+                self.publish_p2p_artifacts(&distributed, runnable.manifest())
+                    .await;
+                drop(runnable);
+                self.cleanup_local_recovery_copy(&snapshot_id).await;
+                Ok(distributed)
+            }
         }
     }
 
@@ -260,18 +231,20 @@ impl SnapshotManager {
         if !matches!(record.source, SnapshotSource::Sandbox { .. }) {
             return Ok(None);
         }
-        self.promote_record(record).await.map(Some)
+        let alias = record.alias.clone();
+        self.promote_record(record, alias).await.map(Some)
     }
 
     async fn promote_record(
         &self,
         record: SnapshotRecord,
+        alias: Option<SnapshotAlias>,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let snapshot_id = record.id.clone();
-        let guard = self.lifecycle_locks.acquire(&snapshot_id).await;
 
-        // Re-read under the per-snapshot lock so a retry observes a promotion
-        // completed by an earlier request instead of replaying its rollback.
+        // Re-read so a retry observes a promotion completed by an earlier
+        // request instead of replaying its rollback. Repository CAS and fixed
+        // artifact keys provide the cross-process safety boundary.
         let record = self
             .primary
             .repository
@@ -281,32 +254,17 @@ impl SnapshotManager {
                 reason: format!("canonical snapshot '{snapshot_id}' disappeared during promotion"),
             })?;
         if record.snapshot_type == SnapshotType::Distributed {
-            drop(guard);
             self.cleanup_local_recovery_copy(&snapshot_id).await;
             return Ok(record);
         }
         let runnable = self.resolve_local_runtime(record.clone()).await?;
-        let metadata = Self::distributed_metadata(&record)?;
         let promoted = self
-            .primary
-            .repository
-            .publish(metadata, runnable.manifest().clone())
-            .await
-            .map_err(|error| match error {
-                error @ (RepositoryError::ArtifactNotFound { .. }
-                | RepositoryError::ManagedLayerNotFound { .. }
-                | RepositoryError::IntegrityMismatch { .. }) => RepositoryError::Unavailable {
-                    reason: format!(
-                        "publish Distributed closure for snapshot '{snapshot_id}': {error}"
-                    ),
-                },
-                error => error,
-            })?;
+            .publish_distributed_closure(&record, alias, runnable.manifest())
+            .await?;
 
-        // Canonical promotion is complete. P2P publication is a best-effort
-        // acceleration path and must not extend the per-snapshot lifecycle
-        // lock across potentially slow local imports or scheduler RPCs.
-        drop(guard);
+        // Keep publication ordered with delete: otherwise delete can
+        // unpublish the keys before this best-effort advertisement recreates
+        // stale entries for an already deleted snapshot.
         self.publish_p2p_artifacts(&promoted, runnable.manifest())
             .await;
         drop(runnable);
@@ -381,26 +339,11 @@ impl SnapshotManager {
             .ok_or_else(|| RepositoryError::Unavailable {
                 reason: "node-local snapshot store is not configured".to_string(),
             })?;
-        let local_record = local
-            .repository
-            .get_committed_record(&snapshot_id)
-            .await
-            .map_err(|error| RepositoryError::Unavailable {
-                reason: format!("load node-local artifacts for snapshot '{snapshot_id}': {error}"),
-            })?
-            .ok_or_else(|| RepositoryError::Unavailable {
-                reason: format!(
-                    "node '{}' no longer has artifacts for Local snapshot '{snapshot_id}'",
-                    self.node_id
-                ),
-            })?;
-        if !canonical.same_local_closure(&local_record) {
-            return Err(RepositoryError::Unavailable {
-                reason: format!(
-                    "node-local closure for snapshot '{snapshot_id}' does not match canonical metadata"
-                ),
-            });
-        }
+        // The canonical record owns identity, lifecycle, and logical artifact
+        // references.  The local resolver owns the physical commit marker,
+        // fixed artifacts, managed-layer files, and runtime materialization
+        // checks.  Reading a second full SnapshotRecord here only duplicated
+        // metadata authority without validating any artifact bytes.
         local
             .runtime_resolver
             .resolve(Arc::new(canonical))
@@ -434,6 +377,7 @@ impl SnapshotManager {
 
     fn distributed_metadata(
         record: &SnapshotRecord,
+        alias: Option<SnapshotAlias>,
     ) -> crate::snapshot::RepositoryResult<SnapshotPublishMetadata> {
         let SnapshotSource::Sandbox { source_sandbox_id } = &record.source else {
             return Err(RepositoryError::InvalidRequest {
@@ -451,7 +395,7 @@ impl SnapshotManager {
             id: record.id.clone(),
             snapshot_type: SnapshotType::Distributed,
             owner_node_id: None,
-            alias: record.alias.clone(),
+            alias,
             source: SnapshotPublishSource::Sandbox {
                 source_sandbox_id: source_sandbox_id.clone(),
             },
@@ -463,6 +407,30 @@ impl SnapshotManager {
             image_configs: committed.image_configs.clone(),
             custom_extension_params: committed.custom_extension_params.clone(),
         })
+    }
+
+    async fn publish_distributed_closure(
+        &self,
+        source: &SnapshotRecord,
+        alias: Option<SnapshotAlias>,
+        manifest: &FirecrackerSnapshotManifest,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        let snapshot_id = &source.id;
+        let metadata = Self::distributed_metadata(source, alias)?;
+        self.primary
+            .repository
+            .publish(metadata, manifest.clone())
+            .await
+            .map_err(|error| match error {
+                error @ (RepositoryError::ArtifactNotFound { .. }
+                | RepositoryError::ManagedLayerNotFound { .. }
+                | RepositoryError::IntegrityMismatch { .. }) => RepositoryError::Unavailable {
+                    reason: format!(
+                        "publish Distributed closure for snapshot '{snapshot_id}': {error}"
+                    ),
+                },
+                error => error,
+            })
     }
 
     /// Reconciles node-local immutable closures against canonical metadata.
@@ -481,7 +449,6 @@ impl SnapshotManager {
 
         for observed_local in local_records {
             let snapshot_id = observed_local.id;
-            let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
             let Some(local_record) = local.repository.get_record(&snapshot_id).await? else {
                 continue;
             };
@@ -504,28 +471,6 @@ impl SnapshotManager {
                 Some(record) if record.lifecycle == SnapshotLifecycle::Deleting => {
                     Self::purge_local_recovery_copy(local, &snapshot_id, "deleting snapshot").await;
                 }
-                Some(record) if record.lifecycle == SnapshotLifecycle::Preparing => {
-                    if let Some(mut local_record) = local_recovery_record.filter(|local| {
-                        record.owner_node_id.as_deref() == Some(self.node_id.as_str())
-                            && record.same_local_closure(local)
-                    }) {
-                        // Make the node-local recovery point visible before
-                        // publishing canonical Ready metadata. If the second
-                        // commit fails, the next reconciliation can safely
-                        // retry from this local Ready record.
-                        if local_record.lifecycle == SnapshotLifecycle::Preparing {
-                            local_record.lifecycle = SnapshotLifecycle::Ready;
-                            local_record = local.repository.commit_record(local_record).await?;
-                        }
-                        local_record.alias = record.alias;
-                        self.primary.repository.commit_record(local_record).await?;
-                    } else {
-                        warn!(
-                            %snapshot_id,
-                            "kept local snapshot closure that cannot recover canonical Preparing metadata"
-                        );
-                    }
-                }
                 Some(record)
                     if record.lifecycle == SnapshotLifecycle::Ready
                         && canonical_committed.is_none() =>
@@ -546,23 +491,18 @@ impl SnapshotManager {
                     if record.snapshot_type == SnapshotType::Local
                         && canonical_committed.is_some()
                         && record.owner_node_id.as_deref() == Some(self.node_id.as_str())
-                        && local_recovery_record
-                            .as_ref()
-                            .is_some_and(|local| record.same_local_closure(local)) =>
+                        && local_recovery_record.is_some() =>
                 {
-                    if local_record.lifecycle == SnapshotLifecycle::Preparing {
-                        let mut local_record = local_recovery_record
-                            .expect("matching recovery record should be present");
-                        local_record.lifecycle = SnapshotLifecycle::Ready;
-                        local.repository.commit_record(local_record).await?;
-                    }
+                    // Canonical metadata and the physical commit marker are
+                    // the only launch facts. The private record's lifecycle
+                    // is not a second public state machine.
                 }
                 Some(record) => {
                     warn!(
                         %snapshot_id,
                         canonical_type = ?record.snapshot_type,
                         canonical_owner = ?record.owner_node_id,
-                        "kept local snapshot closure with mismatched canonical metadata"
+                        "kept local snapshot closure with non-consumable canonical metadata"
                     );
                 }
                 None if local_record.lifecycle == SnapshotLifecycle::Deleting
@@ -623,14 +563,12 @@ impl SnapshotManager {
             return;
         };
 
-        // Fixed VM/manifest keys are safe only for the legacy layout. New OSS
-        // publishes use an immutable attempt namespace per catalog commit;
-        // publishing those bytes under the old snapshot-id-only P2P key would
-        // let concurrent attempts overwrite one another and hydrate the wrong
-        // closure on a later resolve. Content-addressed layers remain safe to
-        // advertise regardless of the attempt namespace.
+        // New and pre-namespace records use fixed artifact keys. Records from
+        // the former namespaced layout must continue to resolve only through
+        // their persisted OSS prefix. Content-addressed layers are safe in
+        // either layout.
         let mut artifacts = Vec::new();
-        if committed.artifact_namespace.is_none() {
+        if committed.legacy_artifact_namespace.is_none() {
             let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
             artifacts.push(SnapshotP2pArtifact::fixed(
                 snapshot_id,
@@ -816,7 +754,6 @@ impl SnapshotManager {
         }
         let snapshot_id = record.id.clone();
         let deleted = {
-            let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
             let Some(record) = self
                 .primary
                 .repository
@@ -888,7 +825,6 @@ impl SnapshotManager {
             SnapshotType::Distributed => self.resolve_distributed_runtime(snapshot).await,
             SnapshotType::Local => {
                 let snapshot_id = snapshot.id.clone();
-                let _guard = self.lifecycle_locks.acquire(&snapshot_id).await;
                 let canonical = self
                     .primary
                     .repository
@@ -906,9 +842,7 @@ impl SnapshotManager {
                 if canonical.snapshot_type == SnapshotType::Distributed {
                     // The canonical state is now immutable Distributed metadata;
                     // remote resolution follows the same path as an initially
-                    // Distributed request and must not hold the lifecycle lock
-                    // across potentially slow OSS/P2P work.
-                    drop(_guard);
+                    // Distributed request.
                     return self.resolve_distributed_runtime(canonical).await;
                 }
                 self.resolve_local_runtime(canonical)
@@ -981,10 +915,7 @@ impl SnapshotManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlaybd::layer_key_from_digest;
-    use crate::p2p::mock::MockTransport;
     use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
     use std::path::Path;
@@ -1030,7 +961,6 @@ mod tests {
                 local_resolver,
             )),
             node_id: node_id.to_string(),
-            lifecycle_locks: Arc::new(SnapshotLifecycleLocks::default()),
             p2p_transport: None,
         };
         (manager, primary_repository, local_repository)
@@ -1038,14 +968,14 @@ mod tests {
 
     fn captured_metadata(
         id: SnapshotId,
-        alias: &str,
+        alias: Option<&str>,
         snapshot_type: SnapshotType,
     ) -> SnapshotPublishMetadata {
         SnapshotPublishMetadata {
             id,
             snapshot_type,
             owner_node_id: (snapshot_type == SnapshotType::Local).then(|| "node-a".to_string()),
-            alias: Some(SnapshotAlias::parse(alias).expect("alias should parse")),
+            alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias should parse")),
             source: SnapshotPublishSource::Sandbox {
                 source_sandbox_id: "sandbox-source".to_string(),
             },
@@ -1084,75 +1014,6 @@ mod tests {
             .publish(metadata, manifest)
             .await
             .expect("seed publish should work");
-    }
-
-    #[tokio::test]
-    async fn lifecycle_lock_waiters_share_one_lock_and_cleanup_after_release() {
-        let locks = Arc::new(SnapshotLifecycleLocks::default());
-        let snapshot_id = SnapshotId::generate();
-        let first = locks.acquire(&snapshot_id).await;
-        let expected_lock = Arc::as_ptr(&first.lock) as usize;
-        let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::unbounded_channel();
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut waiters = Vec::new();
-
-        for _ in 0..2 {
-            let locks = Arc::clone(&locks);
-            let snapshot_id = snapshot_id.clone();
-            let acquired_tx = acquired_tx.clone();
-            let release = Arc::clone(&release);
-            waiters.push(tokio::spawn(async move {
-                let guard = locks.acquire(&snapshot_id).await;
-                acquired_tx
-                    .send(Arc::as_ptr(&guard.lock) as usize)
-                    .expect("test receiver should remain open");
-                release
-                    .acquire()
-                    .await
-                    .expect("test semaphore should remain open")
-                    .forget();
-                drop(guard);
-            }));
-        }
-        drop(acquired_tx);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let strong_count = locks
-                    .locks
-                    .get(&snapshot_id)
-                    .map(|entry| Arc::strong_count(entry.value()))
-                    .unwrap_or_default();
-                if strong_count >= 7 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both waiters should queue on the same lock");
-
-        drop(first);
-        let first_waiter_lock = tokio::time::timeout(Duration::from_secs(1), acquired_rx.recv())
-            .await
-            .expect("first waiter should acquire the lock")
-            .expect("first waiter should report its lock");
-        assert_eq!(first_waiter_lock, expected_lock);
-        assert_eq!(locks.locks.len(), 1);
-
-        release.add_permits(1);
-        let second_waiter_lock = tokio::time::timeout(Duration::from_secs(1), acquired_rx.recv())
-            .await
-            .expect("second waiter should acquire the lock")
-            .expect("second waiter should report its lock");
-        assert_eq!(second_waiter_lock, expected_lock);
-        assert_eq!(locks.locks.len(), 1);
-
-        release.add_permits(1);
-        for waiter in waiters {
-            waiter.await.expect("waiter task should finish");
-        }
-        assert!(locks.locks.is_empty());
     }
 
     #[tokio::test]
@@ -1275,147 +1136,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
-
-        let workspace = TempDir::new().expect("tempdir should exist");
-        let (rootfs_lower, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
-        let snapshot_id = SnapshotId::generate();
-        let metadata = SnapshotPublishMetadata {
-            id: snapshot_id.clone(),
-            ..SnapshotPublishMetadata::mock()
-        };
-
-        manager
-            .publish(metadata, manifest)
-            .await
-            .expect("publish should commit");
-
-        let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let manifest_key =
-            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        let rootfs_layer_digest = crate::digest::FileDigest::describe(&rootfs_lower)
-            .await
-            .expect("describe rootfs lower");
-        let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
-
-        assert!(p2p
-            .lookup(&vm_state_key)
-            .await
-            .expect("lookup vm state")
-            .is_some());
-        assert!(p2p
-            .lookup(&manifest_key)
-            .await
-            .expect("lookup manifest")
-            .is_some());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup shared rootfs layer")
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_unpublishes_snapshot_scoped_p2p_artifacts() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
-
-        let workspace = TempDir::new().expect("workspace should exist");
-        let (rootfs_lower, _, manifest) =
-            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
-        let rootfs_layer_digest = crate::digest::FileDigest::describe(&rootfs_lower)
-            .await
-            .expect("describe rootfs lower");
-        let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
-        let snapshot_id = SnapshotId::generate();
-        manager
-            .publish(
-                SnapshotPublishMetadata {
-                    id: snapshot_id.clone(),
-                    ..SnapshotPublishMetadata::mock()
-                },
-                manifest,
-            )
-            .await
-            .expect("publish should commit");
-
-        let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let manifest_key =
-            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
-        assert!(p2p
-            .lookup(&vm_state_key)
-            .await
-            .expect("lookup vm state")
-            .is_some());
-        assert!(p2p
-            .lookup(&manifest_key)
-            .await
-            .expect("lookup manifest")
-            .is_some());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup shared rootfs layer")
-            .is_some());
-
-        manager
-            .delete(snapshot_id.to_string())
-            .await
-            .expect("delete should commit");
-
-        assert!(p2p
-            .lookup(&vm_state_key)
-            .await
-            .expect("lookup deleted vm state")
-            .is_none());
-        assert!(p2p
-            .lookup(&manifest_key)
-            .await
-            .expect("lookup deleted manifest")
-            .is_none());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup shared rootfs layer after delete")
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn local_capture_keeps_public_alias_out_of_the_physical_store() {
+    async fn local_capture_is_id_only_in_canonical_and_physical_stores() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
             test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let stale_id = SnapshotId::generate();
-        local
-            .publish(
-                captured_metadata(stale_id.clone(), "local-one", SnapshotType::Local),
-                mock_manifest(&tempdir.path().join("stale-capture")),
-            )
-            .await
-            .expect("stale local recovery copy should publish");
         let snapshot_id = SnapshotId::generate();
         let record = manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "local-one", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
@@ -1423,9 +1151,10 @@ mod tests {
 
         assert_eq!(record.snapshot_type, SnapshotType::Local);
         assert_eq!(record.owner_node_id.as_deref(), Some("node-a"));
+        assert!(record.alias.is_none());
         assert_eq!(
             primary
-                .get("local-one")
+                .get(&snapshot_id.to_string())
                 .await
                 .expect("canonical lookup should work")
                 .expect("canonical record should exist")
@@ -1437,13 +1166,11 @@ mod tests {
             .await
             .expect("local lookup should work")
             .is_some_and(|record| record.alias.is_none()));
-        assert_eq!(
-            local
-                .resolve_alias("local-one")
-                .await
-                .expect("stale local alias should remain readable"),
-            Some(stale_id)
-        );
+        assert!(primary
+            .resolve_alias("local-one")
+            .await
+            .expect("canonical alias lookup should work")
+            .is_none());
         assert_eq!(
             manager
                 .resolve_runnable(record)
@@ -1453,6 +1180,43 @@ mod tests {
                 .id,
             snapshot_id
         );
+    }
+
+    #[tokio::test]
+    async fn local_capture_with_alias_fails_before_any_repository_write() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let (manager, primary, local) =
+            test_manager_with_local(tempdir.path(), "primary", "node-a");
+        let snapshot_id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse("local-alias").expect("alias should parse");
+        let mut metadata = captured_metadata(snapshot_id.clone(), None, SnapshotType::Local);
+        metadata.alias = Some(alias.clone());
+
+        assert!(matches!(
+            manager
+                .publish_captured_manifest(
+                    metadata,
+                    mock_manifest(&tempdir.path().join("capture")),
+                )
+                .await
+                .expect_err("Local alias must fail before capture publication"),
+            RepositoryError::InvalidRequest { .. }
+        ));
+        assert!(primary
+            .get_record(&snapshot_id)
+            .await
+            .expect("canonical lookup should work")
+            .is_none());
+        assert!(local
+            .get_record(&snapshot_id)
+            .await
+            .expect("local lookup should work")
+            .is_none());
+        assert!(primary
+            .resolve_alias(alias.as_ref())
+            .await
+            .expect("canonical alias lookup should work")
+            .is_none());
     }
 
     #[tokio::test]
@@ -1466,7 +1230,7 @@ mod tests {
 
         manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "orphan", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
@@ -1495,13 +1259,13 @@ mod tests {
             "primary read failure must prevent managed-layer GC"
         );
         manager
-            .get("orphan")
+            .get(&snapshot_id.to_string())
             .await
             .expect_err("public lookup must not substitute the local catalog");
     }
 
     #[tokio::test]
-    async fn distributed_capture_promotes_the_same_id_and_removes_local_recovery_copy() {
+    async fn distributed_capture_commits_only_distributed_canonical_metadata() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
             test_manager_with_local(tempdir.path(), "primary", "node-a");
@@ -1510,7 +1274,7 @@ mod tests {
             .publish_captured_manifest(
                 captured_metadata(
                     snapshot_id.clone(),
-                    "distributed-one",
+                    Some("distributed-one"),
                     SnapshotType::Distributed,
                 ),
                 mock_manifest(&tempdir.path().join("capture")),
@@ -1521,6 +1285,19 @@ mod tests {
         assert_eq!(promoted.id, snapshot_id);
         assert_eq!(promoted.snapshot_type, SnapshotType::Distributed);
         assert_eq!(promoted.owner_node_id, None);
+        assert_eq!(
+            promoted.alias.as_ref().map(SnapshotAlias::as_ref),
+            Some("distributed-one")
+        );
+        assert_eq!(
+            primary
+                .get_record(&snapshot_id)
+                .await
+                .expect("canonical exact lookup should work")
+                .expect("canonical record should exist")
+                .snapshot_type,
+            SnapshotType::Distributed
+        );
         assert_eq!(
             primary
                 .get("distributed-one")
@@ -1554,6 +1331,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distributed_capture_failure_leaves_only_private_local_recovery() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let (manager, primary, local) =
+            test_manager_with_local(tempdir.path(), "primary", "node-a");
+        let snapshot_id = SnapshotId::generate();
+        let alias = "distributed-failure";
+        std::fs::create_dir_all(tempdir.path().join("primary")).expect("primary root should exist");
+        std::fs::write(tempdir.path().join("primary/managed-layers"), b"blocked")
+            .expect("publication blocker should write");
+
+        manager
+            .publish_captured_manifest(
+                captured_metadata(snapshot_id.clone(), Some(alias), SnapshotType::Distributed),
+                mock_manifest(&tempdir.path().join("capture")),
+            )
+            .await
+            .expect_err("Distributed publication should fail");
+
+        assert!(primary
+            .get_record(&snapshot_id)
+            .await
+            .expect("canonical exact lookup should work")
+            .is_none());
+        assert!(primary
+            .resolve_alias(alias)
+            .await
+            .expect("canonical alias lookup should work")
+            .is_none());
+        let recovery = local
+            .get_record(&snapshot_id)
+            .await
+            .expect("local exact lookup should work")
+            .expect("private local recovery should remain");
+        assert_eq!(recovery.snapshot_type, SnapshotType::Local);
+        assert_eq!(recovery.owner_node_id.as_deref(), Some("node-a"));
+        assert!(recovery.alias.is_none());
+    }
+
+    #[tokio::test]
     async fn idempotent_promotion_removes_a_stale_local_recovery_copy() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
@@ -1562,14 +1378,14 @@ mod tests {
         let manifest = mock_manifest(&tempdir.path().join("capture"));
         let local_record = manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "retry-cleanup", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 manifest.clone(),
             )
             .await
             .expect("Local snapshot should publish");
         primary
             .publish(
-                SnapshotManager::distributed_metadata(&local_record)
+                SnapshotManager::distributed_metadata(&local_record, None)
                     .expect("Distributed metadata should derive from Local record"),
                 manifest,
             )
@@ -1577,7 +1393,7 @@ mod tests {
             .expect("canonical Distributed publication should succeed");
 
         let promoted = manager
-            .promote("retry-cleanup")
+            .promote(&snapshot_id.to_string())
             .await
             .expect("idempotent promotion should succeed")
             .expect("Distributed snapshot should exist");
@@ -1606,7 +1422,7 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
         manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "retryable", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
@@ -1615,11 +1431,11 @@ mod tests {
             .expect("promotion blocker should write");
 
         manager
-            .promote("retryable")
+            .promote(&snapshot_id.to_string())
             .await
             .expect_err("artifact publication should fail");
         let canonical = primary
-            .get("retryable")
+            .get(&snapshot_id.to_string())
             .await
             .expect("canonical lookup should work")
             .expect("Local canonical record must remain visible");
@@ -1634,48 +1450,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_local_closure_cannot_resolve_or_promote() {
+    async fn local_runtime_resolution_uses_canonical_metadata_when_private_record_drifts() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, _) = test_manager_with_local(tempdir.path(), "primary", "node-a");
+        let (manager, primary, local) =
+            test_manager_with_local(tempdir.path(), "primary", "node-a");
         let snapshot_id = SnapshotId::generate();
         let canonical = manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "mismatched", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("canonical-capture")),
             )
             .await
             .expect("Local snapshot should publish");
 
-        let mut mismatched_local = canonical.clone();
-        mismatched_local
+        // The private catalog is not a second metadata authority. A stale
+        // logical field there must not make an otherwise committed closure
+        // unavailable when the canonical record and physical artifacts are
+        // intact.
+        let mut private_record = local
+            .get_record(&snapshot_id)
+            .await
+            .expect("private record lookup should work")
+            .expect("private record should exist");
+        private_record
             .committed
             .as_mut()
             .expect("Local snapshot should have committed metadata")
             .context
             .workdir = "/different".to_string();
-        write_posix_record(tempdir.path(), "local", &mismatched_local);
+        write_posix_record(tempdir.path(), "local", &private_record);
 
-        let resolve_error = manager
+        let resolved = manager
             .resolve_runnable(canonical)
             .await
-            .expect_err("mismatched Local closure must not resolve");
-        assert!(resolve_error.chain().any(|cause| matches!(
-            cause.downcast_ref::<RepositoryError>(),
-            Some(RepositoryError::Unavailable { .. })
-        )));
-        assert!(matches!(
-            manager
-                .promote("mismatched")
-                .await
-                .expect_err("mismatched Local closure must not promote"),
-            RepositoryError::Unavailable { .. }
-        ));
+            .expect("canonical metadata should resolve the committed closure");
+        assert_eq!(resolved.record().id, snapshot_id);
+
+        let promoted = manager
+            .promote(&snapshot_id.to_string())
+            .await
+            .expect("promotion should use canonical metadata and physical artifacts")
+            .expect("Local snapshot should be promoted");
+        assert_eq!(promoted.snapshot_type, SnapshotType::Distributed);
         let canonical = primary
-            .get("mismatched")
+            .get(&snapshot_id.to_string())
             .await
             .expect("canonical lookup should work")
             .expect("canonical Local record should remain visible");
-        assert_eq!(canonical.snapshot_type, SnapshotType::Local);
+        assert_eq!(canonical.snapshot_type, SnapshotType::Distributed);
     }
 
     #[tokio::test]
@@ -1686,7 +1508,7 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
         let record = manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "missing-marker", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
@@ -1712,14 +1534,14 @@ mod tests {
         )));
         assert!(matches!(
             manager
-                .promote("missing-marker")
+                .promote(&snapshot_id.to_string())
                 .await
                 .expect_err("Local promotion must reject a missing commit marker"),
             RepositoryError::Unavailable { .. }
         ));
 
         let canonical = primary
-            .get("missing-marker")
+            .get(&snapshot_id.to_string())
             .await
             .expect("canonical lookup should work")
             .expect("canonical Local record should remain visible");
@@ -1738,311 +1560,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_primary_commit_marker_blocks_stale_local_resolve_and_promote() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        let record = manager
-            .publish_captured_manifest(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "missing-primary-marker",
-                    SnapshotType::Local,
-                ),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-        let marker = tempdir
-            .path()
-            .join("primary/snapshots")
-            .join(snapshot_id.to_string())
-            .join("commit");
-        assert!(
-            marker.exists(),
-            "primary publish should create a commit marker"
-        );
-        std::fs::remove_file(&marker).expect("primary commit marker should be removable");
-
-        let resolve_error = manager
-            .resolve_runnable(record.clone())
-            .await
-            .expect_err("stale Local resolve must reject a missing primary marker");
-        assert!(resolve_error.chain().any(|cause| matches!(
-            cause.downcast_ref::<RepositoryError>(),
-            Some(RepositoryError::Unavailable { .. })
-        )));
-        assert!(matches!(
-            manager
-                .promote("missing-primary-marker")
-                .await
-                .expect_err("stale Local promotion must reject a missing primary marker"),
-            RepositoryError::Unavailable { .. }
-        ));
-
-        let canonical = primary
-            .get_record(&snapshot_id)
-            .await
-            .expect("raw canonical lookup should work")
-            .expect("canonical identity should remain durable");
-        assert!(canonical.is_ready());
-        assert!(primary
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("committed canonical lookup should work")
-            .is_none());
-        assert!(local
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("local committed lookup should work")
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn reconciliation_applies_one_grace_period_to_local_orphans() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, _, local) = test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let cases = [
-            ("recent-ready", SnapshotLifecycle::Ready, false),
-            ("expired-ready", SnapshotLifecycle::Ready, true),
-            ("recent-preparing", SnapshotLifecycle::Preparing, false),
-            ("expired-preparing", SnapshotLifecycle::Preparing, true),
-        ];
-        let mut records = Vec::new();
-        for (alias, lifecycle, expired) in cases {
-            let id = SnapshotId::generate();
-            let mut record = local
-                .publish(
-                    captured_metadata(id.clone(), alias, SnapshotType::Local),
-                    mock_manifest(&tempdir.path().join(alias)),
-                )
-                .await
-                .expect("local orphan should publish");
-            record.lifecycle = lifecycle;
-            if expired {
-                record.updated_at_unix_ms = 0;
-            }
-            write_posix_record(tempdir.path(), "local", &record);
-            records.push((id, alias, expired));
-        }
-
-        let gc_candidate = tempdir
-            .path()
-            .join("local/managed-layers")
-            .join(format!("sha256_{}.overlaybd.commit", "f".repeat(64)));
-        std::fs::write(&gc_candidate, b"unreferenced layer").expect("GC candidate should write");
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("healthy primary reconciliation should work");
-
-        for (id, alias, expired) in records {
-            assert_eq!(
-                local
-                    .get_record(&id)
-                    .await
-                    .expect("local orphan lookup should work")
-                    .is_none(),
-                expired,
-                "unexpected reconciliation result for {alias}"
-            );
-        }
-        assert!(!gc_candidate.exists());
-    }
-
-    #[tokio::test]
-    async fn reconciliation_only_recovers_preparing_metadata_on_its_owner() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (owner_manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        owner_manager
-            .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "recoverable", SnapshotType::Local),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-        let mut preparing = primary
-            .get_record(&snapshot_id)
-            .await
-            .expect("canonical exact lookup should work")
-            .expect("canonical record should exist");
-        preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "primary", &preparing);
-
-        let foreign_manager = SnapshotManager {
-            node_id: "node-b".to_string(),
-            lifecycle_locks: Arc::new(SnapshotLifecycleLocks::default()),
-            ..owner_manager.clone()
-        };
-        foreign_manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("foreign reconciliation should remain conservative");
-        assert_eq!(
-            primary
-                .get_record(&snapshot_id)
-                .await
-                .expect("canonical exact lookup should work")
-                .expect("Preparing record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Preparing
-        );
-        assert!(local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .is_some());
-
-        owner_manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("owner reconciliation should recover metadata");
-        assert_eq!(
-            primary
-                .get("recoverable")
-                .await
-                .expect("public canonical lookup should work")
-                .expect("recovered record should be public")
-                .lifecycle,
-            SnapshotLifecycle::Ready
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_recovers_committed_preparing_local_and_canonical_records() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        manager
-            .publish_captured_manifest(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "recover-both-preparing",
-                    SnapshotType::Local,
-                ),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-
-        let mut local_preparing = local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .expect("local record should exist");
-        local_preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "local", &local_preparing);
-
-        let mut canonical_preparing = primary
-            .get_record(&snapshot_id)
-            .await
-            .expect("canonical exact lookup should work")
-            .expect("canonical record should exist");
-        canonical_preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "primary", &canonical_preparing);
-
-        assert!(local
-            .get_recovery_record(&snapshot_id)
-            .await
-            .expect("local recovery lookup should work")
-            .is_some());
-        assert!(local
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("local public committed lookup should work")
-            .is_none());
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("reconciliation should recover both Preparing records");
-
-        assert_eq!(
-            primary
-                .get_record(&snapshot_id)
-                .await
-                .expect("canonical exact lookup after recovery should work")
-                .expect("canonical record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Ready
-        );
-        assert_eq!(
-            local
-                .get_record(&snapshot_id)
-                .await
-                .expect("local exact lookup after recovery should work")
-                .expect("local record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Ready
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_does_not_resurrect_a_deleting_local_record() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        manager
-            .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "do-not-resurrect", SnapshotType::Local),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-
-        let mut local_deleting = local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .expect("local record should exist");
-        local_deleting.lifecycle = SnapshotLifecycle::Deleting;
-        write_posix_record(tempdir.path(), "local", &local_deleting);
-
-        let mut canonical_preparing = primary
-            .get_record(&snapshot_id)
-            .await
-            .expect("canonical exact lookup should work")
-            .expect("canonical record should exist");
-        canonical_preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "primary", &canonical_preparing);
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("reconciliation should remain conservative");
-
-        assert_eq!(
-            primary
-                .get_record(&snapshot_id)
-                .await
-                .expect("canonical exact lookup after reconciliation should work")
-                .expect("canonical record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Preparing
-        );
-        assert_eq!(
-            local
-                .get_record(&snapshot_id)
-                .await
-                .expect("local exact lookup after reconciliation should work")
-                .expect("local record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Deleting
-        );
-        assert!(local
-            .get_recovery_record(&snapshot_id)
-            .await
-            .expect("local recovery lookup should work")
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn reconciliation_purges_a_fenced_local_copy_after_restart() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
@@ -2051,7 +1568,7 @@ mod tests {
 
         manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "fenced-local", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
@@ -2095,113 +1612,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_removes_distributed_local_recovery_copy() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        let manifest = mock_manifest(&tempdir.path().join("capture"));
-        local
-            .publish(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "reconciled-distributed",
-                    SnapshotType::Local,
-                ),
-                manifest.clone(),
-            )
-            .await
-            .expect("stale local recovery copy should publish");
-        primary
-            .publish(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "reconciled-distributed",
-                    SnapshotType::Distributed,
-                ),
-                manifest,
-            )
-            .await
-            .expect("canonical Distributed snapshot should publish");
-        assert!(local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .is_some());
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("reconciliation should work");
-        assert!(local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .is_none());
-        assert_eq!(
-            primary
-                .get("reconciled-distributed")
-                .await
-                .expect("canonical lookup should work")
-                .expect("Distributed record should remain")
-                .snapshot_type,
-            SnapshotType::Distributed
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_repairs_preparing_local_copy_for_ready_canonical() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        manager
-            .publish_captured_manifest(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "repair-local-preparing",
-                    SnapshotType::Local,
-                ),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-
-        let mut local_preparing = local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .expect("local record should exist");
-        local_preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "local", &local_preparing);
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("reconciliation should repair the local lifecycle");
-
-        assert_eq!(
-            local
-                .get_record(&snapshot_id)
-                .await
-                .expect("local exact lookup after reconciliation should work")
-                .expect("local record should remain")
-                .lifecycle,
-            SnapshotLifecycle::Ready
-        );
-        assert!(local
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("local committed lookup after reconciliation should work")
-            .is_some());
-        assert!(primary
-            .get_committed_record(&snapshot_id)
-            .await
-            .expect("canonical committed lookup should work")
-            .is_some());
-    }
-
-    #[tokio::test]
     async fn reconciliation_keeps_local_copy_when_distributed_marker_is_missing() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
@@ -2210,11 +1620,7 @@ mod tests {
         let manifest = mock_manifest(&tempdir.path().join("capture"));
         local
             .publish(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "missing-distributed-marker",
-                    SnapshotType::Local,
-                ),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 manifest.clone(),
             )
             .await
@@ -2223,7 +1629,7 @@ mod tests {
             .publish(
                 captured_metadata(
                     snapshot_id.clone(),
-                    "missing-distributed-marker",
+                    Some("missing-distributed-marker"),
                     SnapshotType::Distributed,
                 ),
                 manifest,
@@ -2255,68 +1661,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_purges_preparing_local_copy_for_a_canonical_tombstone() {
-        let tempdir = TempDir::new().expect("tempdir should exist");
-        let (manager, primary, local) =
-            test_manager_with_local(tempdir.path(), "primary", "node-a");
-        let snapshot_id = SnapshotId::generate();
-        manager
-            .publish_captured_manifest(
-                captured_metadata(
-                    snapshot_id.clone(),
-                    "tombstoned-preparing",
-                    SnapshotType::Local,
-                ),
-                mock_manifest(&tempdir.path().join("capture")),
-            )
-            .await
-            .expect("Local snapshot should publish");
-
-        let mut local_preparing = local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup should work")
-            .expect("local record should exist");
-        local_preparing.lifecycle = SnapshotLifecycle::Preparing;
-        write_posix_record(tempdir.path(), "local", &local_preparing);
-
-        primary
-            .delete_by_id(&snapshot_id)
-            .await
-            .expect("canonical delete should leave an identity tombstone");
-        assert_eq!(
-            primary
-                .get_for_delete(&snapshot_id.to_string())
-                .await
-                .expect("canonical lifecycle lookup should work")
-                .expect("canonical tombstone should remain")
-                .lifecycle,
-            SnapshotLifecycle::Deleting
-        );
-        assert!(manager
-            .promote(&snapshot_id.to_string())
-            .await
-            .expect("promotion of a terminal tombstone should be idempotent")
-            .is_none());
-
-        manager
-            .reconcile_local_artifacts()
-            .await
-            .expect("reconciliation should purge the fenced local closure");
-
-        assert!(local
-            .get_record(&snapshot_id)
-            .await
-            .expect("local exact lookup after reconciliation should work")
-            .is_none());
-        assert!(!tempdir
-            .path()
-            .join("local/snapshots")
-            .join(snapshot_id.to_string())
-            .exists());
-    }
-
-    #[tokio::test]
     async fn local_delete_fails_closed_and_preserves_both_records() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let (manager, primary, local) =
@@ -2324,14 +1668,14 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
         manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id.clone(), "undeletable", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
             .expect("Local snapshot should publish");
 
         let error = manager
-            .delete("undeletable")
+            .delete(snapshot_id.to_string())
             .await
             .expect_err("Local delete should fail closed");
         assert!(error.chain().any(|cause| matches!(
@@ -2357,14 +1701,13 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
         let record = owner_manager
             .publish_captured_manifest(
-                captured_metadata(snapshot_id, "owner-bound", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("capture")),
             )
             .await
             .expect("Local snapshot should publish");
         let foreign_manager = SnapshotManager {
             node_id: "node-b".to_string(),
-            lifecycle_locks: Arc::new(SnapshotLifecycleLocks::default()),
             ..owner_manager.clone()
         };
 
@@ -2378,7 +1721,7 @@ mod tests {
         )));
         assert!(matches!(
             foreign_manager
-                .promote("owner-bound")
+                .promote(&snapshot_id.to_string())
                 .await
                 .expect_err("foreign node must not promote Local snapshot"),
             RepositoryError::Unavailable { .. }
@@ -2394,7 +1737,7 @@ mod tests {
             .publish_captured_manifest(
                 captured_metadata(
                     snapshot_id.clone(),
-                    "no-fallback",
+                    Some("no-fallback"),
                     SnapshotType::Distributed,
                 ),
                 mock_manifest(&tempdir.path().join("capture")),
@@ -2403,7 +1746,7 @@ mod tests {
             .expect("same-ID promotion should work");
         local
             .publish(
-                captured_metadata(snapshot_id.clone(), "no-fallback", SnapshotType::Local),
+                captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("local-mirror")),
             )
             .await

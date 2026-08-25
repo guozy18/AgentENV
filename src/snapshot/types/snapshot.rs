@@ -231,10 +231,11 @@ impl SnapshotSource {
     }
 }
 
-fn validate_snapshot_placement(
+fn validate_snapshot_metadata(
     snapshot_type: SnapshotType,
     source_is_sandbox: bool,
     owner_node_id: Option<&str>,
+    alias: Option<&SnapshotAlias>,
 ) -> Result<(), String> {
     if snapshot_type == SnapshotType::Local && !source_is_sandbox {
         return Err("Local snapshots must originate from a sandbox".to_string());
@@ -247,15 +248,19 @@ fn validate_snapshot_placement(
     if snapshot_type == SnapshotType::Distributed && owner_node_id.is_some() {
         return Err("Distributed snapshots must not carry owner_node_id".to_string());
     }
+    if snapshot_type == SnapshotType::Local && alias.is_some() {
+        return Err("Local snapshots do not support aliases".to_string());
+    }
     Ok(())
 }
 
 impl SnapshotPublishMetadata {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        validate_snapshot_placement(
+        validate_snapshot_metadata(
             self.snapshot_type,
             matches!(&self.source, SnapshotPublishSource::Sandbox { .. }),
             self.owner_node_id.as_deref(),
+            self.alias.as_ref(),
         )
     }
 }
@@ -404,10 +409,14 @@ pub struct CommittedSnapshot {
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
     pub disk_publications: Vec<PersistedDiskImagePublication>,
-    /// Immutable per-publish namespace for non-content-addressed OSS
-    /// artifacts.  Legacy records omit it and use the snapshot-id prefix.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_namespace: Option<String>,
+    /// Physical prefix retained only for records written by the former
+    /// per-attempt OSS layout. New records use the snapshot-id prefix.
+    #[serde(
+        default,
+        rename = "artifact_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_artifact_namespace: Option<String>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -431,7 +440,7 @@ impl CommittedSnapshot {
             attached_drives: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
-            artifact_namespace: None,
+            legacy_artifact_namespace: None,
             custom_extension_params: None,
         }
     }
@@ -447,14 +456,6 @@ impl CommittedSnapshot {
             && self.custom_extension_params == other.custom_extension_params
     }
 
-    pub(crate) fn same_closure(&self, other: &Self) -> bool {
-        self.same_logical_metadata(other)
-            && self.rootfs_layers == other.rootfs_layers
-            && self.attached_drives == other.attached_drives
-            && self.memory_layers == other.memory_layers
-            && self.disk_publications == other.disk_publications
-    }
-
     pub(crate) fn matches_publish_metadata(&self, metadata: &SnapshotPublishMetadata) -> bool {
         self.context == metadata.context
             && self.startup == metadata.startup
@@ -468,11 +469,6 @@ impl CommittedSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
-    /// Monotonically increasing catalog revision used together with the
-    /// backend's conditional object write.  A missing field in legacy JSON is
-    /// decoded as revision zero and is upgraded on its first mutation.
-    #[serde(default)]
-    pub revision: u64,
     /// Storage availability of the committed reusable snapshot.
     ///
     /// Older records did not carry this field; those records are the legacy
@@ -514,7 +510,6 @@ impl SnapshotRecord {
         };
         Self {
             id: metadata.id.clone(),
-            revision: 1,
             snapshot_type: metadata.snapshot_type,
             owner_node_id: metadata.owner_node_id.clone(),
             lifecycle: SnapshotLifecycle::Ready,
@@ -563,7 +558,6 @@ impl SnapshotRecord {
         let mut record = self.clone();
         record.lifecycle = SnapshotLifecycle::Ready;
         record.updated_at_unix_ms = 0;
-        record.revision = 0;
         record
     }
 
@@ -571,29 +565,6 @@ impl SnapshotRecord {
     /// that changes during an equivalent retry.
     pub(crate) fn same_catalog_contents(&self, other: &Self) -> bool {
         self.normalized_catalog_record() == other.normalized_catalog_record()
-    }
-
-    // Public aliases belong to the canonical catalog, not the physical Local closure.
-    pub(crate) fn same_local_closure(&self, other: &Self) -> bool {
-        self.snapshot_type == SnapshotType::Local
-            && other.snapshot_type == SnapshotType::Local
-            && self.id == other.id
-            && self.owner_node_id == other.owner_node_id
-            && self.resources == other.resources
-            && matches!(
-                (&self.source, &other.source),
-                (
-                    SnapshotSource::Sandbox { .. },
-                    SnapshotSource::Sandbox { .. }
-                )
-            )
-            && self.created_at_unix_ms == other.created_at_unix_ms
-            && self.updated_at_unix_ms == other.updated_at_unix_ms
-            && self
-                .committed
-                .as_ref()
-                .zip(other.committed.as_ref())
-                .is_some_and(|(left, right)| left.same_closure(right))
     }
 
     pub(crate) fn matches_publish_metadata(&self, metadata: &SnapshotPublishMetadata) -> bool {
@@ -633,14 +604,15 @@ impl SnapshotRecord {
         if self.committed.is_none() {
             return Err("committed snapshot metadata requires an artifact payload".to_string());
         }
-        validate_snapshot_placement(
+        validate_snapshot_metadata(
             self.snapshot_type,
             matches!(&self.source, SnapshotSource::Sandbox { .. }),
             self.owner_node_id.as_deref(),
+            self.alias.as_ref(),
         )
     }
 
-    pub(crate) fn validate_template_create(&mut self) -> Result<(), String> {
+    pub(crate) fn validate_template_create(&self) -> Result<(), String> {
         let reason = if !matches!(&self.source, SnapshotSource::Template { .. }) {
             Some("only template snapshots can be pre-created")
         } else if self.committed.is_some() {
@@ -655,7 +627,6 @@ impl SnapshotRecord {
             return Err(reason.to_string());
         }
 
-        self.revision = 1;
         Ok(())
     }
 
@@ -681,7 +652,6 @@ impl SnapshotRecord {
         build.started_at_unix_ms = Some(now_unix_ms);
         build.error_reason = None;
         self.updated_at_unix_ms = now_unix_ms;
-        self.revision = next_revision(self.revision);
         Ok(())
     }
 
@@ -714,7 +684,6 @@ impl SnapshotRecord {
         build.finished_at_unix_ms = Some(now_unix_ms);
         build.error_reason = Some(reason.clone());
         self.updated_at_unix_ms = now_unix_ms;
-        self.revision = next_revision(self.revision);
         Ok(true)
     }
 
@@ -726,7 +695,6 @@ impl SnapshotRecord {
         let now_unix_ms = now_unix_ms();
         Self {
             id,
-            revision: 1,
             snapshot_type: SnapshotType::Distributed,
             owner_node_id: None,
             lifecycle: SnapshotLifecycle::Ready,
@@ -764,7 +732,6 @@ impl SnapshotRecord {
         self.resources = metadata.resources;
         self.updated_at_unix_ms = now_unix_ms;
         self.committed = Some(committed);
-        self.revision = next_revision(self.revision);
     }
 
     /// Returns the published rootfs OCI image reference, if source-registry
@@ -783,7 +750,6 @@ impl SnapshotRecord {
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
             id: SnapshotId::generate(),
-            revision: 1,
             snapshot_type: SnapshotType::Distributed,
             owner_node_id: None,
             lifecycle: SnapshotLifecycle::Ready,
@@ -809,10 +775,6 @@ pub(crate) fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-pub(crate) fn next_revision(current: u64) -> u64 {
-    current.saturating_add(1).max(1)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -960,7 +922,8 @@ impl fmt::Debug for RunnableSnapshot {
 mod tests {
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, SnapshotType, TemplateBuildErrorReason,
+        PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishMetadata,
+        SnapshotPublishSource, SnapshotRecord, SnapshotType, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -1022,6 +985,52 @@ mod tests {
                 .expect("deserialize distributed type"),
             SnapshotType::Distributed
         );
+    }
+
+    #[test]
+    fn local_snapshot_metadata_rejects_alias() {
+        let mut metadata = SnapshotPublishMetadata::mock();
+        metadata.snapshot_type = SnapshotType::Local;
+        metadata.owner_node_id = Some("node-a".to_string());
+        metadata.alias = Some(SnapshotAlias::parse("checkpoint").expect("valid alias"));
+        metadata.source = SnapshotPublishSource::Sandbox {
+            source_sandbox_id: "sandbox-a".to_string(),
+        };
+
+        assert_eq!(
+            metadata.validate().expect_err("Local alias must fail"),
+            "Local snapshots do not support aliases"
+        );
+        metadata.alias = None;
+        metadata.validate().expect("aliasless Local must be valid");
+    }
+
+    #[test]
+    fn legacy_artifact_namespace_survives_record_rewrite() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut legacy = serde_json::to_value(&record).expect("record should serialize");
+        legacy["revision"] = serde_json::json!(27);
+        legacy["committed"]["artifact_namespace"] = serde_json::json!("attempt-old");
+
+        let mut decoded: SnapshotRecord =
+            serde_json::from_value(legacy).expect("legacy record should deserialize");
+        assert_eq!(
+            decoded
+                .committed
+                .as_ref()
+                .and_then(|committed| committed.legacy_artifact_namespace.as_deref()),
+            Some("attempt-old")
+        );
+        decoded.lifecycle = super::SnapshotLifecycle::Preparing;
+        let rewritten = serde_json::to_value(decoded).expect("record should reserialize");
+        assert_eq!(
+            rewritten["committed"]["artifact_namespace"],
+            serde_json::json!("attempt-old")
+        );
+        assert!(rewritten.get("revision").is_none());
+
+        let fresh = serde_json::to_value(record).expect("new record should serialize");
+        assert!(fresh["committed"].get("artifact_namespace").is_none());
     }
 
     #[test]
@@ -1094,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_start_cmd_combines_entrypoint_and_cmd() {
+    fn effective_start_cmd_composition() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec!["/docker-entrypoint.sh".to_string()]))
             .with_cmd(Some(vec![
@@ -1106,28 +1115,16 @@ mod tests {
             ctx.effective_start_cmd().as_deref(),
             Some("/docker-entrypoint.sh nginx -g 'daemon off;'"),
         );
-    }
 
-    #[test]
-    fn effective_start_cmd_entrypoint_only() {
         let ctx = CommandContext::default().with_entrypoint(Some(vec!["node".to_string()]));
         assert_eq!(ctx.effective_start_cmd().as_deref(), Some("node"));
-    }
 
-    #[test]
-    fn effective_start_cmd_cmd_only() {
         let ctx = CommandContext::default()
             .with_cmd(Some(vec!["python3".to_string(), "app.py".to_string()]));
         assert_eq!(ctx.effective_start_cmd().as_deref(), Some("python3 app.py"),);
-    }
 
-    #[test]
-    fn effective_start_cmd_absent_returns_none() {
         assert_eq!(CommandContext::default().effective_start_cmd(), None);
-    }
 
-    #[test]
-    fn effective_start_cmd_empty_vecs_return_none() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec![]))
             .with_cmd(Some(vec![]));
