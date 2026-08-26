@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -21,11 +20,11 @@ use crate::snapshot::repository::backends::common::{
 };
 use crate::snapshot::repository::interfaces::SnapshotRepository;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::types::now_unix_ms;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotPublishMetadata, SnapshotRecord, TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
@@ -75,13 +74,6 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
         reason: format!("invalid alias '{alias}': {e}"),
     })?;
     Ok(OssSnapshotArtifactLayout::alias_key(alias))
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
@@ -463,16 +455,12 @@ impl SnapshotRepository for OssSnapshotRepository {
             // 5. Bind alias (if present) with conflict detection.
             if let Some(ref alias) = metadata.alias {
                 if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
-                    }
                     return Err(e);
                 }
             }
 
-            self.write_committed_record(metadata.clone(), committed).await
+            self.write_committed_record(metadata.clone(), committed)
+                .await
         }
         .await;
 
@@ -509,13 +497,10 @@ impl SnapshotRepository for OssSnapshotRepository {
         record
             .validate_committed_metadata()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        if let Some(existing) = self.read_record(&record.id).await? {
-            if !existing.same_catalog_contents(&record) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("snapshot '{}' metadata does not match", record.id),
-                });
-            }
-            return Ok(existing);
+        if self.read_record(&record.id).await?.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
         }
         self.write_record(&record).await?;
         Ok(record)
@@ -560,7 +545,7 @@ impl SnapshotRepository for OssSnapshotRepository {
             .try_collect()
             .await?;
 
-        records.retain(|record| Self::matches_record_filter(record, &filter));
+        records.retain(|record| filter.matches(record));
         records.sort_by(|a, b| {
             b.created_at_unix_ms
                 .cmp(&a.created_at_unix_ms)
@@ -647,21 +632,9 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
                 })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        if build.status != TemplateBuildStatus::Waiting {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
-            });
-        }
-        build.status = TemplateBuildStatus::Building;
-        build.started_at_unix_ms = Some(now);
-        build.error_reason = None;
-        record.updated_at_unix_ms = now;
+        record
+            .start_template_build(now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record(&record).await?;
         Ok(record)
     }
@@ -677,16 +650,9 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
                 })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        build.status = TemplateBuildStatus::Error;
-        build.finished_at_unix_ms = Some(now);
-        build.error_reason = Some(reason);
-        record.updated_at_unix_ms = now;
+        record
+            .mark_template_build_error(&reason, now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record(&record).await
     }
 }
@@ -1095,62 +1061,6 @@ impl OssSnapshotRepository {
         let target = serde_json::from_slice::<SnapshotId>(&data)
             .map_err(|e| RepositoryError::backend(format!("parse alias target '{alias}'"), e))?;
         Ok(Some(target))
-    }
-
-    fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-        if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
-                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(ids) = filter.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
-                return false;
-            }
-        }
-
-        if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
-            {
-                return false;
-            }
-        }
-
-        if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-            match &record.source {
-                SnapshotSource::Sandbox {
-                    source_sandbox_id: record_source_sandbox_id,
-                } if record_source_sandbox_id == source_sandbox_id => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(sources) = filter.sources.as_ref() {
-            let source = match &record.source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
-                return false;
-            }
-        }
-
-        if let Some(statuses) = filter.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = &record.source else {
-                return false;
-            };
-            if !statuses.contains(&build.status) {
-                return false;
-            };
-        }
-
-        true
     }
 }
 

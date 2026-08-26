@@ -720,43 +720,44 @@ impl Templates<()> for ApiImpl {
                     }
                 }
                 TemplateBuildStartBaseSource::Template(alias) => {
-                    let base_runnable = match api.snapshot_manager.load_runnable(&alias).await {
-                        Ok(Some(runnable)) => runnable,
-                        Ok(None) => {
-                            warn!(
-                                build_id = %build_id,
-                                base_template = %alias,
-                                reason = "base template alias not found",
-                                "template build failed while resolving the base template"
-                            );
-                            mark_v2_build_error(
-                                &api,
-                                &build_id,
-                                TemplateBuildErrorReason::new(format!(
-                                    "template alias not found: {alias}"
-                                )),
-                            )
-                            .await;
-                            return;
-                        }
-                        Err(err) => {
-                            warn!(
-                                build_id = %build_id,
-                                base_template = %alias,
-                                error = %format_args!("{err:#}"),
-                                "template build failed while loading the base template"
-                            );
-                            mark_v2_build_error(
-                                &api,
-                                &build_id,
-                                TemplateBuildErrorReason::new(
-                                    Self::snapshot_manager_error(&err).message,
-                                ),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
+                    let base_runnable =
+                        match api.snapshot_manager.load_runnable(alias.as_ref()).await {
+                            Ok(Some(runnable)) => runnable,
+                            Ok(None) => {
+                                warn!(
+                                    build_id = %build_id,
+                                    base_template = %alias,
+                                    reason = "base template alias not found",
+                                    "template build failed while resolving the base template"
+                                );
+                                mark_v2_build_error(
+                                    &api,
+                                    &build_id,
+                                    TemplateBuildErrorReason::new(format!(
+                                        "template alias not found: {alias}"
+                                    )),
+                                )
+                                .await;
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    build_id = %build_id,
+                                    base_template = %alias,
+                                    error = %format_args!("{err:#}"),
+                                    "template build failed while loading the base template"
+                                );
+                                mark_v2_build_error(
+                                    &api,
+                                    &build_id,
+                                    TemplateBuildErrorReason::new(
+                                        Self::snapshot_manager_error(&err).message,
+                                    ),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
                     debug!(
                         build_id = %build_id,
                         base_template = %alias,

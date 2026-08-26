@@ -13,9 +13,11 @@ use tokio::task;
 
 use crate::snapshot::{RepositoryError, RepositoryResult};
 
+pub(crate) use artifacts::PosixFsArtifactStore;
+pub(crate) use backend::PosixFsSnapshotRepository;
 pub use backend::{PosixFsBackend, PosixFsBackendConfig};
-pub(crate) use backend::{PosixFsLocalArtifactStore, PosixFsSnapshotRepository};
 pub(crate) use layout::PosixFsSnapshotArtifactLayout;
+pub(crate) use runtime::PosixFsRuntimeResolver;
 
 fn persist_atomic_file(
     parent: &Path,

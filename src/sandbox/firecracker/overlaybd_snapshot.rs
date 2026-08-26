@@ -420,24 +420,6 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
-async fn rewrite_lowers_with_owned_runtime_suffix(
-    existing_lowers: Vec<LayerConfig>,
-    output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
-    compaction_output_name: &'static str,
-    compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
-    rewrite_lowers_with_runtime_roots(
-        existing_lowers,
-        output_dir,
-        appended_layer,
-        compaction_output_name,
-        canonicalized_runtime_owned_roots(),
-        compaction_output,
-    )
-    .await
-}
-
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -701,11 +683,12 @@ pub(super) async fn build_mem_snapshot_image_config(
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let lowers = rewrite_lowers_with_runtime_roots(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        canonicalized_runtime_owned_roots(),
         memory_output,
     )
     .await?;

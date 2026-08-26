@@ -109,6 +109,8 @@ pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
 struct ResolvedSourceUpper {
     data_path: PathBuf,
     index_path: Option<PathBuf>,
+    target_path: Option<PathBuf>,
+    gzip_index_path: Option<PathBuf>,
     writable_mode: UpperMode,
 }
 
@@ -119,17 +121,11 @@ enum ResolvedUpperMode {
     Absent,
 }
 
-#[derive(Debug)]
 pub(crate) async fn materialize_overlaybd_runtime(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
 ) -> Result<MaterializedOverlaybdRuntime> {
-    let upper_mode = resolve_upper_mode(
-        request.source_image_config,
-        request.read_only,
-        request.runtime_upper_mode,
-    )?;
     let claimed_runtime_dir = ClaimedRuntimeDir::claim(request.runtime_dir)?;
-    match materialize_runtime_contents(request, upper_mode).await {
+    match materialize_runtime_contents(request).await {
         Ok((runtime_image_config_path, actual_virtual_size)) => Ok(MaterializedOverlaybdRuntime {
             runtime_image_config_path,
             actual_virtual_size,
@@ -144,15 +140,14 @@ pub(crate) async fn materialize_overlaybd_runtime(
 
 async fn materialize_runtime_contents(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
-    upper_mode: ResolvedUpperMode,
 ) -> Result<(PathBuf, u64)> {
     let MaterializeOverlaybdRuntimeRequest {
         image_service_cache,
         source_image_config,
         global_config,
         runtime_dir,
-        read_only: _,
-        runtime_upper_mode: _,
+        read_only,
+        runtime_upper_mode,
         requested_virtual_size,
         known_source_virtual_size,
         resize_tool,
@@ -182,6 +177,7 @@ async fn materialize_runtime_contents(
         validate_requested_virtual_size(requested_virtual_size, base_virtual_size, allow_shrink)
             .map_err(|err| InvalidRequest(format!("{err:#}")))?;
 
+    let upper_mode = resolve_upper_mode(source_image_config, read_only, runtime_upper_mode)?;
     if actual_virtual_size != base_virtual_size
         && !matches!(upper_mode, ResolvedUpperMode::Create(_))
     {
@@ -534,12 +530,6 @@ fn resolve_source_upper(image_config_path: &Path) -> Result<Option<ResolvedSourc
         .unwrap_or_else(|| serde_json::json!({}));
     let upper: UpperConfig = serde_json::from_value(upper_value)
         .with_context(|| format!("parse overlaybd upper '{}'", image_config_path.display()))?;
-    if !upper.target.is_empty() || !upper.gzip_index.is_empty() {
-        return Err(InvalidRequest(
-            "OverlayBD upper target/gzipIndex state is unsupported".to_string(),
-        )
-        .into());
-    }
     if !validate_upper_config(&upper)? {
         return Ok(None);
     }
@@ -548,6 +538,12 @@ fn resolve_source_upper(image_config_path: &Path) -> Result<Option<ResolvedSourc
         data_path: resolve_config_path(base, &upper.data)?,
         index_path: (!upper.index.is_empty())
             .then(|| resolve_config_path(base, &upper.index))
+            .transpose()?,
+        target_path: (!upper.target.is_empty())
+            .then(|| resolve_config_path(base, &upper.target))
+            .transpose()?,
+        gzip_index_path: (!upper.gzip_index.is_empty())
+            .then(|| resolve_config_path(base, &upper.gzip_index))
             .transpose()?,
         writable_mode: upper.writable_mode(),
     }))
@@ -596,8 +592,14 @@ fn materialize_overlaybd_image_config(
             "data": relative_path(runtime_dir, &upper.data_path)?
                 .to_string_lossy()
                 .into_owned(),
-            "target": "",
-            "gzipIndex": ""
+            "target": match upper.target_path.as_ref() {
+                Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
+                None => String::new(),
+            },
+            "gzipIndex": match upper.gzip_index_path.as_ref() {
+                Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
+                None => String::new(),
+            }
         }),
     };
 
@@ -644,13 +646,8 @@ mod tests {
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) {
         let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
         let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path).unwrap());
-        let lower = create_file_rw(LayerInfo::new(
-            data_file,
-            Some(index_file),
-            payload.len() as u64,
-        ))
-        .await
-        .unwrap();
+        let args = LayerInfo::new(data_file, Some(index_file), payload.len() as u64);
+        let lower = create_file_rw(args).await.unwrap();
         lower.write_at(0, payload).await.unwrap();
         lower.close_seal().await.unwrap();
     }
@@ -678,7 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lower_only_runtime_creates_fresh_upper() {
+    async fn materialize_writable_lower_only_runtime_resolves_base_size_when_unknown() {
         let temp = tempfile::tempdir().unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
         let lower_path = temp.path().join("lower.data");

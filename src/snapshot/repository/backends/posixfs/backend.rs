@@ -4,10 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::super::shared_runtime_cache_root;
-use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
+use super::artifacts::{committed_snapshot, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
-use super::layout::{PosixFsSnapshotArtifactLayout, POSIXFS_SNAPSHOT_COMMIT_MARKER};
-use super::persist_atomic_file;
 use super::run_repository_blocking;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
@@ -16,9 +14,7 @@ use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::backends::common::validate_attached_drives;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
-use crate::snapshot::types::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
-};
+use crate::snapshot::types::{SnapshotId, SnapshotPublishMetadata, SnapshotRecord};
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -103,91 +99,6 @@ impl PosixFsBackend {
     ) {
         (self.repository, self.runtime_resolver)
     }
-
-    pub(crate) fn local_from_parts(
-        root: std::path::PathBuf,
-        runtime_cache_root: std::path::PathBuf,
-        store: Arc<dyn OverlaybdLayerStore>,
-        cache: Arc<LocalArtifactCache>,
-    ) -> (
-        Arc<PosixFsLocalArtifactStore>,
-        Arc<dyn SnapshotRuntimeResolver>,
-    ) {
-        let artifact_store = Arc::new(PosixFsLocalArtifactStore::new(root.clone()));
-        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
-            PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
-        );
-        (artifact_store, runtime_resolver)
-    }
-}
-
-#[derive(Clone)]
-/// Node-local physical snapshot artifacts without a metadata catalog.
-///
-/// The configured primary repository owns the canonical `SnapshotRecord`.
-/// This store only writes fixed files, managed layers, and a commit marker;
-/// the marker makes the closure visible to the local runtime resolver.
-pub(crate) struct PosixFsLocalArtifactStore {
-    root: std::path::PathBuf,
-    artifact_store: PosixFsArtifactStore,
-}
-
-impl PosixFsLocalArtifactStore {
-    pub(crate) fn new(root: std::path::PathBuf) -> Self {
-        Self {
-            artifact_store: PosixFsArtifactStore::new(root.clone()),
-            root,
-        }
-    }
-
-    pub(crate) async fn commit(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
-    ) -> RepositoryResult<CommittedSnapshot> {
-        let store = self.clone();
-        run_repository_blocking("publish local snapshot artifacts", move || {
-            validate_attached_drives(&manifest)?;
-            let built = store
-                .artifact_store
-                .import_built_artifacts(&metadata.id, &manifest);
-            let built = match built {
-                Ok(built) => built,
-                Err(error) => {
-                    store.remove_snapshot_dir(&metadata.id);
-                    return Err(error);
-                }
-            };
-            let committed = PosixFsSnapshotRepository::committed_snapshot(&metadata, built);
-            let layout = PosixFsSnapshotArtifactLayout::new(&store.root, &metadata.id);
-            let marker = layout.path(POSIXFS_SNAPSHOT_COMMIT_MARKER);
-            let parent = marker.parent().ok_or_else(|| RepositoryError::Backend {
-                message: format!(
-                    "resolve local snapshot marker parent '{}',",
-                    marker.display()
-                ),
-                source: None,
-            })?;
-            persist_atomic_file(parent, &marker, b"ready\n", "local snapshot commit marker")?;
-            Ok(committed)
-        })
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn commit_marker(&self, id: &SnapshotId) -> std::path::PathBuf {
-        PosixFsSnapshotArtifactLayout::new(&self.root, id).path(POSIXFS_SNAPSHOT_COMMIT_MARKER)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_committed(&self, id: &SnapshotId) -> bool {
-        self.commit_marker(id).is_file()
-    }
-
-    fn remove_snapshot_dir(&self, id: &SnapshotId) {
-        let path = PosixFsSnapshotArtifactLayout::new(&self.root, id).snapshot_dir();
-        let _ = std::fs::remove_dir_all(path);
-    }
 }
 
 #[derive(Clone)]
@@ -205,49 +116,17 @@ impl PosixFsSnapshotRepository {
         }
     }
 
-    fn committed_snapshot(
-        metadata: &SnapshotPublishMetadata,
-        built: CollectedBuiltArtifacts,
-    ) -> CommittedSnapshot {
-        CommittedSnapshot {
-            context: metadata.context.clone(),
-            startup: metadata.startup.clone(),
-            runtime_versions: metadata.runtime_versions.clone(),
-            virtualization_mode: metadata.virtualization_mode,
-            image_configs: metadata.image_configs.clone(),
-            custom_extension_params: metadata.custom_extension_params.clone(),
-            rootfs_layers: built.rootfs_layers,
-            attached_drives: built.attached_drives,
-            memory_layers: built.memory_layers,
-            disk_publications: Vec::new(),
-        }
-    }
-
     fn publish_sync(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
+        metadata
+            .validate()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         validate_attached_drives(&manifest)?;
 
         let session = self.catalog_store.begin_publish(&metadata.id)?;
-        let existing = match self
-            .catalog_store
-            .validate_publish_transition(&session, &metadata)
-        {
-            Ok(existing) => existing,
-            Err(error) => {
-                // `begin_publish` creates the per-identity staging directory
-                // before validation. Remove that empty staging directory on
-                // a rejected retry, but keep any already committed closure
-                // intact.
-                let _ = self.catalog_store.abort_publish(&session);
-                return Err(error);
-            }
-        };
-        if let Some(existing) = existing {
-            return Ok(existing);
-        }
         let built = match self
             .artifact_store
             .import_built_artifacts(&metadata.id, &manifest)
@@ -259,7 +138,7 @@ impl PosixFsSnapshotRepository {
             }
         };
 
-        let committed = Self::committed_snapshot(&metadata, built);
+        let committed = committed_snapshot(&metadata, built);
         match self
             .catalog_store
             .commit_publish(&session, metadata, committed)
@@ -327,7 +206,7 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             let Some(record) = catalog.get(&id_or_alias)? else {
                 return Ok(());
             };
-            catalog.delete_record(&record.id).map(|_| ())
+            catalog.delete_record(&record.id)
         })
         .await
     }

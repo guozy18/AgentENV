@@ -12,7 +12,7 @@ use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
 };
 use crate::snapshot::repository::backends::{
-    build_local_snapshot_backend, build_snapshot_backend, PosixFsLocalArtifactStore,
+    build_local_snapshot_backend, build_snapshot_backend, PosixFsArtifactStore,
 };
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
@@ -45,7 +45,7 @@ fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
 pub struct SnapshotManager {
     repository: Arc<dyn SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
-    local_artifacts: Option<Arc<PosixFsLocalArtifactStore>>,
+    local_artifacts: Option<Arc<PosixFsArtifactStore>>,
     local_runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
@@ -124,8 +124,7 @@ impl SnapshotManager {
         mut metadata: SnapshotPublishMetadata,
         mut manifest: FirecrackerSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let requested_type = metadata.snapshot_type;
-        if requested_type == SnapshotType::Distributed {
+        if metadata.snapshot_type == SnapshotType::Distributed {
             // Distributed capture follows the original repository path: the
             // configured primary backend owns artifact publication and the
             // canonical Ready record. A node-local artifact copy is not part
@@ -143,7 +142,9 @@ impl SnapshotManager {
             .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.repository.prepare_local_capture(&mut manifest).await?;
-        let committed = local_artifacts.commit(metadata.clone(), manifest).await?;
+        let committed = local_artifacts
+            .commit_local(metadata.clone(), manifest)
+            .await?;
         // The configured primary repository is the only public metadata
         // authority, even when the immutable bytes remain node-local.
         self.repository
@@ -411,30 +412,15 @@ impl SnapshotManager {
     /// Returns `Ok(())` on success. The operation is idempotent:
     /// if the snapshot does not exist, it is still considered success.
     pub async fn delete(&self, id_or_alias: impl AsRef<str>) -> anyhow::Result<()> {
-        let lookup = id_or_alias.as_ref();
-        let Some(record) = self
-            .repository
-            .get(lookup)
-            .await
-            .with_context(|| format!("load snapshot '{lookup}' before delete"))?
-        else {
-            return Ok(());
-        };
-        Self::ensure_local_delete_is_supported(&record)?;
         self.repository
-            .delete(lookup)
+            .delete(id_or_alias.as_ref())
             .await
-            .with_context(|| format!("delete snapshot '{lookup}' through repository"))?;
-        Ok(())
-    }
-
-    fn ensure_local_delete_is_supported(record: &SnapshotRecord) -> anyhow::Result<()> {
-        if record.snapshot_type == SnapshotType::Local {
-            return Err(anyhow::Error::new(RepositoryError::Unsupported {
-                feature: "deleting Local snapshots is not supported".to_string(),
-            }));
-        }
-        Ok(())
+            .with_context(|| {
+                format!(
+                    "delete snapshot '{}' through repository",
+                    id_or_alias.as_ref()
+                )
+            })
     }
 
     /// Resolves an alias to its committed snapshot id.
@@ -553,11 +539,12 @@ mod tests {
     ) -> (
         SnapshotManager,
         Arc<dyn SnapshotRepository>,
-        Arc<PosixFsLocalArtifactStore>,
+        std::path::PathBuf,
     ) {
         let (primary_repository, primary_resolver) = test_store(root, primary_name);
         let (_, local_resolver) = test_store(root, "local");
-        let local_artifacts = Arc::new(PosixFsLocalArtifactStore::new(root.join("local")));
+        let local_root = root.join("local");
+        let local_artifacts = Arc::new(PosixFsArtifactStore::new(local_root.clone()));
         let manager = SnapshotManager {
             repository: Arc::clone(&primary_repository),
             runtime_resolver: primary_resolver,
@@ -566,7 +553,11 @@ mod tests {
             node_id: node_id.to_string(),
             p2p_transport: None,
         };
-        (manager, primary_repository, local_artifacts)
+        (manager, primary_repository, local_root)
+    }
+
+    fn local_commit_marker(root: &Path, id: &SnapshotId) -> std::path::PathBuf {
+        root.join("snapshots").join(id.to_string()).join("commit")
     }
 
     fn captured_metadata(
@@ -685,7 +676,7 @@ mod tests {
                 .id,
             snapshot_id
         );
-        assert!(local.has_committed(&snapshot_id));
+        assert!(local_commit_marker(&local, &snapshot_id).is_file());
         assert!(!tempdir
             .path()
             .join("primary/snapshots")
@@ -699,11 +690,6 @@ mod tests {
                 .len(),
             1
         );
-        assert!(primary
-            .resolve_alias("local-one")
-            .await
-            .expect("canonical alias lookup should work")
-            .is_none());
         assert_eq!(
             manager
                 .resolve_runnable(record)
@@ -731,7 +717,7 @@ mod tests {
             )
             .await
             .expect_err("canonical metadata failure must fail the API operation");
-        assert!(local.has_committed(&snapshot_id));
+        assert!(local_commit_marker(&local, &snapshot_id).is_file());
         manager
             .get(&snapshot_id.to_string())
             .await
@@ -818,7 +804,7 @@ mod tests {
             .expect("Local canonical record must remain visible");
         assert_eq!(canonical.id, snapshot_id);
         assert_eq!(canonical.snapshot_type, SnapshotType::Local);
-        assert!(local.has_committed(&snapshot_id));
+        assert!(local_commit_marker(&local, &snapshot_id).is_file());
         assert!(!tempdir
             .path()
             .join("primary/snapshots")
@@ -839,7 +825,7 @@ mod tests {
             )
             .await
             .expect("Local snapshot should publish");
-        let marker = local.commit_marker(&snapshot_id);
+        let marker = local_commit_marker(&local, &snapshot_id);
         assert!(
             marker.exists(),
             "local publish should create a commit marker"
@@ -868,7 +854,7 @@ mod tests {
             .expect("canonical lookup should work")
             .expect("canonical Local record should remain visible");
         assert_eq!(canonical.snapshot_type, SnapshotType::Local);
-        assert!(!local.has_committed(&snapshot_id));
+        assert!(!local_commit_marker(&local, &snapshot_id).exists());
     }
 
     #[tokio::test]
@@ -921,8 +907,8 @@ mod tests {
             )
             .await
             .expect("same-ID promotion should work");
-        local
-            .commit(
+        PosixFsArtifactStore::new(local.clone())
+            .commit_local(
                 captured_metadata(snapshot_id.clone(), None, SnapshotType::Local),
                 mock_manifest(&tempdir.path().join("local-mirror")),
             )

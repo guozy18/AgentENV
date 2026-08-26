@@ -105,7 +105,6 @@ warm-pool = { path = "crates/warm-pool" }
 ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
 overlaybd = { path = "storage/overlaybd" }
 storage-util = { path = "storage/util" }
-dashmap = "6.1.0"
 io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
 sha2 = "0.10"

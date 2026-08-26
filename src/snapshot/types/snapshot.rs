@@ -97,7 +97,7 @@ pub enum TemplateBuildStatus {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TemplateBuildErrorReason {
     pub message: String,
     pub step: Option<String>,
@@ -148,7 +148,7 @@ impl fmt::Display for TemplateBuildErrorReason {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TemplateBuildInfo {
     pub status: TemplateBuildStatus,
     pub started_at_unix_ms: Option<i64>,
@@ -167,7 +167,7 @@ impl TemplateBuildInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotSource {
     Template { build: TemplateBuildInfo },
     Sandbox { source_sandbox_id: String },
@@ -178,21 +178,6 @@ impl SnapshotSource {
         match self {
             Self::Template { .. } => SnapshotSourceKind::Template,
             Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-        }
-    }
-
-    pub(crate) fn matches_publish_source(&self, requested: &SnapshotPublishSource) -> bool {
-        match (self, requested) {
-            (Self::Template { .. }, SnapshotPublishSource::Template) => true,
-            (
-                Self::Sandbox {
-                    source_sandbox_id: existing,
-                },
-                SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: requested,
-                },
-            ) => existing == requested,
-            _ => false,
         }
     }
 }
@@ -359,7 +344,7 @@ pub struct StartupCommand {
     pub context: CommandContext,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommittedSnapshot {
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
@@ -403,18 +388,7 @@ impl CommittedSnapshot {
     }
 }
 
-impl CommittedSnapshot {
-    pub(crate) fn matches_publish_metadata(&self, metadata: &SnapshotPublishMetadata) -> bool {
-        self.context == metadata.context
-            && self.startup == metadata.startup
-            && self.runtime_versions == metadata.runtime_versions
-            && self.virtualization_mode == metadata.virtualization_mode
-            && self.image_configs == metadata.image_configs
-            && self.custom_extension_params == metadata.custom_extension_params
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
     /// Storage availability of the committed reusable snapshot.
@@ -467,27 +441,6 @@ impl SnapshotRecord {
         }
     }
 
-    fn normalized_catalog_record(&self) -> Self {
-        let mut record = self.clone();
-        record.updated_at_unix_ms = 0;
-        record
-    }
-
-    /// Compares catalog contents while ignoring the update timestamp.
-    pub(crate) fn same_catalog_contents(&self, other: &Self) -> bool {
-        self.normalized_catalog_record() == other.normalized_catalog_record()
-    }
-
-    pub(crate) fn matches_publish_metadata(&self, metadata: &SnapshotPublishMetadata) -> bool {
-        self.alias == metadata.alias
-            && self.resources == metadata.resources
-            && self.source.matches_publish_source(&metadata.source)
-            && self
-                .committed
-                .as_ref()
-                .is_none_or(|committed| committed.matches_publish_metadata(metadata))
-    }
-
     pub(crate) fn validate_committed_metadata(&self) -> Result<(), String> {
         if self.committed.is_none() {
             return Err("committed snapshot metadata requires an artifact payload".to_string());
@@ -501,18 +454,12 @@ impl SnapshotRecord {
     }
 
     pub(crate) fn validate_template_create(&self) -> Result<(), String> {
-        let reason = if !matches!(&self.source, SnapshotSource::Template { .. }) {
-            Some("only template snapshots can be pre-created")
-        } else if self.committed.is_some() {
-            Some("pre-created template snapshots must not already be committed")
-        } else {
-            None
-        };
-
-        if let Some(reason) = reason {
-            return Err(reason.to_string());
+        if !matches!(&self.source, SnapshotSource::Template { .. }) {
+            return Err("only template snapshots can be pre-created".to_string());
         }
-
+        if self.committed.is_some() {
+            return Err("pre-created template snapshots must not already be committed".to_string());
+        }
         Ok(())
     }
 
@@ -538,28 +485,15 @@ impl SnapshotRecord {
         &mut self,
         reason: &TemplateBuildErrorReason,
         now_unix_ms: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         let SnapshotSource::Template { build } = &mut self.source else {
             return Err(format!("snapshot '{}' is not a template build", self.id));
         };
-        if build.status == TemplateBuildStatus::Ready {
-            return Ok(false);
-        }
-        if build.status == TemplateBuildStatus::Error {
-            if build.error_reason.as_ref() == Some(reason) {
-                return Ok(false);
-            }
-            return Err(format!(
-                "template build '{}' already has a different error",
-                self.id
-            ));
-        }
-
         build.status = TemplateBuildStatus::Error;
         build.finished_at_unix_ms = Some(now_unix_ms);
         build.error_reason = Some(reason.clone());
         self.updated_at_unix_ms = now_unix_ms;
-        Ok(true)
+        Ok(())
     }
 
     pub fn template_waiting(

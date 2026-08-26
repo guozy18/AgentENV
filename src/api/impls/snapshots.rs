@@ -8,7 +8,7 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotId, SnapshotRecord};
+use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -135,7 +135,11 @@ impl Snapshots<()> for ApiImpl {
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, ()> {
         match self.snapshot_manager.get(&path_params.snapshot_id).await {
-            Ok(Some(record)) => Ok(
+            // Scope this endpoint to sandbox-sourced snapshots so it stays
+            // consistent with the list API, which only exposes
+            // `SnapshotSourceKind::Sandbox` records. Template records are
+            // surfaced through the template APIs instead.
+            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => Ok(
                 SnapshotsSnapshotIdGetResponse::Status200_SuccessfullyReturnedTheSnapshot(
                     models::SnapshotInfo::from(record),
                 ),

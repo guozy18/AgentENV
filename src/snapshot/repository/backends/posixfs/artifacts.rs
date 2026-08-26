@@ -7,12 +7,12 @@ use tempfile::NamedTempFile;
 
 use super::super::common::{overlaybd_layer_uuid, write_dense_overlaybd_layer_to_file_blocking};
 use super::layout::PosixFsSnapshotArtifactLayout;
-use super::{persist_atomic_file, sync_dir};
+use super::{persist_atomic_file, run_repository_blocking, sync_dir};
 use crate::digest::{self, FileDigest};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RepositoryError,
+    RepositoryResult, SnapshotId, SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
@@ -24,6 +24,37 @@ pub struct PosixFsArtifactStore {
 impl PosixFsArtifactStore {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    pub(crate) async fn commit_local(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<CommittedSnapshot> {
+        let store = self.clone();
+        run_repository_blocking("publish local snapshot artifacts", move || {
+            super::super::common::validate_attached_drives(&manifest)?;
+            let built = match store.import_built_artifacts(&metadata.id, &manifest) {
+                Ok(built) => built,
+                Err(error) => {
+                    store.remove_snapshot_dir(&metadata.id);
+                    return Err(error);
+                }
+            };
+            let committed = committed_snapshot(&metadata, built);
+            let layout = PosixFsSnapshotArtifactLayout::new(&store.root, &metadata.id);
+            let marker = layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER);
+            let parent = marker.parent().ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve local snapshot marker parent '{}'",
+                    marker.display()
+                ),
+                source: None,
+            })?;
+            persist_atomic_file(parent, &marker, b"ready\n", "local snapshot commit marker")?;
+            Ok(committed)
+        })
+        .await
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -137,6 +168,11 @@ impl PosixFsArtifactStore {
         }
         persist_atomic_file(parent, &destination, &bytes, "firecracker manifest")?;
         Ok(())
+    }
+
+    fn remove_snapshot_dir(&self, id: &SnapshotId) {
+        let path = PosixFsSnapshotArtifactLayout::new(&self.root, id).snapshot_dir();
+        let _ = fs::remove_dir_all(path);
     }
 
     fn copy_local_artifact(&self, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
@@ -770,6 +806,24 @@ pub(crate) struct CollectedBuiltArtifacts {
     pub(crate) attached_drives: Vec<CommittedAttachedDrive>,
 }
 
+pub(crate) fn committed_snapshot(
+    metadata: &SnapshotPublishMetadata,
+    built: CollectedBuiltArtifacts,
+) -> CommittedSnapshot {
+    CommittedSnapshot {
+        context: metadata.context.clone(),
+        startup: metadata.startup.clone(),
+        runtime_versions: metadata.runtime_versions.clone(),
+        virtualization_mode: metadata.virtualization_mode,
+        image_configs: metadata.image_configs.clone(),
+        custom_extension_params: metadata.custom_extension_params.clone(),
+        rootfs_layers: built.rootfs_layers,
+        attached_drives: built.attached_drives,
+        memory_layers: built.memory_layers,
+        disk_publications: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -785,7 +839,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::layout::{managed_layer_file_name, PosixFsSnapshotArtifactLayout};
-    use super::{hard_link_or_copy_file_with_sha256, PosixFsArtifactStore};
+    use super::PosixFsArtifactStore;
     use crate::digest::FileDigest;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
@@ -991,23 +1045,6 @@ mod tests {
                 .path()
                 .join("managed-layers")
                 .join(managed_layer_file_name(&built.memory_layers[0].digest)),
-        );
-    }
-
-    #[test]
-    fn fixed_artifact_copy_refuses_to_replace_an_existing_name() {
-        let tempdir = TempDir::new().expect("tempdir");
-        let source = tempdir.path().join("source");
-        let destination = tempdir.path().join("destination");
-        fs::write(&source, b"new bytes").expect("source should write");
-        fs::write(&destination, b"committed bytes").expect("destination should write");
-
-        hard_link_or_copy_file_with_sha256(&source, &destination)
-            .expect_err("fixed artifact copy must not replace an existing destination");
-
-        assert_eq!(
-            fs::read(destination).expect("destination should remain readable"),
-            b"committed bytes"
         );
     }
 

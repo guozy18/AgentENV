@@ -99,6 +99,7 @@ services:
       - /dev:/dev
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
       - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-auth:/workspace/env/secrets
       - agentenv-snapshot-local-store-a:/workspace/env/snapshot-local-store
 
   agentenv-b:
@@ -113,6 +114,7 @@ services:
       - /dev:/dev
       - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
       - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-auth:/workspace/env/secrets
       - agentenv-snapshot-local-store-b:/workspace/env/snapshot-local-store
 
 volumes:

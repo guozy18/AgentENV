@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use agentenv::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
 use agentenv::sandbox::{
@@ -366,7 +365,7 @@ async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn backend_pause_state_survives_encoding_and_failed_resume_retry() -> Result<()> {
+async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
@@ -383,21 +382,6 @@ async fn backend_pause_state_survives_encoding_and_failed_resume_retry() -> Resu
 
     let decoded =
         agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
-
-    let mut failing_config = decoded.snapshot_config().clone();
-    failing_config.common.runtime_policy.envd_timeout = Duration::ZERO;
-    let mut failed_resume = FirecrackerSandbox::from_snapshot_config(&failing_config)?;
-    let resume_error = failed_resume
-        .start()
-        .await
-        .expect_err("zero envd timeout should fail after the runtime is restored");
-    failed_resume.stop().await?;
-    ensure!(
-        resume_error
-            .to_string()
-            .contains("timed out waiting for envd"),
-        "unexpected failed-resume error: {resume_error:#}"
-    );
 
     let mut resumed =
         FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;

@@ -77,20 +77,12 @@ impl From<OrchestratorError> for models::Error {
 impl From<SandboxState> for models::SandboxState {
     fn from(state: SandboxState) -> Self {
         match state {
-            SandboxState::Pausing | SandboxState::Paused => Self::Paused,
+            SandboxState::Pausing
+            | SandboxState::Paused
+            | SandboxState::Snapshotting
+            | SandboxState::Forking => Self::Paused,
             _ => Self::Running,
         }
-    }
-}
-
-fn internal_states_for_api_state(state: models::SandboxState) -> Vec<SandboxState> {
-    match state {
-        models::SandboxState::Running => vec![
-            SandboxState::Running,
-            SandboxState::Snapshotting,
-            SandboxState::Forking,
-        ],
-        models::SandboxState::Paused => vec![SandboxState::Pausing, SandboxState::Paused],
     }
 }
 
@@ -602,7 +594,7 @@ impl Sandboxes<()> for ApiImpl {
         query_params: &models::SandboxesGetQueryParams,
     ) -> Result<SandboxesGetResponse, ()> {
         let filter = SandboxListFilter {
-            states: Some(internal_states_for_api_state(models::SandboxState::Running)),
+            states: Some(vec![SandboxState::Running]),
             excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
         };
@@ -1383,7 +1375,10 @@ impl Sandboxes<()> for ApiImpl {
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, ()> {
         let states = if query_params.state.len() == 1 {
-            Some(internal_states_for_api_state(query_params.state[0]))
+            Some(vec![match query_params.state[0] {
+                models::SandboxState::Running => SandboxState::Running,
+                models::SandboxState::Paused => SandboxState::Paused,
+            }])
         } else {
             // Only two states are supported. If multiple states are provided,
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
@@ -1449,30 +1444,6 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capture_transitions_do_not_report_the_sandbox_as_paused() {
-        for (internal, api) in [
-            (SandboxState::Snapshotting, models::SandboxState::Running),
-            (SandboxState::Forking, models::SandboxState::Running),
-            (SandboxState::Pausing, models::SandboxState::Paused),
-        ] {
-            assert_eq!(models::SandboxState::from(internal), api);
-        }
-
-        assert_eq!(
-            internal_states_for_api_state(models::SandboxState::Running),
-            vec![
-                SandboxState::Running,
-                SandboxState::Snapshotting,
-                SandboxState::Forking,
-            ]
-        );
-        assert_eq!(
-            internal_states_for_api_state(models::SandboxState::Paused),
-            vec![SandboxState::Pausing, SandboxState::Paused]
-        );
-    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

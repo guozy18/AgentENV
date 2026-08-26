@@ -25,7 +25,7 @@ use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MockSnapshot;
 
 impl PausedSandboxState for MockSnapshot {
@@ -433,6 +433,6 @@ impl SandboxBackendFactory for MockBackendFactory {
         _artifact_root: std::path::PathBuf,
         _state: serde_json::Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
-        Ok(Arc::new(MockSnapshot::default()))
+        Ok(Arc::new(MockSnapshot))
     }
 }

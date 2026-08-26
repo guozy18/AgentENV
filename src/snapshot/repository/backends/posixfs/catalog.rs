@@ -80,9 +80,6 @@ impl PosixFsCatalogStore {
         metadata: SnapshotPublishMetadata,
         committed: CommittedSnapshot,
     ) -> RepositoryResult<SnapshotRecord> {
-        if let Some(existing) = self.validate_publish_transition(session, &metadata)? {
-            return Ok(existing);
-        }
         let now = now_unix_ms();
         let snapshot_id = metadata.id.clone();
         let record = self.committed_record_unlocked(&metadata, committed, now)?;
@@ -104,7 +101,16 @@ impl PosixFsCatalogStore {
         match write_result {
             Ok(()) => Ok(record),
             Err(error) => {
-                let _ = self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id);
+                if let Some(alias) = metadata.alias.as_ref() {
+                    let _ = self.with_alias_lock(alias, |store| {
+                        let alias_path =
+                            PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
+                        if store.load_alias_target(alias)?.as_ref() == Some(&snapshot_id) {
+                            store.remove_file_if_exists(&alias_path)?;
+                        }
+                        Ok(())
+                    });
+                }
                 Err(error)
             }
         }
@@ -122,25 +128,20 @@ impl PosixFsCatalogStore {
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
 
         let _record_guard = self.acquire_record_lock(&record.id)?;
-        if let Some(existing) = self.load_record_by_id_unlocked(&record.id)? {
-            if !existing.same_catalog_contents(&record) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "snapshot '{}' already exists with different metadata",
-                        record.id
-                    ),
-                });
-            }
-            if let Some(alias) = record.alias.as_ref() {
-                self.with_alias_lock(alias, |store| store.bind_alias_unlocked(alias, &record.id))?;
-            }
-            return Ok(existing);
+        if self.load_record_by_id_unlocked(&record.id)?.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
         }
 
         let write_result = if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
-                store.bind_alias_unlocked(alias, &record.id)?;
-                store.write_record_unlocked(&record)
+                store.ensure_alias_available(alias, &record.id)?;
+                store.write_record_unlocked(&record)?;
+                store.write_json(
+                    &PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias),
+                    &record.id,
+                )
             })
         } else {
             self.write_record_unlocked(&record)
@@ -159,79 +160,13 @@ impl PosixFsCatalogStore {
             .validate_committed_metadata()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let _record_guard = self.acquire_record_lock(&record.id)?;
-        if let Some(previous) = self.load_record_by_id_unlocked(&record.id)? {
-            if !previous.same_catalog_contents(&record) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "snapshot '{}' canonical metadata does not match the existing record",
-                        record.id
-                    ),
-                });
-            }
-            return Ok(previous);
+        if self.load_record_by_id_unlocked(&record.id)?.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
         }
         self.write_record_unlocked(&record)?;
         Ok(record)
-    }
-
-    /// Checks a publish while the session's record lock is held. Returning a
-    /// record means the request is an equivalent retry and no artifact should
-    /// be imported or metadata overwritten.
-    pub(crate) fn validate_publish_transition(
-        &self,
-        session: &PublishSession,
-        metadata: &SnapshotPublishMetadata,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        if session.snapshot_id != metadata.id {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "publish session and metadata snapshot IDs do not match".to_string(),
-            });
-        }
-        metadata
-            .validate()
-            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        let Some(existing) = self.load_record_by_id_unlocked(&metadata.id)? else {
-            return Ok(None);
-        };
-
-        if existing.committed.is_none() {
-            return Ok(None);
-        }
-        if existing.snapshot_type != metadata.snapshot_type
-            && !(existing.snapshot_type == SnapshotType::Local
-                && metadata.snapshot_type == SnapshotType::Distributed)
-        {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' storage type cannot transition", metadata.id),
-            });
-        }
-        if existing.owner_node_id != metadata.owner_node_id
-            && !(existing.snapshot_type == SnapshotType::Local
-                && metadata.snapshot_type == SnapshotType::Distributed)
-        {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' owner metadata does not match", metadata.id),
-            });
-        }
-        if !existing.matches_publish_metadata(metadata) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' metadata does not match", metadata.id),
-            });
-        }
-        if existing.snapshot_type == SnapshotType::Local
-            && metadata.snapshot_type == SnapshotType::Distributed
-        {
-            return Ok(None);
-        }
-        if !self.commit_marker_path(&metadata.id).exists() {
-            return Ok(None);
-        }
-        if let Some(alias) = existing.alias.as_ref() {
-            self.with_alias_lock(alias, |store| {
-                store.bind_alias_unlocked(alias, &existing.id)
-            })?;
-        }
-        Ok(Some(existing))
     }
 
     pub(crate) fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -246,7 +181,21 @@ impl PosixFsCatalogStore {
             SnapshotAlias::parse(id_or_alias).map_err(|error| RepositoryError::InvalidRequest {
                 reason: error.to_string(),
             })?;
-        self.load_alias_record(&alias, |store, id| store.load_record_by_id_unlocked(id))
+        self.with_alias_lock(&alias, |store| {
+            let Some(id) = store.load_alias_target(&alias)? else {
+                return Ok(None);
+            };
+            match store.load_record_by_id_unlocked(&id)? {
+                Some(record) => Ok(Some(record)),
+                None => {
+                    store.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::alias_path(
+                        &store.root,
+                        &alias,
+                    ))?;
+                    Ok(None)
+                }
+            }
+        })
     }
 
     pub(crate) fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -255,7 +204,9 @@ impl PosixFsCatalogStore {
             .load_all_records_unlocked()?
             .into_iter()
             .filter(|record| {
-                (record.committed.is_none() || self.is_committed(&record.id))
+                (record.committed.is_none()
+                    || record.snapshot_type == SnapshotType::Local
+                    || self.commit_marker_path(&record.id).exists())
                     && filter.matches(record)
             })
             .collect::<Vec<_>>();
@@ -303,16 +254,12 @@ impl PosixFsCatalogStore {
         Ok(records)
     }
 
-    pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<bool> {
+    pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let _record_guard = self.acquire_record_lock(id)?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
-            return Ok(false);
+            return Ok(());
         };
         let snapshot_layout = PosixFsSnapshotArtifactLayout::new(&self.root, id);
-        self.remove_file_if_exists(
-            &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
-        )?;
-        self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
         if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
                 if store.load_alias_target(alias)?.as_ref() == Some(id) {
@@ -321,12 +268,20 @@ impl PosixFsCatalogStore {
                         alias,
                     ))?;
                 }
+                store.remove_file_if_exists(
+                    &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
+                )?;
+                store.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
                 store.remove_file_if_exists(&store.record_path(id))
             })?;
         } else {
+            self.remove_file_if_exists(
+                &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
+            )?;
+            self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
             self.remove_file_if_exists(&self.record_path(id))?;
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Resolves one alias to a committed snapshot id and drops stale alias entries on the way.
@@ -342,10 +297,8 @@ impl PosixFsCatalogStore {
             if store.load_record_by_id_unlocked(&id)?.is_some() {
                 return Ok(Some(id));
             }
-            if store.load_record_by_id_unlocked(&id)?.is_none() {
-                let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, &alias);
-                store.remove_file_if_exists(&alias_path)?;
-            }
+            let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, &alias);
+            store.remove_file_if_exists(&alias_path)?;
             Ok(None)
         })
     }
@@ -363,11 +316,10 @@ impl PosixFsCatalogStore {
     }
 
     fn ensure_layout(&self) -> RepositoryResult<()> {
-        let catalog_dir = PosixFsSnapshotArtifactLayout::catalog_dir(&self.root);
         let aliases_dir = self.aliases_dir();
         let records_dir = self.records_dir();
         let snapshots_dir = self.snapshots_dir();
-        for dir in [&catalog_dir, &aliases_dir, &records_dir, &snapshots_dir] {
+        for dir in [&aliases_dir, &records_dir, &snapshots_dir] {
             fs::create_dir_all(dir).map_err(|error| {
                 RepositoryError::backend(format!("create catalog dir '{}'", dir.display()), error)
             })?;
@@ -400,12 +352,9 @@ impl PosixFsCatalogStore {
                 lookup: id.to_string(),
             }
         })?;
-        let changed = record
+        record
             .mark_template_build_error(&reason, now_unix_ms())
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        if !changed {
-            return Ok(());
-        }
         self.write_record_unlocked(&record)
     }
 
@@ -469,17 +418,6 @@ impl PosixFsCatalogStore {
         }
     }
 
-    fn is_committed(&self, id: &SnapshotId) -> bool {
-        self.load_record_by_id_unlocked(id)
-            .ok()
-            .flatten()
-            .is_some_and(|record| {
-                record.committed.is_some()
-                    && (record.snapshot_type == SnapshotType::Local
-                        || self.commit_marker_path(id).exists())
-            })
-    }
-
     fn cleanup_uncommitted_snapshot_dir(&self, id: &SnapshotId) -> RepositoryResult<()> {
         // An existing Distributed record still owns its repository closure
         // even if its visibility marker is missing. Local canonical metadata
@@ -510,26 +448,6 @@ impl PosixFsCatalogStore {
             return Ok(None);
         }
         self.read_json(&path).map(Some)
-    }
-
-    fn load_alias_record(
-        &self,
-        alias: &SnapshotAlias,
-        read: impl FnOnce(&Self, &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.with_alias_lock(alias, |store| {
-            let Some(id) = store.load_alias_target(alias)? else {
-                return Ok(None);
-            };
-            let record = read(store, &id)?;
-            if record.is_none() && store.load_record_by_id_unlocked(&id)?.is_none() {
-                store.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::alias_path(
-                    &store.root,
-                    alias,
-                ))?;
-            }
-            Ok(record)
-        })
     }
 
     fn acquire_file_lock(
@@ -618,21 +536,6 @@ impl PosixFsCatalogStore {
         action(self)
     }
 
-    fn bind_alias_unlocked(
-        &self,
-        alias: &SnapshotAlias,
-        snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<()> {
-        self.ensure_alias_available(alias, snapshot_id)?;
-        if self.load_alias_target(alias)?.as_ref() != Some(snapshot_id) {
-            self.write_json(
-                &PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias),
-                snapshot_id,
-            )?;
-        }
-        Ok(())
-    }
-
     fn ensure_alias_available(
         &self,
         alias: &SnapshotAlias,
@@ -666,18 +569,6 @@ impl PosixFsCatalogStore {
         now_unix_ms: i64,
     ) -> RepositoryResult<SnapshotRecord> {
         if let Some(mut record) = self.load_record_by_id_unlocked(&metadata.id)? {
-            if record.snapshot_type == metadata.snapshot_type {
-                if let Some(existing) = record.committed.as_ref() {
-                    if existing != &committed {
-                        return Err(RepositoryError::InvalidRequest {
-                            reason: format!(
-                                "snapshot '{}' committed artifact metadata does not match the existing record",
-                                metadata.id
-                            ),
-                        });
-                    }
-                }
-            }
             record.mark_committed(metadata, committed, now_unix_ms);
             record
                 .validate_committed_metadata()

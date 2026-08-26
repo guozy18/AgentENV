@@ -2369,44 +2369,6 @@ mod tests {
     }
 
     #[test]
-    fn successful_live_mutation_makes_followup_errors_terminal() {
-        for (live_runtime_mutated, expected_terminal) in [(false, false), (true, true)] {
-            let error = classify_after_live_mutation::<()>(
-                Err(anyhow::anyhow!("follow-up snapshot failure")),
-                live_runtime_mutated,
-            )
-            .expect_err("injected failure should remain an error");
-            assert_eq!(
-                SandboxCaptureError::from(error).is_terminal(),
-                expected_terminal
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_snapshot_cleanup_preserves_terminal_runtime_dependencies() -> Result<()> {
-        let root = TempDir::new()?;
-        let recoverable_dir = root.path().join("recoverable");
-        fs::create_dir(&recoverable_dir)?;
-        FirecrackerSandbox::cleanup_failed_snapshot_dir(
-            &recoverable_dir,
-            &anyhow::anyhow!("recoverable failure"),
-        )
-        .await;
-        assert!(!recoverable_dir.exists());
-
-        let terminal_dir = root.path().join("terminal");
-        fs::create_dir(&terminal_dir)?;
-        let terminal_error = anyhow::Error::new(SandboxCaptureError::terminal(anyhow::anyhow!(
-            "restacked runtime"
-        )))
-        .context("snapshot overlaybd runtime state");
-        FirecrackerSandbox::cleanup_failed_snapshot_dir(&terminal_dir, &terminal_error).await;
-        assert!(terminal_dir.exists());
-        Ok(())
-    }
-
-    #[test]
     fn snapshot_config_runtime_identity_replaces_source_auth() -> Result<()> {
         let source_id = SandboxId::new();
         let child_id = SandboxId::new();

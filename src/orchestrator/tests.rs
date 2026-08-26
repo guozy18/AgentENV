@@ -719,7 +719,7 @@ async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
 
 fn test_paused_state() -> &'static Arc<dyn PausedSandboxState> {
     static STATE: OnceLock<Arc<dyn PausedSandboxState>> = OnceLock::new();
-    STATE.get_or_init(|| Arc::new(MockSnapshot::default()))
+    STATE.get_or_init(|| Arc::new(MockSnapshot))
 }
 
 fn test_runnable_snapshot() -> &'static RunnableSnapshot {
@@ -3389,7 +3389,7 @@ async fn failed_resume_stays_resuming_when_durable_rollback_fails() -> Result<()
 }
 
 #[tokio::test]
-async fn delete_stop_failure_does_not_restore_a_potentially_destroyed_runtime() -> Result<()> {
+async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
@@ -3405,6 +3405,7 @@ async fn delete_stop_failure_does_not_restore_a_potentially_destroyed_runtime() 
         .create_sandbox(create_request(Some(60), &[("team", "delete-stop-failure")]))
         .await?;
     let sandbox_id = created.id;
+    let running_metrics = current_metrics(&orchestrator).await;
     assert_metrics_values(
         &orchestrator,
         1,
@@ -3428,8 +3429,14 @@ async fn delete_stop_failure_does_not_restore_a_potentially_destroyed_runtime() 
         }
     ));
 
+    assert!(
+        orchestrator.get_sandbox(&sandbox_id).await?.is_some(),
+        "metadata should still exist after failed delete"
+    );
+    assert_metrics_snapshot(&orchestrator, &running_metrics).await;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
