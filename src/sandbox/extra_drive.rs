@@ -278,6 +278,12 @@ pub fn normalize_mount_path_for_drive(drive_id: &str, mount_path: PathBuf) -> Re
     Ok(mount_path)
 }
 
+/// Compatibility fallback for persisted attached-drive metadata.
+pub(crate) fn normalize_mount_path_or_default(drive_id: &str, mount_path: PathBuf) -> PathBuf {
+    normalize_mount_path_for_drive(drive_id, mount_path)
+        .unwrap_or_else(|_| ExtraDrive::default_mount_path(drive_id))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DriveMount {
     pub(crate) drive_id: String,
@@ -364,7 +370,6 @@ pub(crate) async fn prepare_extra_drives(
     let mut mounts = Vec::with_capacity(extra_drives.len());
     let mut cleanup_paths = Vec::with_capacity(extra_drives.len());
     let mut runtimes = Vec::with_capacity(extra_drives.len());
-
     for drive in extra_drives {
         let result = async {
             let runtime_dir = drive.runtime_dir(sandbox_work_dir);

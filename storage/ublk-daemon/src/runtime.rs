@@ -569,7 +569,6 @@ fn materialize_overlaybd_image_config(
     let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
 
     rewrite_overlaybd_lower_paths(&mut value, base, runtime_dir)?;
-
     let upper = match upper_mode {
         ResolvedUpperMode::Absent => json!({}),
         ResolvedUpperMode::Create(mode) => {
@@ -1006,64 +1005,49 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_writable_existing_upper_reuses_source_upper() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "mode": "logStructured",
-                    "data": "existing-upper.data",
-                    "index": "existing-upper.index"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
+        for (existing_mode, has_index, requested_mode) in [
+            ("logStructured", true, UpperMode::Sparse),
+            ("sparse", false, UpperMode::LogStructured),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (cache, global_config) = test_cache(temp.path()).await;
+            let source = write_source(
+                temp.path(),
+                json!({
+                    "lowers": [],
+                    "upper": {
+                        "mode": existing_mode,
+                        "data": "existing-upper.data",
+                        "index": if has_index { "existing-upper.index" } else { "" }
+                    },
+                    "resultFile": ""
+                }),
+            );
+            let runtime_dir = temp.path().join("runtime");
 
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.runtime_upper_mode = UpperMode::Sparse;
-        request.known_source_virtual_size = Some(16384);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+            let mut request =
+                materialize_test_request(&cache, &source, &global_config, &runtime_dir);
+            request.runtime_upper_mode = requested_mode;
+            request.known_source_virtual_size = Some(16384);
+            let runtime = materialize_overlaybd_runtime(request).await.unwrap();
 
-        assert_eq!(runtime.actual_virtual_size, 16384);
-        assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
-        let image: Value =
-            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
-        assert_eq!(image["upper"]["index"], json!("../existing-upper.index"));
-    }
-
-    #[tokio::test]
-    async fn materialize_writable_existing_sparse_upper_reuses_source_upper() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "mode": "sparse",
-                    "data": "existing-upper.data"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.known_source_virtual_size = Some(8192);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
-
-        assert_eq!(runtime.actual_virtual_size, 8192);
-        assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
-        assert!(!runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists());
-        let image: Value =
-            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(image["upper"]["mode"], json!("sparse"));
-        assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
-        assert_eq!(image["upper"]["index"], json!(""));
+            assert_eq!(runtime.actual_virtual_size, 16384);
+            assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
+            assert!(!runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists());
+            let image: Value =
+                serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap())
+                    .unwrap();
+            assert_eq!(image["upper"]["mode"], json!(existing_mode));
+            assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
+            assert_eq!(
+                image["upper"]["index"],
+                json!(if has_index {
+                    "../existing-upper.index"
+                } else {
+                    ""
+                })
+            );
+        }
     }
 
     #[test]

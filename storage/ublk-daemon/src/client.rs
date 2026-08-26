@@ -387,9 +387,6 @@ impl UblkDaemonClient {
     }
 
     /// Create an OverlayBD runtime config and acquire a ublk device for it.
-    ///
-    /// This is the sandbox rootfs/extra-drive path. The daemon owns runtime
-    /// materialization and returns the generated runtime image config path.
     pub async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
@@ -459,7 +456,12 @@ impl UblkDaemonClient {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await.map_err(|error| {
+            RestackSnapshotTerminalFailure::new(format!(
+                "daemon: restack snapshot dev_id={dev_id} ended without a response; live-state mutation outcome is unknown: {error:#}"
+            ))
+        })?;
+        match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
                 data_stat,
@@ -479,6 +481,21 @@ impl UblkDaemonClient {
                 bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for restack snapshot: {other:?}"),
+        }
+    }
+
+    /// Flush a live image after its owning VM has stopped issuing I/O.
+    pub async fn sync_for_checkpoint(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::SyncForCheckpoint { dev_id };
+        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: checkpoint sync dev_id={dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: checkpoint sync dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for checkpoint sync: {other:?}"),
         }
     }
 

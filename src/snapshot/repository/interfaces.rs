@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::errors::RepositoryResult;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
-    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
+    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
 /// Snapshot record list filter.
@@ -75,13 +75,65 @@ impl SnapshotListFilter {
             ..Self::default()
         }
     }
+
+    pub(crate) fn matches(&self, record: &SnapshotRecord) -> bool {
+        if let Some(alias_prefix) = self.alias_prefix.as_deref() {
+            match record.alias.as_ref() {
+                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(ids) = self.snapshot_ids.as_ref() {
+            if !ids.iter().any(|id| id == &record.id) {
+                return false;
+            }
+        }
+
+        if let Some(id_or_alias) = self.snapshot_id_or_alias.as_deref() {
+            if record.id.to_string() != id_or_alias
+                && record
+                    .alias
+                    .as_ref()
+                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
+            {
+                return false;
+            }
+        }
+
+        if let Some(source_sandbox_id) = self.source_sandbox_id.as_deref() {
+            match &record.source {
+                SnapshotSource::Sandbox {
+                    source_sandbox_id: record_source_sandbox_id,
+                } if record_source_sandbox_id == source_sandbox_id => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(sources) = self.sources.as_ref() {
+            if !sources.contains(&record.source.kind()) {
+                return false;
+            }
+        }
+
+        if let Some(statuses) = self.template_statuses.as_ref() {
+            let SnapshotSource::Template { build } = &record.source else {
+                return false;
+            };
+            if !statuses.contains(&build.status) {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 #[async_trait]
-/// Durable snapshot repository.
+/// Repository for canonical snapshot metadata and Distributed artifacts.
 ///
 /// This trait owns the repository truth for [`SnapshotRecord`] values and committed snapshot
-/// artifacts. A record is the catalog identity and lifecycle state for a snapshot:
+/// artifacts. A record is the catalog identity and metadata for a snapshot:
 ///
 /// - template records may exist before build artifacts are committed
 /// - sandbox records are created by publishing an already captured runtime snapshot
@@ -92,7 +144,7 @@ impl SnapshotListFilter {
 ///
 /// - snapshot records and template build state
 /// - alias-to-snapshot bindings
-/// - committed artifacts such as Firecracker snapshots and managed layers
+/// - repository-backed committed artifacts such as Firecracker snapshots and managed layers
 /// - publish / delete visibility rules
 ///
 /// Callers may assume returned records describe durable repository state rather than process-local
@@ -140,6 +192,25 @@ pub trait SnapshotRepository: Send + Sync {
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord>;
+
+    /// Materializes backend-owned remote lowers that a node-local capture
+    /// cannot represent by reference before the local store imports them.
+    /// Repositories whose capture inputs are already local use the default.
+    async fn prepare_local_capture(
+        &self,
+        _manifest: &mut FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<()> {
+        Ok(())
+    }
+
+    /// Commits an already materialized logical record without importing its bytes.
+    ///
+    /// This is the canonical metadata commit used for Local snapshots: the
+    /// node-local POSIX store has already committed the immutable artifact
+    /// closure, while this repository owns public identity, alias, and
+    /// placement. Implementations must publish the record only after the
+    /// physical closure is ready.
+    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
 
     /// Loads one snapshot record by repository id or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;

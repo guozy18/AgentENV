@@ -5,6 +5,18 @@ use crate::snapshot::types::SnapshotId;
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 
+pub(crate) fn validate_attached_drive_virtual_size(
+    drive_id: &str,
+    virtual_size: u64,
+) -> RepositoryResult<()> {
+    if virtual_size != 0 {
+        return Ok(());
+    }
+    Err(RepositoryError::InvalidRequest {
+        reason: format!("attached drive '{drive_id}' virtual_size must be non-zero"),
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("invalid repository request: {reason}")]
@@ -38,6 +50,9 @@ pub enum RepositoryError {
 
     #[error("unsupported operation: {feature}")]
     Unsupported { feature: String },
+
+    #[error("snapshot unavailable: {reason}")]
+    Unavailable { reason: String },
 
     #[error("backend error: {message}")]
     Backend {

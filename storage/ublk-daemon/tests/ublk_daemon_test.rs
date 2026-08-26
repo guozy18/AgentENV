@@ -354,9 +354,10 @@ mod client_tests {
                 assert_eq!(requested_virtual_size, None);
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(!allow_shrink);
+                let dev_id = 11;
                 DaemonResponse::OverlaybdRuntimeDeviceCreated {
-                    dev_id: 11,
-                    device_path: PathBuf::from("/dev/ublkb11"),
+                    dev_id,
+                    device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
                     actual_virtual_size: 8192,
                     runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
                 }
@@ -368,17 +369,18 @@ mod client_tests {
         .await;
 
         let client = server.client();
+        let request = || CreateOverlaybdRuntimeDeviceRequest {
+            source_image_config: Path::new("/src/image.json"),
+            global_config: Path::new("/global.json"),
+            runtime_dir: Path::new("/work/overlaybd"),
+            read_only: false,
+            runtime_upper_mode: UpperMode::Sparse,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(8192),
+            allow_shrink: false,
+        };
         let device = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::Sparse,
-                requested_virtual_size: None,
-                known_source_virtual_size: Some(8192),
-                allow_shrink: false,
-            })
+            .create_overlaybd_runtime_device(request())
             .await
             .unwrap();
         assert_eq!(device.dev_id, 11);
@@ -680,6 +682,11 @@ mod client_tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not running"));
+        assert!(
+            err.downcast_ref::<RestackSnapshotTerminalFailure>()
+                .is_some(),
+            "restack without a response has an unknown mutation outcome"
+        );
     }
 
     // ── request dispatch verification ───────────────────────────────────
@@ -705,6 +712,7 @@ mod client_tests {
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
+                DaemonRequest::SyncForCheckpoint { .. } => DaemonResponse::Ok,
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -737,8 +745,9 @@ mod client_tests {
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
+        client.sync_for_checkpoint(17).await.unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -750,6 +759,9 @@ mod client_tests {
 
         assert!(requests[2].contains("RestackSnapshot"));
         assert!(requests[2].contains("40"));
+
+        assert!(requests[3].contains("SyncForCheckpoint"));
+        assert!(requests[3].contains("17"));
         assert!(requests[2].contains("output"));
     }
 }
@@ -1117,12 +1129,18 @@ mod server_tests {
     }
 
     #[tokio::test]
-    async fn acquire_overlaybd_exclusive_success() {
+    async fn acquire_overlaybd_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
-                dev_id: 10,
-                device_path: PathBuf::from("/dev/ublkb10"),
-            },
+            DaemonRequest::AcquireOverlaybd { access_mode, .. } => {
+                let dev_id = match access_mode {
+                    uvm_ublk_daemon::AccessMode::Exclusive => 10,
+                    uvm_ublk_daemon::AccessMode::Shared => 20,
+                };
+                DaemonResponse::DeviceAcquired {
+                    dev_id,
+                    device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
+                }
+            }
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
@@ -1141,25 +1159,7 @@ mod server_tests {
             .unwrap();
         assert_eq!(dev_id, 10);
         assert_eq!(path, PathBuf::from("/dev/ublkb10"));
-    }
 
-    #[tokio::test]
-    async fn acquire_overlaybd_shared_success() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::AcquireOverlaybd { access_mode, .. } => {
-                assert_eq!(access_mode, uvm_ublk_daemon::AccessMode::Shared);
-                DaemonResponse::DeviceAcquired {
-                    dev_id: 20,
-                    device_path: PathBuf::from("/dev/ublkb20"),
-                }
-            }
-            _ => DaemonResponse::Error {
-                message: "unexpected request".into(),
-            },
-        }))
-        .await;
-
-        let client = server.client();
         let (dev_id, path) = client
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),

@@ -1095,7 +1095,6 @@ pub(super) mod tests {
         blob_exists: bool,
         blob_head_429s_remaining: usize,
         manifest_exists: bool,
-        omit_manifest_digest: bool,
     }
 
     impl FakeState {
@@ -1142,6 +1141,22 @@ pub(super) mod tests {
 
     fn repo_blob_url(base: &str) -> String {
         format!("{base}/v2/ns/repo/blobs")
+    }
+
+    #[tokio::test]
+    async fn ensure_manifest_absent_rejects_overwrite() {
+        let state = Arc::new(Mutex::new(FakeState {
+            manifest_exists: true,
+            ..FakeState::default()
+        }));
+        let base = fake_server(state).await;
+
+        assert!(matches!(
+            client()
+                .ensure_manifest_absent(&manifest_url(&base, "tag"), "ns/repo", "tag")
+                .await,
+            Err(AcrClientError::ManifestExists { .. })
+        ));
     }
 
     pub(crate) fn client() -> AcrClient {
@@ -1319,12 +1334,10 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
         authorized_or_challenge(&headers, &state, |state| {
             state.manifest_puts.push(body.to_vec());
             let mut headers = AxumHeaderMap::new();
-            if !state.omit_manifest_digest {
-                headers.insert(
-                    "Docker-Content-Digest",
-                    HeaderValue::from_static("sha256:manifest"),
-                );
-            }
+            headers.insert(
+                "Docker-Content-Digest",
+                HeaderValue::from_static("sha256:manifest"),
+            );
             (AxumStatusCode::CREATED, headers).into_response()
         })
     }
@@ -1591,22 +1604,6 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
         let state = state.lock().unwrap();
         assert!(state.uploads.is_empty());
         assert_eq!(state.upload_completes, 0);
-    }
-
-    #[tokio::test]
-    async fn ensure_manifest_absent_rejects_overwrite() {
-        let state = Arc::new(Mutex::new(FakeState {
-            manifest_exists: true,
-            ..FakeState::default()
-        }));
-        let base = fake_server(state).await;
-
-        assert!(matches!(
-            client()
-                .ensure_manifest_absent(&manifest_url(&base, "tag"), "ns/repo", "tag")
-                .await,
-            Err(AcrClientError::ManifestExists { .. })
-        ));
     }
 
     #[tokio::test]

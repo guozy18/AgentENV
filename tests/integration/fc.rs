@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agentenv::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
 use agentenv::sandbox::{
-    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
-    SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    BaseSandboxNetworkPolicy, ExtraDrive, FirecrackerPausedState, FirecrackerSandbox,
+    FirecrackerSnapshotConfig, ProcessOpts, SandboxBackend, SandboxExecutor,
+    SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use overlaybd::backend::local::LocalFile;
-use overlaybd::config::ImageConfig;
+use overlaybd::config::{validate_upper_config, ImageConfig};
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
 
@@ -17,6 +19,10 @@ use crate::common;
 
 const DISK_MARKER: &str = "agentenv-disk-test-ok";
 const DISK_MARKER_PATH: &str = "/tmp/agentenv-test-marker";
+const TEMPORAL_ROOTFS_STATE_PATH: &str = "/tmp/agentenv-temporal-rootfs-state";
+const TEMPORAL_DRIVE_STATE_PATH: &str = "/mnt/data/agentenv-temporal-drive-state";
+
+type LowerSignature = Vec<(String, String, String, String, u64)>;
 
 fn lower_file_paths_from_image_config(image_config_path: &Path) -> Result<Vec<PathBuf>> {
     let image_config: ImageConfig = serde_json::from_slice(
@@ -59,6 +65,109 @@ fn assert_no_lower_paths_under(paths: &[PathBuf], root: &Path, context: &str) {
         "{context} should not reference managed snapshot lower paths under {}: {paths:?}",
         canonical_root.display()
     );
+}
+
+fn assert_temporal_overlaybd_generation(
+    image_config_path: &Path,
+    generation_dir: &Path,
+) -> Result<LowerSignature> {
+    let image_config = overlaybd::config::load_image_config(image_config_path)
+        .with_context(|| format!("load temporal image config {}", image_config_path.display()))?;
+    ensure!(
+        validate_upper_config(&image_config.upper)?,
+        "temporal image config {} should retain a writable upper",
+        image_config_path.display()
+    );
+
+    for (field, path) in [
+        ("upper.data", image_config.upper.data.as_str()),
+        ("upper.index", image_config.upper.index.as_str()),
+    ] {
+        if path.is_empty() {
+            continue;
+        }
+        let path = Path::new(path);
+        ensure!(
+            path.is_file(),
+            "{field} should exist in temporal generation: {}",
+            path.display()
+        );
+        ensure!(
+            path.starts_with(generation_dir),
+            "{field} should be owned by temporal generation {}: {}",
+            generation_dir.display(),
+            path.display()
+        );
+    }
+
+    Ok(image_config
+        .lowers
+        .into_iter()
+        .map(|lower| {
+            (
+                lower.digest,
+                lower.target_digest,
+                lower.uuid,
+                lower.repo_blob_url,
+                lower.size,
+            )
+        })
+        .collect())
+}
+
+async fn write_temporal_disk_state(sandbox: &mut FirecrackerSandbox, round: usize) -> Result<()> {
+    let value = format!("round-{round}");
+    let command = format!(
+        "printf '%s\\n' '{value}' > {TEMPORAL_ROOTFS_STATE_PATH} && \
+         printf '%s\\n' '{value}' > {TEMPORAL_DRIVE_STATE_PATH} && sync"
+    );
+    let output = sandbox.run_command("sh", &["-c", &command]).await?;
+    ensure!(
+        output.exit_code == 0,
+        "write temporal disk state failed: {}",
+        output.stderr
+    );
+    Ok(())
+}
+
+async fn verify_temporal_disk_state(sandbox: &mut FirecrackerSandbox, round: usize) -> Result<()> {
+    let command = format!(
+        "sync && echo 3 > /proc/sys/vm/drop_caches && \
+         cat {TEMPORAL_ROOTFS_STATE_PATH} && cat {TEMPORAL_DRIVE_STATE_PATH}"
+    );
+    let output = sandbox.run_command("sh", &["-c", &command]).await?;
+    ensure!(
+        output.exit_code == 0,
+        "read temporal disk state failed: {}",
+        output.stderr
+    );
+    let expected = format!("round-{round}\nround-{round}");
+    ensure!(
+        output.stdout.trim() == expected,
+        "temporal disk state mismatch: expected {expected:?}, got {:?}",
+        output.stdout.trim()
+    );
+    Ok(())
+}
+
+async fn verify_temporal_memory_processes(
+    sandbox: &mut FirecrackerSandbox,
+    processes: &[(u32, String)],
+) -> Result<()> {
+    for (pid, token) in processes {
+        let expected = format!("AGENTENV_TEMPORAL_TOKEN={token}");
+        let command = format!(
+            "test -r /proc/{pid}/environ && \
+             tr '\\000' '\\n' < /proc/{pid}/environ | grep -Fqx '{expected}'"
+        );
+        let output = sandbox.run_command("sh", &["-c", &command]).await?;
+        ensure!(
+            output.exit_code == 0,
+            "temporal memory process {pid} lost token {expected}: {}",
+            output.stderr
+        );
+    }
+    Ok(())
 }
 
 /// Write a marker file to guest disk via envd and verify it was written.
@@ -104,7 +213,11 @@ async fn verify_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
 /// the newest local lower is the last entry with a `file` path.
 async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
     let memory_config = &ConfigManager::global().config().memory_snapshot;
-    let image_config_path = &snapshot.mem_overlaybd_config.image_config_path;
+    let image_config_path = &snapshot
+        .mem_overlaybd_config
+        .as_ref()
+        .context("immutable snapshot should have overlaybd memory")?
+        .image_config_path;
     let image_config: ImageConfig = serde_json::from_slice(
         &fs::read(image_config_path)
             .with_context(|| format!("read image config {}", image_config_path.display()))?,
@@ -181,14 +294,19 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     assert!(snapshot.vm_state_path.exists());
-    assert!(snapshot.mem_overlaybd_config.image_config_path.exists());
+    assert!(snapshot
+        .mem_overlaybd_config
+        .as_ref()
+        .expect("immutable snapshot memory")
+        .image_config_path
+        .exists());
 
     sandbox.resume().await?;
     verify_disk_marker(&mut sandbox).await?;
 
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     sandbox.stop().await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
@@ -208,11 +326,18 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot_dir = tempfile::tempdir()?;
-    let (snapshot, _) = sandbox.pause_to_dir(snapshot_dir.path()).await?;
+    let (snapshot, _) = sandbox
+        .capture_immutable_checkpoint_to_dir(snapshot_dir.path())
+        .await?;
     sandbox.stop().await?;
 
     assert!(snapshot.vm_state_path.exists());
-    assert!(snapshot.mem_overlaybd_config.image_config_path.exists());
+    assert!(snapshot
+        .mem_overlaybd_config
+        .as_ref()
+        .expect("immutable snapshot memory")
+        .image_config_path
+        .exists());
     assert!(snapshot_dir
         .path()
         .join("mem_overlaybd/overlaybd.commit")
@@ -257,11 +382,159 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
 
     let decoded =
         agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
+
     let mut resumed =
         FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
     Ok(())
+}
+
+async fn run_temporal_pause_resume_case(rounds: usize) -> Result<()> {
+    common::setup().await;
+    let mut sandbox_config = common::default_sandbox_config()?;
+    sandbox_config.vcpu_count = 1;
+    sandbox_config.mem_size_mib = 128;
+    let attached_drive_image = sandbox_config
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .context("default sandbox should have a rootfs image config")?
+        .image_config_path
+        .clone();
+    sandbox_config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
+        "data",
+        attached_drive_image,
+        false,
+    )?];
+
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+    let artifact_base = tempfile::tempdir()?;
+    let mut memory_processes = Vec::new();
+    let mut baseline_rootfs_lowers: Option<LowerSignature> = None;
+    let mut baseline_drive_lowers: Option<LowerSignature> = None;
+
+    for round in 0..rounds {
+        let token = format!("temporal-memory-round-{round}");
+        let process_opts = ProcessOpts::new().with_envs(HashMap::from([(
+            "AGENTENV_TEMPORAL_TOKEN".to_string(),
+            token.clone(),
+        )]));
+        let process = sandbox
+            .start_process("sleep", &["1000000"], &process_opts)
+            .await?;
+        memory_processes.push((process.pid(), token));
+        write_temporal_disk_state(&mut sandbox, round).await?;
+
+        let artifact_root = artifact_base.path().join(format!("generation-{round}"));
+        let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root)).await?;
+        let firecracker_state = paused_state
+            .as_ref()
+            .downcast_ref::<FirecrackerPausedState>()
+            .context("expected Firecracker paused state")?;
+        let snapshot = firecracker_state.snapshot_config();
+
+        ensure!(
+            snapshot.mem_overlaybd_config.is_none(),
+            "temporal pause must not create immutable memory backing"
+        );
+        let temporal_memory_path = snapshot
+            .temporal_mem_file_path
+            .as_deref()
+            .context("temporal pause should have regular-file memory backing")?;
+        ensure!(temporal_memory_path == artifact_root.join("mem.bin"));
+        ensure!(
+            fs::metadata(temporal_memory_path)?.len() == snapshot.mem_virtual_size,
+            "temporal memory backing should have the exact guest memory size"
+        );
+        ensure!(snapshot.vm_state_path == artifact_root.join("vm_state.bin"));
+        ensure!(
+            fs::metadata(&snapshot.vm_state_path)?.is_file(),
+            "temporal pause should leave a complete regular vm-state file"
+        );
+        ensure!(!artifact_root.join("mem_image.json").exists());
+        ensure!(!artifact_root
+            .join("mem_overlaybd/overlaybd.commit")
+            .exists());
+        ensure!(!artifact_root.join("rootfs/snapshot.commit").exists());
+        ensure!(!artifact_root.join("drives/data/snapshot.commit").exists());
+
+        let rootfs_config = snapshot
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("temporal state should have a rootfs image config")?;
+        let rootfs_lowers = assert_temporal_overlaybd_generation(
+            &rootfs_config.image_config_path,
+            &artifact_root.join("rootfs"),
+        )?;
+        let drive_config_path = match snapshot.common.extra_drives.as_slice() {
+            [ExtraDrive::Overlaybd {
+                drive_id,
+                image_config_path,
+                read_only,
+                ..
+            }] => {
+                ensure!(drive_id == "data");
+                ensure!(!read_only);
+                image_config_path
+            }
+            drives => bail!("expected one temporal attached drive, got {drives:?}"),
+        };
+        let drive_lowers = assert_temporal_overlaybd_generation(
+            drive_config_path,
+            &artifact_root.join("drives/data"),
+        )?;
+
+        if let Some(baseline) = baseline_rootfs_lowers.as_ref() {
+            ensure!(
+                &rootfs_lowers == baseline,
+                "temporal rootfs immutable lower sequence changed in round {round}"
+            );
+        } else {
+            baseline_rootfs_lowers = Some(rootfs_lowers);
+        }
+        if let Some(baseline) = baseline_drive_lowers.as_ref() {
+            ensure!(
+                &drive_lowers == baseline,
+                "temporal attached-drive immutable lower sequence changed in round {round}"
+            );
+        } else {
+            baseline_drive_lowers = Some(drive_lowers);
+        }
+
+        let encoded = paused_state.encode()?;
+        sandbox.stop().await?;
+        drop(process);
+        drop(paused_state);
+
+        let decoded = FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
+        let mut resumed = FirecrackerSandbox::from_snapshot_config(decoded.snapshot_config())?;
+        resumed.start().await?;
+        drop(decoded);
+
+        tokio::fs::remove_dir_all(&artifact_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "remove consumed temporal generation {}",
+                    artifact_root.display()
+                )
+            })?;
+        verify_temporal_memory_processes(&mut resumed, &memory_processes).await?;
+        verify_temporal_disk_state(&mut resumed, round).await?;
+        sandbox = resumed;
+    }
+
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn temporal_pause_resume_preserves_mutable_state_without_growing_overlaybd_lowers(
+) -> Result<()> {
+    run_temporal_pause_resume_case(3).await
 }
 
 /// Verify multi-level snapshot chains: first → second → resume from second after
@@ -274,13 +547,15 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let first_snapshot = sandbox.pause().await?;
+    let first_snapshot = sandbox.capture_immutable_checkpoint().await?;
     assert_memory_layer_matches_config(&first_snapshot).await?;
     sandbox.stop().await?;
     let first_snapshot_dir = fs::canonicalize(first_snapshot.vm_state_path.parent().unwrap())?;
     let first_persistent_generation = fs::canonicalize(
         first_snapshot
             .mem_overlaybd_config
+            .as_ref()
+            .context("first snapshot should have overlaybd memory")?
             .image_config_path
             .parent()
             .context("first memory image should live under a persistent generation dir")?,
@@ -305,12 +580,16 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     // Resume from first, write additional data, pause again.
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&first_snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
-    let second_snapshot = resumed.pause().await?;
+    let second_snapshot = resumed.capture_immutable_checkpoint().await?;
     assert_memory_layer_matches_config(&second_snapshot).await?;
     resumed.stop().await?;
     let second_snapshot_dir = fs::canonicalize(second_snapshot.vm_state_path.parent().unwrap())?;
     let second_mem_lowers = lower_file_paths_from_image_config(
-        &second_snapshot.mem_overlaybd_config.image_config_path,
+        &second_snapshot
+            .mem_overlaybd_config
+            .as_ref()
+            .context("second snapshot should have overlaybd memory")?
+            .image_config_path,
     )?;
     assert!(
         second_mem_lowers
@@ -376,7 +655,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     // Also test pause_to_dir with snapshot-owned inherited layer adoption.
     let expected_snapshot_dir = tempfile::tempdir()?;
     let (dir_snapshot, _) = resumed_again
-        .pause_to_dir(expected_snapshot_dir.path())
+        .capture_immutable_checkpoint_to_dir(expected_snapshot_dir.path())
         .await?;
     resumed_again.stop().await?;
     let managed_snapshot_base_root = ConfigManager::global_config()
@@ -385,8 +664,13 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("agentenv"))
         .join("managed-snapshots");
-    let dir_snapshot_mem_lowers =
-        lower_file_paths_from_image_config(&dir_snapshot.mem_overlaybd_config.image_config_path)?;
+    let dir_snapshot_mem_lowers = lower_file_paths_from_image_config(
+        &dir_snapshot
+            .mem_overlaybd_config
+            .as_ref()
+            .context("directory snapshot should have overlaybd memory")?
+            .image_config_path,
+    )?;
     assert_no_lower_paths_under(
         &dir_snapshot_mem_lowers,
         &managed_snapshot_base_root,
@@ -442,7 +726,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     sandbox.stop().await?;
 
     // Resume multiple VMs sequentially from the same snapshot.
@@ -462,7 +746,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
             "per-vm write failed: {}",
             output.stderr
         );
-        let snap = resumed.pause().await?;
+        let snap = resumed.capture_immutable_checkpoint().await?;
         resumed.stop().await?;
         snapshots.push(snap);
     }
@@ -555,7 +839,7 @@ async fn microvm_can_access_internet() -> Result<()> {
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
     test_network(&mut sandbox, false).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     sandbox.stop().await?;
 
     let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;

@@ -1,23 +1,24 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
+use super::persist_atomic_file;
 use crate::snapshot::repository::SnapshotListFilter;
+use crate::snapshot::types::now_unix_ms;
 use crate::snapshot::{
     CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    SnapshotPublishMetadata, SnapshotRecord, SnapshotType, TemplateBuildErrorReason,
 };
-const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
-const ALIAS_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
-const RECORD_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
+const FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone)]
 pub struct PosixFsCatalogStore {
     root: PathBuf,
 }
@@ -25,18 +26,13 @@ pub struct PosixFsCatalogStore {
 #[derive(Debug)]
 pub(crate) struct PublishSession {
     pub(crate) snapshot_id: SnapshotId,
+    /// Serializes publish and delete for this identity.
+    _record_lock: PosixFileLockGuard,
 }
 
-#[derive(Debug)]
-struct PosixFileLockGuard {
-    path: PathBuf,
-}
-
-impl Drop for PosixFileLockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
+/// Kernel-owned advisory lock. Its stable path can outlive a process and be
+/// reused safely after the file descriptor is closed or the process exits.
+pub(super) type PosixFileLockGuard = Flock<fs::File>;
 
 impl PosixFsCatalogStore {
     /// Creates a catalog store rooted at the repository's durable POSIX directory.
@@ -62,7 +58,7 @@ impl PosixFsCatalogStore {
         &self,
         snapshot_id: &SnapshotId,
     ) -> RepositoryResult<PublishSession> {
-        self.ensure_layout()?;
+        let record_lock = self.acquire_record_lock(snapshot_id)?;
         let snapshot_dir = self.layout(snapshot_id).snapshot_dir();
         fs::create_dir_all(&snapshot_dir).map_err(|error| {
             RepositoryError::backend(
@@ -72,16 +68,12 @@ impl PosixFsCatalogStore {
         })?;
         Ok(PublishSession {
             snapshot_id: snapshot_id.clone(),
+            _record_lock: record_lock,
         })
     }
 
-    /// Commits one imported snapshot into the catalog and makes it visible via the commit marker.
-    ///
-    /// Flow:
-    /// 1. acquire the alias lock when an alias is present
-    /// 2. bind the alias
-    /// 3. write the commit marker
-    /// 4. write the committed snapshot record
+    /// Commits one imported snapshot into the catalog after its artifact
+    /// closure and commit marker are ready.
     pub(crate) fn commit_publish(
         &self,
         session: &PublishSession,
@@ -90,38 +82,24 @@ impl PosixFsCatalogStore {
     ) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
         let snapshot_id = metadata.id.clone();
+        let record = self.committed_record_unlocked(&metadata, committed, now)?;
         let write_result = if let Some(alias) = metadata.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
-                let record = store.committed_record_unlocked(&metadata, committed.clone(), now)?;
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                if let Some(existing) = store.load_alias_target(alias)? {
-                    if existing != snapshot_id {
-                        if store.load_record_by_id_unlocked(&existing)?.is_some() {
-                            return Err(RepositoryError::AliasConflict {
-                                alias: alias.to_string(),
-                                existing,
-                                new_id: snapshot_id.clone(),
-                            });
-                        }
-                        store.remove_file_if_exists(&alias_path)?;
-                    }
-                }
-                store.write_json(&alias_path, &snapshot_id)?;
+                store.ensure_alias_available(alias, &snapshot_id)?;
                 store.write_commit_marker(&session.snapshot_id)?;
-                store.write_committed_record_unlocked(&record)?;
-                Ok(record)
+                store.write_json(&alias_path, &snapshot_id)?;
+                store.write_record_unlocked(&record)
             })
         } else {
             (|| {
-                let record = self.committed_record_unlocked(&metadata, committed.clone(), now)?;
                 self.write_commit_marker(&session.snapshot_id)?;
-                self.write_committed_record_unlocked(&record)?;
-                Ok(record)
+                self.write_record_unlocked(&record)
             })()
         };
 
         match write_result {
-            Ok(record) => Ok(record),
+            Ok(()) => Ok(record),
             Err(error) => {
                 if let Some(alias) = metadata.alias.as_ref() {
                     let _ = self.with_alias_lock(alias, |store| {
@@ -133,36 +111,30 @@ impl PosixFsCatalogStore {
                         Ok(())
                     });
                 }
-                let _ = self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id);
                 Err(error)
             }
         }
     }
 
-    /// Cleans up an unfinished publish session that never reached the committed marker.
+    /// Cleans up an unfinished publish session that never reached a visible committed record.
     pub(crate) fn abort_publish(&self, session: &PublishSession) -> RepositoryResult<()> {
         self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id)
     }
 
     pub(crate) fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.ensure_layout()?;
-        if !matches!(record.source, SnapshotSource::Template { .. }) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "only template snapshots can be pre-created".to_string(),
-            });
-        }
-        if record.committed.is_some() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "pre-created template snapshots must not already be committed".to_string(),
-            });
-        }
+        record
+            .validate_template_create()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+
+        let _record_guard = self.acquire_record_lock(&record.id)?;
         if self.load_record_by_id_unlocked(&record.id)?.is_some() {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("snapshot '{}' already exists", record.id),
             });
         }
 
-        if let Some(alias) = record.alias.as_ref() {
+        let write_result = if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
                 store.ensure_alias_available(alias, &record.id)?;
                 store.write_record_unlocked(&record)?;
@@ -170,10 +142,30 @@ impl PosixFsCatalogStore {
                     &PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias),
                     &record.id,
                 )
-            })?;
+            })
         } else {
-            self.write_record_unlocked(&record)?;
+            self.write_record_unlocked(&record)
+        };
+        write_result.map(|()| record)
+    }
+
+    /// Persists canonical Local metadata without creating a second physical closure.
+    pub(crate) fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        if record.snapshot_type != SnapshotType::Local {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "metadata-only commits are supported only for Local snapshots".to_string(),
+            });
         }
+        record
+            .validate_committed_metadata()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        let _record_guard = self.acquire_record_lock(&record.id)?;
+        if self.load_record_by_id_unlocked(&record.id)?.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
+        }
+        self.write_record_unlocked(&record)?;
         Ok(record)
     }
 
@@ -208,6 +200,26 @@ impl PosixFsCatalogStore {
 
     pub(crate) fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
         self.ensure_layout()?;
+        let mut records = self
+            .load_all_records_unlocked()?
+            .into_iter()
+            .filter(|record| {
+                (record.committed.is_none()
+                    || record.snapshot_type == SnapshotType::Local
+                    || self.commit_marker_path(&record.id).exists())
+                    && filter.matches(record)
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .created_at_unix_ms
+                .cmp(&left.created_at_unix_ms)
+                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+        });
+        Ok(records)
+    }
+
+    fn load_all_records_unlocked(&self) -> RepositoryResult<Vec<SnapshotRecord>> {
         let records_dir = self.records_dir();
         let mut records = Vec::new();
         for entry in fs::read_dir(&records_dir).map_err(|error| {
@@ -237,48 +249,38 @@ impl PosixFsCatalogStore {
             if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let record: SnapshotRecord = self.read_json(&entry.path())?;
-            if Self::matches_record_filter(&record, &filter) {
-                records.push(record);
-            }
+            records.push(self.read_json(&entry.path())?);
         }
-        records.sort_by(|left, right| {
-            right
-                .created_at_unix_ms
-                .cmp(&left.created_at_unix_ms)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-        });
         Ok(records)
     }
 
     pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let _record_guard = self.acquire_record_lock(id)?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
-            // Idempotent: already doesn't exist
             return Ok(());
         };
+        let snapshot_layout = PosixFsSnapshotArtifactLayout::new(&self.root, id);
         if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
-                let snapshot_layout = PosixFsSnapshotArtifactLayout::new(&store.root, id);
-                let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
+                if store.load_alias_target(alias)?.as_ref() == Some(id) {
+                    store.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::alias_path(
+                        &store.root,
+                        alias,
+                    ))?;
+                }
                 store.remove_file_if_exists(
                     &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
                 )?;
-                if store.load_alias_target(alias)?.as_ref() == Some(id) {
-                    store.remove_file_if_exists(&alias_path)?;
-                }
-                if record.committed.is_some() {
-                    store.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
-                }
+                store.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
                 store.remove_file_if_exists(&store.record_path(id))
             })?;
-            return Ok(());
-        }
-        let snapshot_layout = self.layout(id);
-        self.remove_file_if_exists(&self.commit_marker_path(id))?;
-        if record.committed.is_some() {
+        } else {
+            self.remove_file_if_exists(
+                &snapshot_layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER),
+            )?;
             self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())?;
+            self.remove_file_if_exists(&self.record_path(id))?;
         }
-        self.remove_file_if_exists(&self.record_path(id))?;
         Ok(())
     }
 
@@ -314,11 +316,10 @@ impl PosixFsCatalogStore {
     }
 
     fn ensure_layout(&self) -> RepositoryResult<()> {
-        let catalog_dir = PosixFsSnapshotArtifactLayout::catalog_dir(&self.root);
         let aliases_dir = self.aliases_dir();
         let records_dir = self.records_dir();
         let snapshots_dir = self.snapshots_dir();
-        for dir in [&catalog_dir, &aliases_dir, &records_dir, &snapshots_dir] {
+        for dir in [&aliases_dir, &records_dir, &snapshots_dir] {
             fs::create_dir_all(dir).map_err(|error| {
                 RepositoryError::backend(format!("create catalog dir '{}'", dir.display()), error)
             })?;
@@ -333,21 +334,9 @@ impl PosixFsCatalogStore {
                 lookup: id.to_string(),
             }
         })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        if build.status != TemplateBuildStatus::Waiting {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
-            });
-        }
-        build.status = TemplateBuildStatus::Building;
-        build.started_at_unix_ms = Some(now);
-        build.error_reason = None;
-        record.updated_at_unix_ms = now;
+        record
+            .start_template_build(now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record_unlocked(&record)?;
         Ok(record)
     }
@@ -363,16 +352,9 @@ impl PosixFsCatalogStore {
                 lookup: id.to_string(),
             }
         })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        build.status = TemplateBuildStatus::Error;
-        build.finished_at_unix_ms = Some(now);
-        build.error_reason = Some(reason);
-        record.updated_at_unix_ms = now;
+        record
+            .mark_template_build_error(&reason, now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record_unlocked(&record)
     }
 
@@ -392,46 +374,13 @@ impl PosixFsCatalogStore {
     where
         T: Serialize,
     {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RepositoryError::backend(format!("create '{}'", parent.display()), error)
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
             RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
         })?;
-        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-            message: format!("resolve parent for '{}'", path.display()),
-            source: None,
-        })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
-        })?;
-        temp.write_all(&bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write temp json '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.as_file().sync_all().map_err(|error| {
-            RepositoryError::backend(format!("sync temp json '{}'", temp.path().display()), error)
-        })?;
-        let tmp_path = temp.path().to_path_buf();
-        temp.persist(path).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "persist json '{}' -> '{}'",
-                    tmp_path.display(),
-                    path.display()
-                ),
-                error.error,
-            )
-        })?;
-        Ok(())
+        self.write_atomic_bytes(path, &bytes, "json")
     }
 
-    fn write_commit_marker(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let path = self.commit_marker_path(id);
+    fn write_atomic_bytes(&self, path: &Path, bytes: &[u8], kind: &str) -> RepositoryResult<()> {
         let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
             message: format!("resolve parent for '{}'", path.display()),
             source: None,
@@ -439,25 +388,12 @@ impl PosixFsCatalogStore {
         fs::create_dir_all(parent).map_err(|error| {
             RepositoryError::backend(format!("create '{}'", parent.display()), error)
         })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(
-                format!("create temp commit marker in '{}'", path.display()),
-                error,
-            )
-        })?;
-        temp.write_all(b"committed").map_err(|error| {
-            RepositoryError::backend(
-                format!("write commit marker '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.persist(&path).map_err(|error| {
-            RepositoryError::backend(
-                format!("persist commit marker '{}'", path.display()),
-                error.error,
-            )
-        })?;
-        Ok(())
+        persist_atomic_file(parent, path, bytes, kind)
+    }
+
+    fn write_commit_marker(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let path = self.commit_marker_path(id);
+        self.write_atomic_bytes(&path, b"committed", "commit marker")
     }
 
     fn remove_file_if_exists(&self, path: &Path) -> RepositoryResult<()> {
@@ -482,17 +418,13 @@ impl PosixFsCatalogStore {
         }
     }
 
-    fn is_committed(&self, id: &SnapshotId) -> bool {
-        self.commit_marker_path(id).exists()
-            && self
-                .load_record_by_id_unlocked(id)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.committed.is_some())
-    }
-
     fn cleanup_uncommitted_snapshot_dir(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        if self.is_committed(id) {
+        // An existing Distributed record still owns its repository closure
+        // even if its visibility marker is missing. Local canonical metadata
+        // owns no artifacts under the primary repository root.
+        if self.load_record_by_id_unlocked(id)?.is_some_and(|record| {
+            record.snapshot_type == SnapshotType::Distributed && record.committed.is_some()
+        }) {
             return Ok(());
         }
         let snapshot_layout = self.layout(id);
@@ -521,11 +453,34 @@ impl PosixFsCatalogStore {
     fn acquire_file_lock(
         &self,
         lock_path: PathBuf,
-        contents: String,
-        stale_age: Duration,
         label: &'static str,
-        on_locked: impl Fn() -> RepositoryResult<PosixFileLockGuard>,
+        lock_arg: FlockArg,
     ) -> RepositoryResult<PosixFileLockGuard> {
+        let deadline = Instant::now() + FILE_LOCK_TIMEOUT;
+        loop {
+            if let Some(guard) = self.try_acquire_file_lock(&lock_path, label, lock_arg)? {
+                return Ok(guard);
+            }
+            if Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            return Err(RepositoryError::Backend {
+                message: format!(
+                    "timed out waiting for {label} lock '{}'",
+                    lock_path.display()
+                ),
+                source: None,
+            });
+        }
+    }
+
+    fn try_acquire_file_lock(
+        &self,
+        lock_path: &Path,
+        label: &'static str,
+        lock_arg: FlockArg,
+    ) -> RepositoryResult<Option<PosixFileLockGuard>> {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 RepositoryError::backend(
@@ -534,87 +489,41 @@ impl PosixFsCatalogStore {
                 )
             })?;
         }
-
-        let deadline = FILE_LOCK_TIMEOUT.map(|timeout| Instant::now() + timeout);
-        loop {
-            match fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&lock_path)
-            {
-                Ok(mut file) => {
-                    let guard = PosixFileLockGuard {
-                        path: lock_path.clone(),
-                    };
-                    file.write_all(contents.as_bytes()).map_err(|error| {
-                        RepositoryError::backend(
-                            format!("write {label} lock '{}'", lock_path.display()),
-                            error,
-                        )
-                    })?;
-                    return Ok(guard);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&lock_path)
-                        .ok()
-                        .and_then(|meta| meta.modified().ok())
-                        .and_then(|modified| modified.elapsed().ok())
-                        .map(|age| age > stale_age)
-                        .unwrap_or(false);
-                    if stale {
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
-                    }
-                    if let Some(deadline) = deadline {
-                        if Instant::now() < deadline {
-                            thread::sleep(Duration::from_millis(25));
-                            continue;
-                        }
-                    }
-                    return on_locked();
-                }
-                Err(error) => {
-                    return Err(RepositoryError::backend(
-                        format!("create {label} lock '{}'", lock_path.display()),
-                        error,
-                    ));
-                }
-            }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("open {label} lock '{}'", lock_path.display()),
+                    error,
+                )
+            })?;
+        match Flock::lock(file, lock_arg) {
+            Ok(file) => Ok(Some(file)),
+            Err((_file, Errno::EWOULDBLOCK)) => Ok(None),
+            Err((_file, error)) => Err(RepositoryError::backend(
+                format!("acquire {label} lock '{}'", lock_path.display()),
+                std::io::Error::from_raw_os_error(error as i32),
+            )),
         }
     }
 
     fn acquire_alias_lock(&self, alias: &SnapshotAlias) -> RepositoryResult<PosixFileLockGuard> {
-        let lock_path = PosixFsSnapshotArtifactLayout::alias_lock_path(&self.root, alias);
         self.acquire_file_lock(
-            lock_path.clone(),
-            std::process::id().to_string(),
-            ALIAS_LOCK_STALE_AGE,
+            PosixFsSnapshotArtifactLayout::alias_lock_path(&self.root, alias),
             "alias",
-            || {
-                Err(RepositoryError::Backend {
-                    message: format!("timed out waiting for alias lock '{}'", lock_path.display()),
-                    source: None,
-                })
-            },
+            FlockArg::LockExclusiveNonblock,
         )
     }
 
     fn acquire_record_lock(&self, id: &SnapshotId) -> RepositoryResult<PosixFileLockGuard> {
-        let lock_path = PosixFsSnapshotArtifactLayout::record_lock_path(&self.root, id);
         self.acquire_file_lock(
-            lock_path.clone(),
-            std::process::id().to_string(),
-            RECORD_LOCK_STALE_AGE,
+            PosixFsSnapshotArtifactLayout::record_lock_path(&self.root, id),
             "record",
-            || {
-                Err(RepositoryError::Backend {
-                    message: format!(
-                        "timed out waiting for record lock '{}'",
-                        lock_path.display()
-                    ),
-                    source: None,
-                })
-            },
+            FlockArg::LockExclusiveNonblock,
         )
     }
 
@@ -659,106 +568,19 @@ impl PosixFsCatalogStore {
         committed: CommittedSnapshot,
         now_unix_ms: i64,
     ) -> RepositoryResult<SnapshotRecord> {
-        let id = metadata.id.clone();
-        let alias = metadata.alias.clone();
-        let resources = metadata.resources;
-        let source = metadata.source.clone();
-        if let Some(mut record) = self.load_record_by_id_unlocked(&id)? {
-            record.mark_committed(alias, resources, committed, source, now_unix_ms);
+        if let Some(mut record) = self.load_record_by_id_unlocked(&metadata.id)? {
+            record.mark_committed(metadata, committed, now_unix_ms);
+            record
+                .validate_committed_metadata()
+                .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
             return Ok(record);
         }
-
-        let source = match source {
-            SnapshotPublishSource::Template => SnapshotSource::Template {
-                build: TemplateBuildInfo {
-                    status: TemplateBuildStatus::Ready,
-                    started_at_unix_ms: None,
-                    finished_at_unix_ms: Some(now_unix_ms),
-                    error_reason: None,
-                },
-            },
-            SnapshotPublishSource::Sandbox { source_sandbox_id } => {
-                SnapshotSource::Sandbox { source_sandbox_id }
-            }
-        };
-
-        Ok(SnapshotRecord {
-            id,
-            alias,
-            source,
-            resources,
-            created_at_unix_ms: now_unix_ms,
-            updated_at_unix_ms: now_unix_ms,
-            committed: Some(committed),
-        })
+        Ok(SnapshotRecord::new_committed(
+            metadata,
+            committed,
+            now_unix_ms,
+        ))
     }
-
-    fn write_committed_record_unlocked(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        self.write_record_unlocked(record)
-    }
-
-    fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-        if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
-                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(ids) = filter.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
-                return false;
-            }
-        }
-
-        if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
-            {
-                return false;
-            }
-        }
-
-        if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-            match &record.source {
-                SnapshotSource::Sandbox {
-                    source_sandbox_id: record_source_sandbox_id,
-                } if record_source_sandbox_id == source_sandbox_id => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(sources) = filter.sources.as_ref() {
-            let source = match &record.source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
-                return false;
-            }
-        }
-
-        if let Some(statuses) = filter.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = &record.source else {
-                return false;
-            };
-            if !statuses.contains(&build.status) {
-                return false;
-            };
-        }
-
-        true
-    }
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

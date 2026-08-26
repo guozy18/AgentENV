@@ -16,6 +16,8 @@ pub struct SnapshotInfo {
     pub names: Vec<String>,
     #[serde(rename = "imageRef", default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+    #[serde(rename = "snapshotType", default)]
+    pub snapshot_type: Option<String>,
 }
 
 impl Client {

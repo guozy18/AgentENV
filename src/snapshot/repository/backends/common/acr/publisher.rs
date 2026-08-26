@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_remote_source_registry_image_publishes_manifest_without_layer_upload() {
+    async fn source_registry_manifest_publication() {
         let state = Arc::new(Mutex::new(FakeState::with_existing_blobs()));
         let base = fake_server(Arc::clone(&state)).await;
         let dir = TempDir::new().unwrap();
@@ -470,6 +470,7 @@ mod tests {
                 }),
             ]
         );
+
         let (_, expected_config_digest, _) = snapshot_oci_config_blob(
             host_architecture_for_oci(),
             SnapshotOciConfigInput::new(&context, Some(&raw)),

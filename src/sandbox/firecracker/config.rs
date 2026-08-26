@@ -456,8 +456,12 @@ pub struct FirecrackerSnapshotConfig {
     pub common: FirecrackerCommonConfig,
     /// The path to the Firecracker VM state snapshot file (for example, `vm_state.bin`).
     pub vm_state_path: PathBuf,
-    /// The memory overlaybd image config (image config path + read_only).
-    pub mem_overlaybd_config: OverlaybdConfig,
+    /// Immutable memory backing used by reusable snapshots and forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_overlaybd_config: Option<OverlaybdConfig>,
+    /// Mutable, sandbox-owned memory continuation used only by pause/resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_mem_file_path: Option<PathBuf>,
     /// Virtual size of the memory image in bytes.
     pub mem_virtual_size: u64,
     /// If `None`, the caller is responsible for managing the snapshot directory lifecycle.
@@ -528,7 +532,8 @@ impl FirecrackerSnapshotConfig {
         Ok(Self {
             common: snapshot_common,
             vm_state_path: manifest.vm_state.path.clone(),
-            mem_overlaybd_config,
+            mem_overlaybd_config: Some(mem_overlaybd_config),
+            temporal_mem_file_path: None,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
         })
@@ -559,27 +564,66 @@ impl FirecrackerSnapshotConfig {
             rootfs_virtual_size > 0,
             "rootfs virtual size must be non-zero"
         );
+        anyhow::ensure!(
+            self.mem_virtual_size > 0,
+            "memory virtual size must be non-zero"
+        );
         if !self.vm_state_path.exists() {
             anyhow::bail!(
                 "vm state snapshot not found at {}",
                 self.vm_state_path.display()
             );
         }
-        if !self.mem_overlaybd_config.image_config_path.exists() {
-            anyhow::bail!(
-                "mem overlaybd image config not found at {}",
-                self.mem_overlaybd_config.image_config_path.display()
-            );
+        match (
+            self.mem_overlaybd_config.as_ref(),
+            self.temporal_mem_file_path.as_deref(),
+        ) {
+            (Some(memory), None) => {
+                if !memory.image_config_path.exists() {
+                    anyhow::bail!(
+                        "mem overlaybd image config not found at {}",
+                        memory.image_config_path.display()
+                    );
+                }
+                if !memory.image_config_path.is_file() {
+                    anyhow::bail!(
+                        "mem overlaybd image config path is not a file: {}",
+                        memory.image_config_path.display()
+                    );
+                }
+            }
+            (None, Some(memory_path)) => {
+                let metadata = fs::metadata(memory_path).with_context(|| {
+                    format!(
+                        "temporal memory file not found at {}",
+                        memory_path.display()
+                    )
+                })?;
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "temporal memory path is not a file: {}",
+                    memory_path.display()
+                );
+                anyhow::ensure!(
+                    metadata.len() == self.mem_virtual_size,
+                    "temporal memory file size mismatch at {}: expected {}, got {}",
+                    memory_path.display(),
+                    self.mem_virtual_size,
+                    metadata.len()
+                );
+            }
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "snapshot memory backing must not contain both overlaybd and temporal files"
+                );
+            }
+            (None, None) => {
+                anyhow::bail!("snapshot memory backing is missing");
+            }
         }
         let rootfs_path = &rootfs_image_config.image_config_path;
         if !rootfs_path.exists() {
             anyhow::bail!("base rootfs not found at {}", rootfs_path.display());
-        }
-        if !self.mem_overlaybd_config.image_config_path.is_file() {
-            anyhow::bail!(
-                "mem overlaybd image config path is not a file: {}",
-                self.mem_overlaybd_config.image_config_path.display()
-            );
         }
         if !rootfs_path.is_file() {
             anyhow::bail!("base rootfs path is not a file: {}", rootfs_path.display());
@@ -841,11 +885,12 @@ mod tests {
         let mut snapshot = FirecrackerSnapshotConfig {
             common,
             vm_state_path: vm_state_path.clone(),
-            mem_overlaybd_config: OverlaybdConfig {
+            mem_overlaybd_config: Some(OverlaybdConfig {
                 image_config_path: image_config_path.clone(),
                 read_only: true,
                 runtime_upper_mode: UpperMode::LogStructured,
-            },
+            }),
+            temporal_mem_file_path: None,
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
         };
@@ -877,6 +922,42 @@ mod tests {
 
         fs::write(&rootfs_path, b"rootfs")?;
         snapshot.validate_persisted()?;
+
+        let temporal_memory_path = temp.path().join("mem.bin");
+        fs::File::create(&temporal_memory_path)?.set_len(4096)?;
+        snapshot.mem_overlaybd_config = None;
+        snapshot.temporal_mem_file_path = Some(temporal_memory_path.clone());
+        snapshot.validate_persisted()?;
+
+        fs::File::options()
+            .write(true)
+            .open(&temporal_memory_path)?
+            .set_len(2048)?;
+        let error = snapshot
+            .validate_persisted()
+            .expect_err("wrong-sized temporal memory must be rejected");
+        assert!(error.to_string().contains("size mismatch"));
+
+        fs::File::options()
+            .write(true)
+            .open(&temporal_memory_path)?
+            .set_len(4096)?;
+        snapshot.mem_overlaybd_config = Some(OverlaybdConfig {
+            image_config_path,
+            read_only: true,
+            runtime_upper_mode: UpperMode::LogStructured,
+        });
+        let error = snapshot
+            .validate_persisted()
+            .expect_err("two memory backings must be rejected");
+        assert!(error.to_string().contains("must not contain both"));
+
+        snapshot.mem_overlaybd_config = None;
+        snapshot.temporal_mem_file_path = None;
+        let error = snapshot
+            .validate_persisted()
+            .expect_err("missing memory backing must be rejected");
+        assert!(error.to_string().contains("memory backing is missing"));
         Ok(())
     }
 

@@ -19,7 +19,8 @@ use crate::orchestrator::{
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    CommandContext, RepositoryError, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotType,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -635,9 +636,12 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(err) => {
                 warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(match error.code {
+                    400 => SandboxesPostResponse::Status400_BadRequest(error),
+                    503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
+                    _ => SandboxesPostResponse::Status500_ServerError(error),
+                });
             }
         };
 
@@ -1130,19 +1134,31 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
 
-        let alias = match &body.name {
-            Some(name) => match SnapshotAlias::parse(name) {
-                Ok(alias) => Some(alias),
-                Err(err) => {
-                    return Ok(
-                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                            400,
-                            format!("invalid snapshot alias: {}", err),
-                        )),
-                    );
-                }
-            },
-            None => None,
+        let snapshot_type = match body
+            .snapshot_type
+            .unwrap_or(models::SnapshotType::Distributed)
+        {
+            models::SnapshotType::Local => SnapshotType::Local,
+            models::SnapshotType::Distributed => SnapshotType::Distributed,
+        };
+        if snapshot_type == SnapshotType::Local && body.name.is_some() {
+            return Ok(
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    "Local snapshots do not support aliases",
+                )),
+            );
+        }
+        let alias = match body.name.as_deref().map(SnapshotAlias::parse).transpose() {
+            Ok(alias) => alias,
+            Err(error) => {
+                return Ok(
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        format!("invalid snapshot alias: {error}"),
+                    )),
+                )
+            }
         };
 
         let capture = match timer
@@ -1178,6 +1194,8 @@ impl Sandboxes<()> for ApiImpl {
                 self.snapshot_manager.publish_captured(
                     SnapshotPublishMetadata {
                         id: SnapshotId::generate(),
+                        snapshot_type,
+                        owner_node_id: None,
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),
@@ -1197,16 +1215,24 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                let error =
+                let error = if matches!(
+                    err,
+                    RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. }
+                ) {
+                    Self::reusable_snapshot_error(&err)
+                } else {
                     Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
                         warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
                         Self::error(500, err.to_string())
-                    });
-                return Ok(Self::client_or_server_response(
-                    error,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
-                ));
+                    })
+                };
+                return Ok(match error.code {
+                    400 => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                    503 => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status503_ServiceUnavailable(error)
+                    }
+                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                });
             }
         };
 

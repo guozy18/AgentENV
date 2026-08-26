@@ -25,6 +25,7 @@ pub use backend::{
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
+pub(crate) use extra_drive::normalize_mount_path_or_default;
 pub use extra_drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
     ExtraDrive,

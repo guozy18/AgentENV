@@ -1298,7 +1298,7 @@ where
         self.ensure_accepting_lifecycle_operations()?;
 
         info!("resuming sandbox");
-        let mut metadata = self
+        let metadata = self
             .store
             .get(&sandbox_id)
             .await?
@@ -1307,9 +1307,7 @@ where
         // If another resume is in progress, wait for it to complete and
         // re-evaluate the resulting stable state.
         if metadata.state == SandboxState::Resuming {
-            metadata = self
-                .wait_for_transition(sandbox_id, SandboxState::Resuming)
-                .await?;
+            return self.join_concurrent_resume(sandbox_id, timeout).await;
         }
 
         match metadata.state {
@@ -1334,6 +1332,10 @@ where
                 node_mode,
             });
         }
+        let paused_state = metadata.paused_state.as_ref().cloned().ok_or_else(|| {
+            warn!("missing paused state while resuming");
+            OrchestratorError::InternalError("missing paused state".to_string())
+        })?;
 
         match self
             .store
@@ -1370,6 +1372,12 @@ where
 
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
+            if let Err(rollback_error) = self.persister.rollback_resuming(&sandbox_id).await {
+                warn!(error = ?rollback_error, "failed to restore persisted sandbox record after mark-resuming failure; keeping sandbox Resuming");
+                return Err(OrchestratorError::InternalError(format!(
+                    "failed to mark persisted sandbox record as resuming: {err:#}; durable rollback also failed: {rollback_error:#}"
+                )));
+            }
             let _ = self
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
@@ -1379,15 +1387,10 @@ where
             )));
         }
 
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            warn!("missing paused state while resuming");
-            OrchestratorError::InternalError("missing paused state".to_string())
-        })?;
-
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
-                Arc::clone(paused_state),
+                paused_state,
                 timeout,
                 metadata.resources,
                 metadata
@@ -2089,6 +2092,7 @@ where
         }
 
         let launch_timeout = plan.timeout();
+        let is_resume = matches!(plan, LaunchPlan::Resume(_));
         let final_metadata = match self
             .store
             .update_if_state(
@@ -2097,6 +2101,9 @@ where
                 move |metadata| {
                     metadata.resources = runtime_resources;
                     metadata.state = SandboxState::Running;
+                    if is_resume {
+                        metadata.paused_state = None;
+                    }
                     metadata.update_timeout(launch_timeout);
                 },
             )
@@ -2131,7 +2138,7 @@ where
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
         }
 
-        if matches!(plan, LaunchPlan::Resume(_)) {
+        if is_resume {
             if let Err(err) = self.persister.delete_record(&sandbox_id).await {
                 warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
             }
@@ -2214,20 +2221,25 @@ where
                     warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
                 }
             }
-            LaunchPlan::Resume(_) => {
+            LaunchPlan::Resume(resume) => {
+                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
+                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback; keeping sandbox Resuming");
+                    return;
+                }
+                let paused_state = Arc::clone(&resume.paused_state);
                 if let Err(err) = self
                     .store
-                    .update_state_if_state(
+                    .update_if_state(
                         &plan.sandbox_id(),
-                        SandboxState::Paused,
                         std::slice::from_ref(&expected_state),
+                        move |metadata| {
+                            metadata.state = SandboxState::Paused;
+                            metadata.paused_state = Some(paused_state);
+                        },
                     )
                     .await
                 {
                     warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
-                }
-                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
                 }
             }
         }

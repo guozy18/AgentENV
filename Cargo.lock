@@ -108,7 +108,6 @@ dependencies = [
  "clap",
  "confique",
  "custom_extension_client",
- "dashmap",
  "envd",
  "firecracker_client",
  "flate2",

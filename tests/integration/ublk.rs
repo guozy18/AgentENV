@@ -59,7 +59,7 @@ async fn overlaybd_ublk_lifecycle() -> Result<()> {
         .await?;
     assert_eq!(output.exit_code, 0);
 
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox.capture_immutable_checkpoint().await?;
     sandbox.stop().await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;

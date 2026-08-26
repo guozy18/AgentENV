@@ -550,6 +550,9 @@ async fn handle_connection(
             dev_id,
             output_layer_path,
         } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
+        DaemonRequest::SyncForCheckpoint { dev_id } => {
+            handle_sync_for_checkpoint(&devices, &pool_state, dev_id).await
+        }
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
@@ -956,27 +959,7 @@ async fn handle_restack_snapshot(
     dev_id: u32,
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
-    let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
-        let image = Arc::clone(&device_ref.image);
-        drop(device_ref);
-        (image, None)
-    } else if let Some(pool) = pool_state {
-        if let Some(active) = pool.active_exclusive.get(&dev_id) {
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
-        } else if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
-            let key = shared_key.clone();
-            drop(shared_key);
-            let active = pool
-                .active_shared
-                .get(&key)
-                .with_context(|| format!("device {dev_id} not found for snapshot"))?;
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
-        } else {
-            bail!("device {dev_id} not found for snapshot");
-        }
-    } else {
-        bail!("device {dev_id} not found for snapshot");
-    };
+    let (image, image_config) = find_overlaybd_image(devices, pool_state, dev_id, "snapshot")?;
 
     tracing::info!(
         dev_id,
@@ -1014,6 +997,48 @@ async fn handle_restack_snapshot(
         data_stat,
         ext4_used_bytes,
     })
+}
+
+async fn handle_sync_for_checkpoint(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let (image, _) = find_overlaybd_image(devices, pool_state, dev_id, "checkpoint sync")?;
+    image
+        .sync_for_checkpoint()
+        .await
+        .with_context(|| format!("sync overlaybd image for dev_id={dev_id}"))?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn find_overlaybd_image(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+    operation: &str,
+) -> Result<(Arc<ImageFile>, Option<PathBuf>)> {
+    if let Some(device) = devices.get(&dev_id) {
+        return Ok((Arc::clone(&device.image), None));
+    }
+
+    let Some(pool) = pool_state else {
+        bail!("device {dev_id} not found for {operation}");
+    };
+    if let Some(active) = pool.active_exclusive.get(&dev_id) {
+        return Ok((Arc::clone(&active.image), Some(active.image_config.clone())));
+    }
+    if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
+        let key = shared_key.clone();
+        drop(shared_key);
+        let active = pool
+            .active_shared
+            .get(&key)
+            .with_context(|| format!("device {dev_id} not found for {operation}"))?;
+        return Ok((Arc::clone(&active.image), Some(active.image_config.clone())));
+    }
+
+    bail!("device {dev_id} not found for {operation}")
 }
 
 // ── Pool handlers ───────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 use axum::{middleware, routing::get, Router};
 
-use super::{impls::auth, proxy, ApiImpl};
+use super::{impls::auth, proxy, snapshot_placement, ApiImpl};
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
@@ -26,6 +26,7 @@ where
     // proxy contract.
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
         .merge(proxy::router(api_impl.clone()))
+        .merge(snapshot_placement::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(
             api_impl.clone(),

@@ -52,6 +52,8 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -232,6 +234,8 @@ pub enum SandboxesSandboxIdSnapshotsPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }

@@ -21,6 +21,15 @@ use crate::types::{ImageConfigs, SandboxResources};
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
+    /// Storage availability requested for this reusable snapshot.
+    ///
+    /// The value is persisted with the record so readers do not infer
+    /// availability from the configured repository backend.
+    pub snapshot_type: SnapshotType,
+    /// Serving Pod identity that owns the immutable bytes for a Local snapshot.
+    ///
+    /// Distributed snapshots and template records never carry placement.
+    pub owner_node_id: Option<String>,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotPublishSource,
     pub context: CommandContext,
@@ -39,6 +48,8 @@ impl SnapshotPublishMetadata {
     pub fn mock() -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotType::Distributed,
+            owner_node_id: None,
             alias: None,
             source: SnapshotPublishSource::Template,
             context: CommandContext::default(),
@@ -55,6 +66,15 @@ impl SnapshotPublishMetadata {
             custom_extension_params: None,
         }
     }
+}
+
+/// Storage availability of a committed reusable snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotType {
+    Local,
+    #[default]
+    Distributed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +171,49 @@ impl TemplateBuildInfo {
 pub enum SnapshotSource {
     Template { build: TemplateBuildInfo },
     Sandbox { source_sandbox_id: String },
+}
+
+impl SnapshotSource {
+    pub fn kind(&self) -> SnapshotSourceKind {
+        match self {
+            Self::Template { .. } => SnapshotSourceKind::Template,
+            Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
+        }
+    }
+}
+
+fn validate_snapshot_metadata(
+    snapshot_type: SnapshotType,
+    source_is_sandbox: bool,
+    owner_node_id: Option<&str>,
+    alias: Option<&SnapshotAlias>,
+) -> Result<(), String> {
+    if snapshot_type == SnapshotType::Local && !source_is_sandbox {
+        return Err("Local snapshots must originate from a sandbox".to_string());
+    }
+    if snapshot_type == SnapshotType::Local
+        && owner_node_id.is_none_or(|owner| owner.trim().is_empty())
+    {
+        return Err("Local snapshots require owner_node_id".to_string());
+    }
+    if snapshot_type == SnapshotType::Distributed && owner_node_id.is_some() {
+        return Err("Distributed snapshots must not carry owner_node_id".to_string());
+    }
+    if snapshot_type == SnapshotType::Local && alias.is_some() {
+        return Err("Local snapshots do not support aliases".to_string());
+    }
+    Ok(())
+}
+
+impl SnapshotPublishMetadata {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_snapshot_metadata(
+            self.snapshot_type,
+            matches!(&self.source, SnapshotPublishSource::Sandbox { .. }),
+            self.owner_node_id.as_deref(),
+            self.alias.as_ref(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +391,16 @@ impl CommittedSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
+    /// Storage availability of the committed reusable snapshot.
+    ///
+    /// Older records did not carry this field; those records are the legacy
+    /// durable (distributed) form.
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
+    /// Placement for Local snapshot bytes. The owner is the publishing Pod;
+    /// if that Pod is deleted, the Local snapshot is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node_id: Option<String>,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotSource,
     pub resources: SandboxResources,
@@ -337,6 +410,92 @@ pub struct SnapshotRecord {
 }
 
 impl SnapshotRecord {
+    pub(crate) fn new_committed(
+        metadata: &SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+        now_unix_ms: i64,
+    ) -> Self {
+        let source = match &metadata.source {
+            SnapshotPublishSource::Template => SnapshotSource::Template {
+                build: TemplateBuildInfo {
+                    status: TemplateBuildStatus::Ready,
+                    started_at_unix_ms: None,
+                    finished_at_unix_ms: Some(now_unix_ms),
+                    error_reason: None,
+                },
+            },
+            SnapshotPublishSource::Sandbox { source_sandbox_id } => SnapshotSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.clone(),
+            },
+        };
+        Self {
+            id: metadata.id.clone(),
+            snapshot_type: metadata.snapshot_type,
+            owner_node_id: metadata.owner_node_id.clone(),
+            alias: metadata.alias.clone(),
+            source,
+            resources: metadata.resources,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            committed: Some(committed),
+        }
+    }
+
+    pub(crate) fn validate_committed_metadata(&self) -> Result<(), String> {
+        if self.committed.is_none() {
+            return Err("committed snapshot metadata requires an artifact payload".to_string());
+        }
+        validate_snapshot_metadata(
+            self.snapshot_type,
+            matches!(&self.source, SnapshotSource::Sandbox { .. }),
+            self.owner_node_id.as_deref(),
+            self.alias.as_ref(),
+        )
+    }
+
+    pub(crate) fn validate_template_create(&self) -> Result<(), String> {
+        if !matches!(&self.source, SnapshotSource::Template { .. }) {
+            return Err("only template snapshots can be pre-created".to_string());
+        }
+        if self.committed.is_some() {
+            return Err("pre-created template snapshots must not already be committed".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn start_template_build(&mut self, now_unix_ms: i64) -> Result<(), String> {
+        let SnapshotSource::Template { build } = &mut self.source else {
+            return Err(format!("snapshot '{}' is not a template build", self.id));
+        };
+        if build.status != TemplateBuildStatus::Waiting {
+            return Err(format!(
+                "template build '{}' is not in waiting state",
+                self.id
+            ));
+        }
+
+        build.status = TemplateBuildStatus::Building;
+        build.started_at_unix_ms = Some(now_unix_ms);
+        build.error_reason = None;
+        self.updated_at_unix_ms = now_unix_ms;
+        Ok(())
+    }
+
+    pub(crate) fn mark_template_build_error(
+        &mut self,
+        reason: &TemplateBuildErrorReason,
+        now_unix_ms: i64,
+    ) -> Result<(), String> {
+        let SnapshotSource::Template { build } = &mut self.source else {
+            return Err(format!("snapshot '{}' is not a template build", self.id));
+        };
+        build.status = TemplateBuildStatus::Error;
+        build.finished_at_unix_ms = Some(now_unix_ms);
+        build.error_reason = Some(reason.clone());
+        self.updated_at_unix_ms = now_unix_ms;
+        Ok(())
+    }
+
     pub fn template_waiting(
         id: SnapshotId,
         alias: Option<SnapshotAlias>,
@@ -345,6 +504,8 @@ impl SnapshotRecord {
         let now_unix_ms = now_unix_ms();
         Self {
             id,
+            snapshot_type: SnapshotType::Distributed,
+            owner_node_id: None,
             alias,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
@@ -358,22 +519,24 @@ impl SnapshotRecord {
 
     pub fn mark_committed(
         &mut self,
-        alias: Option<SnapshotAlias>,
-        resources: SandboxResources,
+        metadata: &SnapshotPublishMetadata,
         committed: CommittedSnapshot,
-        source: SnapshotPublishSource,
         now_unix_ms: i64,
     ) {
-        if let SnapshotPublishSource::Sandbox { source_sandbox_id } = source {
-            self.source = SnapshotSource::Sandbox { source_sandbox_id };
+        if let SnapshotPublishSource::Sandbox { source_sandbox_id } = &metadata.source {
+            self.source = SnapshotSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.clone(),
+            };
         }
         if let SnapshotSource::Template { build } = &mut self.source {
             build.status = TemplateBuildStatus::Ready;
             build.finished_at_unix_ms = Some(now_unix_ms);
             build.error_reason = None;
         }
-        self.alias = alias;
-        self.resources = resources;
+        self.alias = metadata.alias.clone();
+        self.snapshot_type = metadata.snapshot_type;
+        self.owner_node_id = metadata.owner_node_id.clone();
+        self.resources = metadata.resources;
         self.updated_at_unix_ms = now_unix_ms;
         self.committed = Some(committed);
     }
@@ -394,6 +557,8 @@ impl SnapshotRecord {
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotType::Distributed,
+            owner_node_id: None,
             alias: None,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo {
@@ -411,7 +576,7 @@ impl SnapshotRecord {
     }
 }
 
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -454,21 +619,12 @@ pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
 }
 
-pub(crate) trait RuntimeArtifactLease: Send + Sync {}
-
-#[derive(Clone, Default)]
-#[cfg(test)]
-struct EmptyRuntimeArtifactLease;
+pub(crate) type RuntimeArtifactLease = dyn Send + Sync;
 
 #[cfg(test)]
-impl RuntimeArtifactLease for EmptyRuntimeArtifactLease {}
-
-#[cfg(test)]
-fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
-    static INSTANCE: OnceLock<Arc<dyn RuntimeArtifactLease>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| Arc::new(EmptyRuntimeArtifactLease))
-        .clone()
+fn default_runtime_artifact_lease() -> Arc<RuntimeArtifactLease> {
+    static INSTANCE: OnceLock<Arc<RuntimeArtifactLease>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Arc::new(())).clone()
 }
 
 #[derive(Clone)]
@@ -476,14 +632,14 @@ fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
     manifest: FirecrackerSnapshotManifest,
-    _lease: Arc<dyn RuntimeArtifactLease>,
+    _lease: Arc<RuntimeArtifactLease>,
 }
 
 impl RunnableSnapshot {
     pub(crate) fn new(
         record: SnapshotRecord,
         manifest: FirecrackerSnapshotManifest,
-        lease: Arc<dyn RuntimeArtifactLease>,
+        lease: Arc<RuntimeArtifactLease>,
     ) -> Self {
         Self {
             record,
@@ -502,13 +658,10 @@ impl RunnableSnapshot {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::sandbox::normalize_mount_path_or_default(
                     &drive.drive_id,
                     drive.mount_path.clone(),
-                )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
+                ),
                 sub_path: drive.sub_path.clone(),
             })
             .collect()
@@ -575,7 +728,8 @@ impl fmt::Debug for RunnableSnapshot {
 mod tests {
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        PersistedDiskImagePublication, SnapshotAlias, SnapshotPublishMetadata,
+        SnapshotPublishSource, SnapshotRecord, SnapshotType, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -609,6 +763,52 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_record_without_snapshot_type_defaults_to_distributed() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut value = serde_json::to_value(record).expect("serialize snapshot record");
+        value
+            .as_object_mut()
+            .expect("snapshot record must serialize as an object")
+            .remove("snapshot_type");
+
+        let record: SnapshotRecord =
+            serde_json::from_value(value).expect("deserialize legacy snapshot record");
+
+        assert_eq!(record.snapshot_type, SnapshotType::Distributed);
+    }
+
+    #[test]
+    fn snapshot_type_uses_stable_snake_case_values() {
+        assert_eq!(
+            serde_json::to_value(SnapshotType::Local).expect("serialize local type"),
+            serde_json::json!("local")
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapshotType>("\"distributed\"")
+                .expect("deserialize distributed type"),
+            SnapshotType::Distributed
+        );
+    }
+
+    #[test]
+    fn local_snapshot_metadata_rejects_alias() {
+        let mut metadata = SnapshotPublishMetadata::mock();
+        metadata.snapshot_type = SnapshotType::Local;
+        metadata.owner_node_id = Some("node-a".to_string());
+        metadata.alias = Some(SnapshotAlias::parse("checkpoint").expect("valid alias"));
+        metadata.source = SnapshotPublishSource::Sandbox {
+            source_sandbox_id: "sandbox-a".to_string(),
+        };
+
+        assert_eq!(
+            metadata.validate().expect_err("Local alias must fail"),
+            "Local snapshots do not support aliases"
+        );
+        metadata.alias = None;
+        metadata.validate().expect("aliasless Local must be valid");
     }
 
     #[test]
@@ -681,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_start_cmd_combines_entrypoint_and_cmd() {
+    fn effective_start_cmd_composition() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec!["/docker-entrypoint.sh".to_string()]))
             .with_cmd(Some(vec![
@@ -693,28 +893,16 @@ mod tests {
             ctx.effective_start_cmd().as_deref(),
             Some("/docker-entrypoint.sh nginx -g 'daemon off;'"),
         );
-    }
 
-    #[test]
-    fn effective_start_cmd_entrypoint_only() {
         let ctx = CommandContext::default().with_entrypoint(Some(vec!["node".to_string()]));
         assert_eq!(ctx.effective_start_cmd().as_deref(), Some("node"));
-    }
 
-    #[test]
-    fn effective_start_cmd_cmd_only() {
         let ctx = CommandContext::default()
             .with_cmd(Some(vec!["python3".to_string(), "app.py".to_string()]));
         assert_eq!(ctx.effective_start_cmd().as_deref(), Some("python3 app.py"),);
-    }
 
-    #[test]
-    fn effective_start_cmd_absent_returns_none() {
         assert_eq!(CommandContext::default().effective_start_cmd(), None);
-    }
 
-    #[test]
-    fn effective_start_cmd_empty_vecs_return_none() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec![]))
             .with_cmd(Some(vec![]));

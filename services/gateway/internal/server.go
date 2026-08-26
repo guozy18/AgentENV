@@ -210,6 +210,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
+	} else if isSnapshotPromotionRequest(r) {
+		// Snapshot promotion is a control-plane operation even when callers
+		// include data-plane routing headers. Keep it on the scheduled path so
+		// snapshot placement can bind Local snapshots to their owner node.
+		routeSource = routeSourceSchedule
+	} else if isSnapshotMetadataRequest(r) {
+		// Snapshot metadata is a control-plane API even when callers include
+		// data-plane routing headers. Do not resolve a sandbox owner for it.
+		routeSource = routeSourceSchedule
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -218,6 +227,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	ownerBound := false
 
 	if hasSandbox {
 		rpcStart := time.Now()
@@ -229,15 +239,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		node = resp.GetNode()
 	} else {
-		hint, err := buildScheduleHint(r)
+		hint, launchSnapshotRef, err := buildScheduleHint(r)
 		if err != nil {
-			// this only happens it cannot read request body, so the request cannot continue
 			s.logger.Warn("Fatal error when building schedule hint",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Error(err),
 			)
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			switch {
+			case errors.Is(err, errNewSandboxBodyTooLarge):
+				http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+			default:
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
 			return
 		}
 		rpcStart := time.Now()
@@ -250,6 +264,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+
+		operation, snapshotRef := snapshotRequestOperation(r, launchSnapshotRef)
+		if operation != snapshotOperationNone {
+			routedNode, routedOwnerBound, routingErr := s.routeSnapshotRequest(
+				routingCtx,
+				r,
+				node,
+				operation,
+				snapshotRef,
+			)
+			if routingErr != nil {
+				s.logger.Warn("snapshot routing failed",
+					zap.String("method", r.Method),
+					zap.String("path", r.URL.Path),
+					zap.String("snapshot_ref", snapshotRef),
+					zap.Error(routingErr),
+				)
+				if routingErr.statusCode == http.StatusUnauthorized {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				s.writeJSON(w, routingErr.statusCode, struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				}{
+					Code:    routingErr.statusCode,
+					Message: routingErr.message,
+				})
+				return
+			}
+			node = routedNode
+			ownerBound = routedOwnerBound
+		}
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -265,7 +312,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		if ownerBound {
+			http.Error(w, "snapshot owner unavailable", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		}
 		return
 	}
 
@@ -282,6 +333,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
+			ownerBound:       ownerBound,
 		},
 	)
 }
@@ -308,6 +360,7 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	ownerBound       bool
 }
 
 func (s *Server) proxyRequest(
@@ -369,6 +422,23 @@ func (s *Server) proxyRequest(
 				return
 			}
 
+			var proxyErr *proxyResponseError
+			if errors.As(err, &proxyErr) {
+				http.Error(rw, proxyErr.message, proxyErr.statusCode)
+				return
+			}
+
+			if options.ownerBound {
+				s.logger.Warn("snapshot owner proxy request failed",
+					zap.Error(err),
+					zap.String("node", node.GetNodeId()),
+					zap.String("path", proxyReq.URL.Path),
+					zap.String("target", upstreamURL.String()),
+				)
+				http.Error(rw, "snapshot owner unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
 				s.logger.Warn("proxy request timed out",
 					zap.Error(err),
@@ -377,12 +447,6 @@ func (s *Server) proxyRequest(
 					zap.String("target", upstreamURL.String()),
 				)
 				http.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
-				return
-			}
-
-			var proxyErr *proxyResponseError
-			if errors.As(err, &proxyErr) {
-				http.Error(rw, proxyErr.message, proxyErr.statusCode)
 				return
 			}
 
@@ -861,7 +925,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		return false
 	}
 
-	return !isSandboxControlPlaneRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
+	return !isSandboxControlPlaneRequest(r) && !isSnapshotPromotionRequest(r) && !isSnapshotMetadataRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

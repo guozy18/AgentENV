@@ -1,14 +1,12 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
@@ -17,15 +15,16 @@ use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
-use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
+use crate::snapshot::repository::backends::common::{
+    overlaybd_layer_uuid, validate_attached_drives, write_dense_overlaybd_layer_to_file,
+};
 use crate::snapshot::repository::interfaces::SnapshotRepository;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::types::now_unix_ms;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotPublishMetadata, SnapshotRecord, TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
@@ -77,13 +76,6 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
     Ok(OssSnapshotArtifactLayout::alias_key(alias))
 }
 
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
     !left.is_empty() && left.trim_end_matches('/') == right.trim_end_matches('/')
 }
@@ -115,11 +107,130 @@ fn managed_memory_layer_from_remote_lower(
     })
 }
 
-fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
-    read_overlaybd_layer_uuid(source)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
+fn memory_layer_digest(index: usize, layer: &LayerConfig) -> RepositoryResult<&str> {
+    let digest = if !layer.digest.is_empty() {
+        &layer.digest
+    } else if !layer.target_digest.is_empty() {
+        &layer.target_digest
+    } else {
+        return Err(RepositoryError::Unsupported {
+            feature: format!("memory layer {index} without digest"),
+        });
+    };
+    Ok(digest)
+}
+
+async fn verify_staged_memory_layer(
+    path: &Path,
+    digest: &str,
+    expected_size: u64,
+) -> RepositoryResult<u64> {
+    let actual = crate::digest::FileDigest::describe(path)
+        .await
+        .map_err(|error| {
+            RepositoryError::backend(
+                format!("describe staged memory layer '{}'", path.display()),
+                error,
+            )
+        })?;
+    if actual.sha256 != digest {
+        return Err(RepositoryError::IntegrityMismatch {
+            artifact: format!("staged memory layer '{}'", path.display()),
+            expected: digest.to_string(),
+            actual: actual.sha256,
+        });
+    }
+    if expected_size != 0 && actual.size != expected_size {
+        return Err(RepositoryError::IntegrityMismatch {
+            artifact: format!("staged memory layer '{}'", path.display()),
+            expected: expected_size.to_string(),
+            actual: actual.size.to_string(),
+        });
+    }
+    Ok(actual.size)
+}
+
+async fn stage_memory_layer(
+    client: &OssClient,
+    capture_dir: &Path,
+    layer: &mut LayerConfig,
+    index: usize,
+) -> RepositoryResult<()> {
+    let digest = memory_layer_digest(index, layer)?.to_owned();
+    let expected_size = layer.size;
+    let destination =
+        crate::image::commit_index::commit_file(&capture_dir.join("local-memory-layers"), &digest);
+    let staging_dir = destination
+        .parent()
+        .expect("staged memory layer path has a parent");
+    tokio::fs::create_dir_all(staging_dir)
+        .await
+        .map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "create captured memory layer dir '{}'",
+                    staging_dir.display()
+                ),
+                error,
+            )
+        })?;
+    let destination_exists = tokio::fs::try_exists(&destination).await.map_err(|error| {
+        RepositoryError::backend(
+            format!("check staged memory layer '{}'", destination.display()),
+            error,
+        )
+    })?;
+    if !destination_exists {
+        let source = (!layer.file.is_empty()).then(|| PathBuf::from(&layer.file));
+        if let Some(source) = source.filter(|path| path.is_file()) {
+            let temporary = destination.with_extension(format!("tmp-{}", Uuid::now_v7()));
+            tokio::fs::copy(&source, &temporary)
+                .await
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!(
+                            "copy captured memory layer '{}' into local staging",
+                            source.display()
+                        ),
+                        error,
+                    )
+                })?;
+            tokio::fs::rename(&temporary, &destination)
+                .await
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!("commit staged memory layer '{}'", destination.display()),
+                        error,
+                    )
+                })?;
+        } else {
+            client
+                .get_to_file(
+                    &OssSnapshotArtifactLayout::managed_layer_key(&digest),
+                    &destination,
+                )
+                .await
+                .map_err(|error| {
+                    if OssClient::is_not_found_error(&error) {
+                        RepositoryError::ManagedLayerNotFound {
+                            digest: digest.clone(),
+                        }
+                    } else {
+                        RepositoryError::backend(
+                            format!("download captured memory layer '{digest}'"),
+                            error,
+                        )
+                    }
+                })?;
+        }
+    }
+    let size = verify_staged_memory_layer(&destination, &digest, expected_size).await?;
+    layer.file = destination.display().to_string();
+    layer.dir.clear();
+    layer.repo_blob_url.clear();
+    layer.digest = digest;
+    layer.size = size;
+    Ok(())
 }
 
 fn fallback_to_object_storage_would_mix_sources(
@@ -149,16 +260,9 @@ fn fallback_to_object_storage_would_mix_sources(
 #[async_trait]
 impl SnapshotRepository for OssSnapshotRepository {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        if !matches!(record.source, SnapshotSource::Template { .. }) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "only template snapshots can be pre-created".to_string(),
-            });
-        }
-        if record.committed.is_some() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "pre-created template snapshots must not already be committed".to_string(),
-            });
-        }
+        record
+            .validate_template_create()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         if self.snapshot_exists(&record.id).await? {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("snapshot '{}' already exists", record.id),
@@ -188,34 +292,87 @@ impl SnapshotRepository for OssSnapshotRepository {
         Ok(record)
     }
 
+    async fn prepare_local_capture(
+        &self,
+        manifest: &mut FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<()> {
+        let config_path = &manifest.memory.image_config_path;
+        let mut image_config = load_overlaybd_image_config(config_path).map_err(|error| {
+            RepositoryError::backend(
+                format!(
+                    "load captured memory image config '{}'",
+                    config_path.display()
+                ),
+                error,
+            )
+        })?;
+        let managed_repo_blob_url = self.client.managed_layers_repo_blob_url();
+        let image_repo_blob_url = image_config.repo_blob_url.clone();
+        let capture_dir = config_path
+            .parent()
+            .ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve parent dir for memory image config '{}'",
+                    config_path.display()
+                ),
+                source: None,
+            })?
+            .join(format!("local-capture-{}", Uuid::now_v7()));
+        let local_config_path = capture_dir.join("memory.json");
+        let mut staged_any = false;
+
+        for (index, layer) in image_config.lowers.iter_mut().enumerate() {
+            let has_local_file = !layer.file.is_empty() && Path::new(&layer.file).is_file();
+            // The newest capture delta is local and intentionally descriptorless;
+            // do not interpret the inherited image-level managed URL as its
+            // source. POSIX import will hash this file during local commit.
+            if has_local_file && (layer.digest.is_empty() || layer.size == 0) {
+                continue;
+            }
+            let repo_blob_url = layer
+                .effective_repo_blob_url(&image_repo_blob_url)
+                .to_string();
+            if !repo_blob_url.is_empty()
+                && same_repo_blob_url(&repo_blob_url, &managed_repo_blob_url)
+            {
+                stage_memory_layer(&self.client, &capture_dir, layer, index).await?;
+                staged_any = true;
+            } else if !has_local_file {
+                let feature = if repo_blob_url.is_empty() {
+                    format!("memory layer {index} without local file path")
+                } else {
+                    format!("memory layer {index} uses non-OSS managed repoBlobUrl")
+                };
+                return Err(RepositoryError::Unsupported { feature });
+            }
+        }
+
+        if !staged_any {
+            return Ok(());
+        }
+        image_config.repo_blob_url.clear();
+        crate::snapshot::runtime_support::write_image_config(
+            &local_config_path,
+            "local capture memory",
+            &image_config,
+        )
+        .await?;
+        manifest.memory.image_config_path = local_config_path;
+        Ok(())
+    }
+
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: FirecrackerSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
+        metadata
+            .validate()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let id = &metadata.id;
         let layout = self.layout(id);
 
-        // 0. Validate no duplicate drive ids.
-        let mut drive_ids_set = HashSet::new();
-        for drive in &manifest.attached_drives {
-            if !drive_ids_set.insert(drive.drive_id.clone()) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "duplicate attached drive id in publish request: {}",
-                        drive.drive_id
-                    ),
-                });
-            }
-            if drive.virtual_size == 0 {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "attached drive '{}' virtual_size must be non-zero",
-                        drive.drive_id
-                    ),
-                });
-            }
-        }
+        validate_attached_drives(&manifest)?;
 
         let mut disk_publications = Vec::new();
 
@@ -298,23 +455,12 @@ impl SnapshotRepository for OssSnapshotRepository {
             // 5. Bind alias (if present) with conflict detection.
             if let Some(ref alias) = metadata.alias {
                 if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
-                    }
                     return Err(e);
                 }
             }
 
-            self.write_committed_record(
-                metadata.id.clone(),
-                metadata.alias.clone(),
-                metadata.resources,
-                committed,
-                metadata.source.clone(),
-            )
-            .await
+            self.write_committed_record(metadata.clone(), committed)
+                .await
         }
         .await;
 
@@ -344,6 +490,19 @@ impl SnapshotRepository for OssSnapshotRepository {
         };
 
         debug!(snapshot_id = %id, "published snapshot to oss");
+        Ok(record)
+    }
+
+    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        record
+            .validate_committed_metadata()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        if self.read_record(&record.id).await?.is_some() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' already exists", record.id),
+            });
+        }
+        self.write_record(&record).await?;
         Ok(record)
     }
 
@@ -386,7 +545,7 @@ impl SnapshotRepository for OssSnapshotRepository {
             .try_collect()
             .await?;
 
-        records.retain(|record| Self::matches_record_filter(record, &filter));
+        records.retain(|record| filter.matches(record));
         records.sort_by(|a, b| {
             b.created_at_unix_ms
                 .cmp(&a.created_at_unix_ms)
@@ -473,21 +632,9 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
                 })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        if build.status != TemplateBuildStatus::Waiting {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
-            });
-        }
-        build.status = TemplateBuildStatus::Building;
-        build.started_at_unix_ms = Some(now);
-        build.error_reason = None;
-        record.updated_at_unix_ms = now;
+        record
+            .start_template_build(now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record(&record).await?;
         Ok(record)
     }
@@ -503,16 +650,9 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .ok_or_else(|| RepositoryError::SnapshotNotFound {
                     lookup: id.to_string(),
                 })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        build.status = TemplateBuildStatus::Error;
-        build.finished_at_unix_ms = Some(now);
-        build.error_reason = Some(reason);
-        record.updated_at_unix_ms = now;
+        record
+            .mark_template_build_error(&reason, now_unix_ms())
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_record(&record).await
     }
 }
@@ -549,39 +689,15 @@ impl OssSnapshotRepository {
 
     async fn write_committed_record(
         &self,
-        id: SnapshotId,
-        alias: Option<SnapshotAlias>,
-        resources: crate::types::SandboxResources,
+        metadata: SnapshotPublishMetadata,
         committed: CommittedSnapshot,
-        source: SnapshotPublishSource,
     ) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
-        let record = if let Some(mut record) = self.read_record(&id).await? {
-            record.mark_committed(alias, resources, committed, source, now);
+        let record = if let Some(mut record) = self.read_record(&metadata.id).await? {
+            record.mark_committed(&metadata, committed, now);
             record
         } else {
-            let source = match source {
-                SnapshotPublishSource::Template => SnapshotSource::Template {
-                    build: TemplateBuildInfo {
-                        status: TemplateBuildStatus::Ready,
-                        started_at_unix_ms: None,
-                        finished_at_unix_ms: Some(now),
-                        error_reason: None,
-                    },
-                },
-                SnapshotPublishSource::Sandbox { source_sandbox_id } => {
-                    SnapshotSource::Sandbox { source_sandbox_id }
-                }
-            };
-            SnapshotRecord {
-                id,
-                alias,
-                source,
-                resources,
-                created_at_unix_ms: now,
-                updated_at_unix_ms: now,
-                committed: Some(committed),
-            }
+            SnapshotRecord::new_committed(&metadata, committed, now)
         };
         self.write_record(&record).await?;
         Ok(record)
@@ -945,62 +1061,6 @@ impl OssSnapshotRepository {
         let target = serde_json::from_slice::<SnapshotId>(&data)
             .map_err(|e| RepositoryError::backend(format!("parse alias target '{alias}'"), e))?;
         Ok(Some(target))
-    }
-
-    fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-        if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
-                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(ids) = filter.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
-                return false;
-            }
-        }
-
-        if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
-            {
-                return false;
-            }
-        }
-
-        if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-            match &record.source {
-                SnapshotSource::Sandbox {
-                    source_sandbox_id: record_source_sandbox_id,
-                } if record_source_sandbox_id == source_sandbox_id => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(sources) = filter.sources.as_ref() {
-            let source = match &record.source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
-                return false;
-            }
-        }
-
-        if let Some(statuses) = filter.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = &record.source else {
-                return false;
-            };
-            if !statuses.contains(&build.status) {
-                return false;
-            };
-        }
-
-        true
     }
 }
 

@@ -1,9 +1,8 @@
 //! Overlaybd-specific snapshot helpers for Firecracker sandboxes.
 //!
-//! During pause, [`restack_snapshot_overlaybd_rootfs`] either stages a
-//! read-only runtime config as-is or asks the ublk daemon to
-//! `close_seal + restack` the live upper before writing the persisted
-//! snapshot config.
+//! Immutable checkpoint capture seals writable state through
+//! [`restack_snapshot_overlaybd_rootfs`]. Temporal pause instead stages the
+//! mutable upper without sealing it or extending the immutable lower chain.
 //!
 use std::ffi::OsStr;
 use std::fs;
@@ -16,9 +15,10 @@ use anyhow::{ensure, Context, Result};
 use firecracker_client::models::DirtyMemoryRanges;
 use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
-use overlaybd::config::{ImageConfig, LayerConfig};
+use overlaybd::config::{validate_upper_config, ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::compact_to;
+use overlaybd::index_file::{compact_to, create_mappings_from_sparse};
+use overlaybd::layer_metadata::resolve_local_layer_path;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
@@ -99,6 +99,18 @@ fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
         .as_slice()
 }
 
+fn runtime_owned_roots_for_live_config(image_config_path: &Path) -> Vec<PathBuf> {
+    let mut roots = canonicalized_runtime_owned_roots().to_vec();
+    if let Some(runtime_dir) = image_config_path.parent() {
+        let runtime_dir =
+            fs::canonicalize(runtime_dir).unwrap_or_else(|_| runtime_dir.to_path_buf());
+        if !roots.contains(&runtime_dir) {
+            roots.push(runtime_dir);
+        }
+    }
+    roots
+}
+
 /// Split a list of overlaybd lowers into two parts: the prefix of stable lowers and the suffix of runtime-owned lowers.
 ///
 /// Runtime-created local lowers are appended during resume/fork/pause.
@@ -109,27 +121,44 @@ fn split_runtime_suffix(
     mut lowers: Vec<LayerConfig>,
     runtime_owned_roots: &[PathBuf],
 ) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
-    let Some(first_runtime_owned_index) = lowers.iter().position(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .any(|root| lower_path.starts_with(root))
-    }) else {
+    let Some(first_runtime_owned_index) = lowers
+        .iter()
+        .position(|lower| layer_references_runtime_owned_artifact(lower, runtime_owned_roots))
+    else {
         return (lowers, Vec::new());
     };
 
     let runtime_owned_suffix = lowers.split_off(first_runtime_owned_index);
 
-    debug_assert!(lowers.iter().all(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .all(|root| !lower_path.starts_with(root))
-    }));
+    debug_assert!(lowers
+        .iter()
+        .all(|lower| !layer_references_runtime_owned_artifact(lower, runtime_owned_roots)));
 
     (lowers, runtime_owned_suffix)
+}
+
+fn local_path_ownership(path: &Path, runtime_owned_roots: &[PathBuf]) -> (bool, bool, PathBuf) {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let reference_owned = runtime_owned_roots
+        .iter()
+        .any(|root| path.starts_with(root));
+    let target_owned = runtime_owned_roots
+        .iter()
+        .any(|root| resolved.starts_with(root));
+    (reference_owned, target_owned, resolved)
+}
+
+fn layer_references_runtime_owned_artifact(
+    lower: &LayerConfig,
+    runtime_owned_roots: &[PathBuf],
+) -> bool {
+    let source = resolve_local_layer_path(lower).or_else(|| {
+        (!lower.dir.is_empty() && lower.file.is_empty()).then(|| PathBuf::from(&lower.dir))
+    });
+    source.is_some_and(|path| {
+        let (reference_owned, target_owned, _) = local_path_ownership(&path, runtime_owned_roots);
+        reference_owned || target_owned
+    })
 }
 
 fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -150,7 +179,7 @@ fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Res
             source = %source.display(),
             destination = %destination.display(),
             error = %error,
-            "hard-link runtime overlaybd layer failed; falling back to sparse copy"
+            "hard-link runtime artifact failed; falling back to sparse copy"
         );
     } else {
         return Ok(());
@@ -176,17 +205,17 @@ fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Res
     }
 }
 
-async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result<()> {
+pub(super) async fn link_or_copy_runtime_artifact(source: &Path, destination: &Path) -> Result<()> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
     let description = format!(
-        "link or copy runtime overlaybd layer {} -> {}",
+        "link or copy runtime artifact {} -> {}",
         source.display(),
         destination.display()
     );
     tokio::task::spawn_blocking(move || link_or_copy_file_blocking(&source, &destination))
         .await
-        .context("link runtime overlaybd layer task failed")?
+        .context("link runtime artifact task failed")?
         .with_context(|| description)
 }
 
@@ -369,11 +398,13 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
-    let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let runtime_owned_roots = runtime_owned_roots_for_live_config(live_runtime_image_config_path);
+    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        &runtime_owned_roots,
         // Rootfs layers must stay raw: only memory snapshots may be compressed.
         OverlaybdCompactOutput::Raw,
     )
@@ -389,24 +420,6 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     Ok(output_path)
 }
 
-async fn rewrite_lowers_with_owned_runtime_suffix(
-    existing_lowers: Vec<LayerConfig>,
-    output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
-    compaction_output_name: &'static str,
-    compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
-    rewrite_lowers_with_runtime_roots(
-        existing_lowers,
-        output_dir,
-        appended_layer,
-        compaction_output_name,
-        canonicalized_runtime_owned_roots(),
-        compaction_output,
-    )
-    .await
-}
-
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
@@ -415,7 +428,7 @@ async fn rewrite_lowers_with_runtime_roots(
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
-    let (mut lowers, mut runtime_owned_lowers) =
+    let (mut lowers, runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
     // If the total number of lowers exceeds the default maximum, try to compact the
@@ -443,25 +456,130 @@ async fn rewrite_lowers_with_runtime_roots(
         return Ok(lowers);
     }
 
-    // Otherwise, adopt the runtime-owned suffix into the snapshot artifact dir.
-    let inherited_layers_dir = output_dir.join(INHERITED_LAYERS_DIR);
-    for (index, lower) in runtime_owned_lowers.iter_mut().enumerate() {
-        let source = Path::new(&lower.file);
-        let destination = inherited_layers_dir.join(format!("{index:04}")).join(
-            source
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
-        );
-        link_or_copy_runtime_layer(source, &destination).await?;
-        lower.file = destination.display().to_string();
-    }
-    lowers.extend(runtime_owned_lowers);
-
+    let mut lowers = adopt_runtime_owned_lowers(
+        lowers,
+        runtime_owned_lowers,
+        output_dir,
+        runtime_owned_roots,
+    )
+    .await?;
     if let Some(layer) = appended_layer {
         lowers.push(layer);
     }
-
     Ok(lowers)
+}
+
+async fn adopt_runtime_owned_lowers(
+    mut lowers: Vec<LayerConfig>,
+    mut runtime_owned_lowers: Vec<LayerConfig>,
+    output_dir: &Path,
+    runtime_owned_roots: &[PathBuf],
+) -> Result<Vec<LayerConfig>> {
+    let inherited_layers_dir = output_dir.join(INHERITED_LAYERS_DIR);
+    for (index, lower) in runtime_owned_lowers.iter_mut().enumerate() {
+        let layer_dir = inherited_layers_dir.join(format!("{index:04}"));
+        if let Some(source) = resolve_local_layer_path(lower) {
+            let (reference_owned, target_owned, resolved) =
+                local_path_ownership(&source, runtime_owned_roots);
+            if target_owned {
+                let destination = layer_dir.join(
+                    resolved
+                        .file_name()
+                        .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
+                );
+                link_or_copy_runtime_artifact(&resolved, &destination).await?;
+                lower.file = destination.display().to_string();
+                lower.dir.clear();
+            } else if reference_owned {
+                lower.file = resolved.display().to_string();
+                lower.dir.clear();
+            }
+        } else if !lower.dir.is_empty() {
+            let (reference_owned, target_owned, _) =
+                local_path_ownership(Path::new(&lower.dir), runtime_owned_roots);
+            if reference_owned || target_owned {
+                anyhow::bail!(
+                    "runtime-owned overlaybd lower dir has no commit or sealed artifact: {}",
+                    lower.dir
+                );
+            }
+        }
+    }
+    lowers.extend(runtime_owned_lowers);
+    Ok(lowers)
+}
+
+async fn stage_mutable_upper_path(
+    field: &mut String,
+    output_dir: &Path,
+    file_name: &str,
+) -> Result<()> {
+    if field.is_empty() {
+        return Ok(());
+    }
+    let source = PathBuf::from(field.as_str());
+    let destination = output_dir.join(file_name);
+    link_or_copy_runtime_artifact(&source, &destination).await?;
+    *field = destination.display().to_string();
+    Ok(())
+}
+
+/// Preserve a live OverlayBD runtime as a mutable, single-writer Temporal
+/// continuation without sealing its upper or changing its immutable lowers.
+pub(super) async fn stage_temporal_overlaybd_device(
+    ublk_device: &UblkDevice,
+    read_only: bool,
+    live_runtime_image_config_path: &Path,
+    output_dir: &Path,
+    kind: &'static str,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create temporal overlaybd dir {}", output_dir.display()))?;
+
+    if !read_only {
+        UblkDeviceManager::global()
+            .sync_for_checkpoint(ublk_device)
+            .await
+            .with_context(|| format!("sync {kind} overlaybd upper for temporal checkpoint"))?;
+    }
+
+    let mut image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
+        .with_context(|| {
+            format!(
+                "load live {kind} overlaybd config {}",
+                live_runtime_image_config_path.display()
+            )
+        })?;
+    let runtime_owned_roots = runtime_owned_roots_for_live_config(live_runtime_image_config_path);
+    let (stable_lowers, runtime_owned_lowers) =
+        split_runtime_suffix(image_config.lowers, &runtime_owned_roots);
+    image_config.lowers = adopt_runtime_owned_lowers(
+        stable_lowers,
+        runtime_owned_lowers,
+        output_dir,
+        &runtime_owned_roots,
+    )
+    .await?;
+
+    let has_writable_upper = validate_upper_config(&image_config.upper)?;
+    anyhow::ensure!(
+        read_only || has_writable_upper,
+        "writable {kind} runtime is missing an OverlayBD upper"
+    );
+    if read_only {
+        image_config.upper = Default::default();
+    } else {
+        stage_mutable_upper_path(&mut image_config.upper.data, output_dir, "upper.data").await?;
+        stage_mutable_upper_path(&mut image_config.upper.index, output_dir, "upper.index").await?;
+    }
+    image_config.result_file = "./result.txt".to_string();
+
+    let output_path = output_dir.join("image.json");
+    let bytes = serde_json::to_vec_pretty(&image_config)
+        .with_context(|| format!("serialize temporal {kind} overlaybd config"))?;
+    write_bytes_atomically(&output_path, &bytes, "temporal overlaybd image config")?;
+    Ok(output_path)
 }
 
 async fn capture_live_overlaybd_snapshot(
@@ -508,49 +626,49 @@ async fn capture_live_overlaybd_snapshot(
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
-    if live_snapshot_layer_path != snapshot_layer_path {
-        // If this cross-filesystem copy fails, leave the live runtime config
-        // untouched and surface a terminal pause failure. The daemon has
-        // already sealed the old upper and reopened a fresh one, so callers
-        // must not continue treating the live runtime as safely resumable.
-        copy_file_atomically(
-            &live_snapshot_layer_path,
+    // The daemon has sealed the old upper and opened a new one. Every error
+    // after this mutation boundary is terminal until the live config is
+    // rewritten to describe that new stack.
+    async {
+        if live_snapshot_layer_path != snapshot_layer_path {
+            copy_file_atomically(
+                &live_snapshot_layer_path,
+                &snapshot_layer_path,
+                "restack snapshot layer",
+            )
+            .await
+            .context("copy restack snapshot layer into managed snapshot dir")?;
+        }
+
+        if let Some(descriptor) = descriptor.as_ref() {
+            let copied_size = tokio::fs::metadata(&snapshot_layer_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "read restack snapshot layer metadata {}",
+                        snapshot_layer_path.display()
+                    )
+                })?
+                .len();
+            if copied_size != descriptor.size {
+                anyhow::bail!(
+                    "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
+                    snapshot_layer_path.display(),
+                    descriptor.size,
+                    copied_size
+                );
+            }
+        }
+
+        rewrite_live_runtime_config_for_restack(
+            live_runtime_image_config_path,
             &snapshot_layer_path,
-            "restack snapshot layer",
+            descriptor.as_ref(),
         )
         .await
-        .context("copy restack snapshot layer into managed snapshot dir")
-        .map_err(into_terminal_snapshot_failure)?;
+        .context("rewrite live runtime config after restack snapshot")
     }
-
-    if let Some(descriptor) = descriptor.as_ref() {
-        let copied_size = tokio::fs::metadata(&snapshot_layer_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "read restack snapshot layer metadata {}",
-                    snapshot_layer_path.display()
-                )
-            })?
-            .len();
-        if copied_size != descriptor.size {
-            let _ = fs::remove_file(&snapshot_layer_path);
-            anyhow::bail!(
-                "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
-                snapshot_layer_path.display(),
-                descriptor.size,
-                copied_size
-            );
-        }
-    }
-
-    rewrite_live_runtime_config_for_restack(
-        live_runtime_image_config_path,
-        &snapshot_layer_path,
-        descriptor.as_ref(),
-    )
     .await
-    .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
@@ -565,11 +683,12 @@ pub(super) async fn build_mem_snapshot_image_config(
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let lowers = rewrite_lowers_with_runtime_roots(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        canonicalized_runtime_owned_roots(),
         memory_output,
     )
     .await?;
@@ -779,6 +898,35 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     .context("compact dirty memory ranges as overlaybd layer")?;
 
     Ok((data_path, memory_size))
+}
+
+/// Convert a complete memory file into a sealed OverlayBD layer.
+pub(crate) async fn convert_memory_file_to_overlaybd(
+    memory_path: &Path,
+    output_dir: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<(PathBuf, u64)> {
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
+    let data_path = output_dir.join("overlaybd.commit");
+    let virtual_size = tokio::fs::metadata(memory_path)
+        .await
+        .with_context(|| format!("stat memory snapshot: {}", memory_path.display()))?
+        .len();
+    let source: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(memory_path)?);
+    let mappings = create_mappings_from_sparse(&source, 0).await?;
+    publish_memory_overlaybd_layer(
+        &[source],
+        &mappings,
+        virtual_size,
+        &data_path,
+        mode,
+        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+    )
+    .await?;
+    let _ = tokio::fs::remove_file(memory_path).await;
+    Ok((data_path, virtual_size))
 }
 
 #[cfg(test)]
@@ -993,6 +1141,69 @@ mod tests {
             assert_eq!(source_metadata.dev(), adopted_metadata.dev());
             assert_eq!(source_metadata.ino(), adopted_metadata.ino());
         }
+    }
+
+    #[tokio::test]
+    async fn live_runtime_lower_is_adopted_before_runtime_directory_is_deleted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stable_dir = temp.path().join("stable");
+        let live_dir = temp.path().join("live");
+        let source_lowers_dir = live_dir.join("source-lowers");
+        let output_dir = temp.path().join("paused").join("rootfs");
+        std::fs::create_dir_all(&stable_dir).expect("create stable dir");
+        std::fs::create_dir_all(&source_lowers_dir).expect("create live lower dir");
+
+        let stable_lower = stable_dir.join("base.commit");
+        let runtime_lower = source_lowers_dir.join("continued.commit");
+        std::fs::write(&stable_lower, b"stable").expect("write stable lower");
+        std::fs::write(&runtime_lower, b"continued").expect("write runtime lower");
+        let live_config = live_dir.join("image.json");
+        std::fs::write(
+            &live_config,
+            serde_json::to_vec_pretty(&json!({
+                "lowers": [
+                    {
+                        "file": stable_lower.display().to_string(),
+                        "digest": "sha256:stable",
+                        "size": 6
+                    },
+                    {
+                        "file": runtime_lower.display().to_string(),
+                        "digest": "sha256:continued",
+                        "size": 9
+                    }
+                ],
+                "upper": {},
+                "resultFile": ""
+            }))
+            .expect("serialize live config"),
+        )
+        .expect("write live config");
+
+        let staged_config =
+            stage_overlaybd_snapshot_from_live_runtime(&live_config, &output_dir, None)
+                .await
+                .expect("stage live runtime");
+        let staged =
+            overlaybd::config::load_image_config(&staged_config).expect("load staged config");
+
+        assert_eq!(staged.lowers.len(), 2);
+        assert_eq!(PathBuf::from(&staged.lowers[0].file), stable_lower);
+        assert_eq!(staged.lowers[0].digest, "sha256:stable");
+        let adopted = PathBuf::from(&staged.lowers[1].file);
+        assert!(adopted.starts_with(output_dir.join(INHERITED_LAYERS_DIR)));
+        assert_eq!(staged.lowers[1].digest, "sha256:continued");
+        assert_eq!(
+            std::fs::read(&adopted).expect("read adopted lower"),
+            b"continued"
+        );
+        assert!(!output_dir.join("snapshot.commit").exists());
+
+        std::fs::remove_dir_all(&live_dir).expect("remove source runtime");
+        assert_eq!(
+            std::fs::read(&adopted).expect("read adopted lower after source removal"),
+            b"continued"
+        );
     }
 
     #[tokio::test]

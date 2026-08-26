@@ -1,21 +1,22 @@
 use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use overlaybd::dense_export;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
+use super::super::common::{overlaybd_layer_uuid, write_dense_overlaybd_layer_to_file_blocking};
 use super::layout::PosixFsSnapshotArtifactLayout;
+use super::{persist_atomic_file, run_repository_blocking, sync_dir};
 use crate::digest::{self, FileDigest};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RepositoryError,
+    RepositoryResult, SnapshotId, SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
+#[derive(Clone)]
 pub struct PosixFsArtifactStore {
     root: PathBuf,
 }
@@ -25,8 +26,35 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
-    fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
-        PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
+    pub(crate) async fn commit_local(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: FirecrackerSnapshotManifest,
+    ) -> RepositoryResult<CommittedSnapshot> {
+        let store = self.clone();
+        run_repository_blocking("publish local snapshot artifacts", move || {
+            super::super::common::validate_attached_drives(&manifest)?;
+            let built = match store.import_built_artifacts(&metadata.id, &manifest) {
+                Ok(built) => built,
+                Err(error) => {
+                    store.remove_snapshot_dir(&metadata.id);
+                    return Err(error);
+                }
+            };
+            let committed = committed_snapshot(&metadata, built);
+            let layout = PosixFsSnapshotArtifactLayout::new(&store.root, &metadata.id);
+            let marker = layout.path(super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER);
+            let parent = marker.parent().ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve local snapshot marker parent '{}'",
+                    marker.display()
+                ),
+                source: None,
+            })?;
+            persist_atomic_file(parent, &marker, b"ready\n", "local snapshot commit marker")?;
+            Ok(committed)
+        })
+        .await
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -46,7 +74,7 @@ impl PosixFsArtifactStore {
         snapshot_id: &SnapshotId,
         manifest: &FirecrackerSnapshotManifest,
     ) -> RepositoryResult<CollectedBuiltArtifacts> {
-        let committed_layout = self.committed_layout(snapshot_id);
+        let committed_layout = PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id);
 
         self.copy_local_artifact(
             committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
@@ -71,13 +99,10 @@ impl PosixFsArtifactStore {
                     layers: rootfs_layers,
                     read_only: drive.read_only,
                     virtual_size: drive.virtual_size,
-                    mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                    mount_path: crate::sandbox::normalize_mount_path_or_default(
                         &drive.drive_id,
                         drive.mount_path.clone(),
-                    )
-                    .unwrap_or_else(|_| {
-                        crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                    }),
+                    ),
                     sub_path: drive.sub_path.clone(),
                 })
             })
@@ -107,13 +132,47 @@ impl PosixFsArtifactStore {
         }
         let bytes = serde_json::to_vec_pretty(manifest)
             .map_err(|error| RepositoryError::backend("serialize firecracker manifest", error))?;
-        fs::write(&destination, bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write firecracker manifest '{}'", destination.display()),
-                error,
-            )
-        })?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| RepositoryError::Backend {
+                message: format!(
+                    "resolve parent dir for firecracker manifest '{}'",
+                    destination.display()
+                ),
+                source: None,
+            })?;
+        match fs::read(&destination) {
+            Ok(existing) if existing == bytes => {
+                // Retrying a rename whose directory sync failed should repair
+                // that durability boundary without replacing immutable data.
+                sync_dir(parent)?;
+                return Ok(());
+            }
+            Ok(existing) => {
+                return Err(RepositoryError::IntegrityMismatch {
+                    artifact: format!(
+                        "committed firecracker manifest at '{}'",
+                        destination.display()
+                    ),
+                    expected: digest::sha256_digest(&existing),
+                    actual: digest::sha256_digest(&bytes),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read firecracker manifest '{}'", destination.display()),
+                    error,
+                ));
+            }
+        }
+        persist_atomic_file(parent, &destination, &bytes, "firecracker manifest")?;
         Ok(())
+    }
+
+    fn remove_snapshot_dir(&self, id: &SnapshotId) {
+        let path = PosixFsSnapshotArtifactLayout::new(&self.root, id).snapshot_dir();
+        let _ = fs::remove_dir_all(path);
     }
 
     fn copy_local_artifact(&self, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
@@ -136,9 +195,46 @@ impl PosixFsArtifactStore {
         fs::create_dir_all(parent).map_err(|error| {
             RepositoryError::backend(format!("create artifact dir '{}'", parent.display()), error)
         })?;
-        if !same_file(&source_metadata, &destination)? {
-            hard_link_or_copy_file_with_sha256(source, &destination)?;
-            sync_dir(parent)?;
+        match fs::metadata(&destination) {
+            Ok(destination_metadata) => {
+                let same_inode = source_metadata.dev() == destination_metadata.dev()
+                    && source_metadata.ino() == destination_metadata.ino();
+                if !same_inode {
+                    let expected =
+                        FileDigest::describe_blocking(&destination).map_err(|error| {
+                            RepositoryError::backend(
+                                format!("describe committed artifact '{}'", destination.display()),
+                                error,
+                            )
+                        })?;
+                    let actual = FileDigest::describe_blocking(source).map_err(|error| {
+                        RepositoryError::backend(
+                            format!("describe retry artifact '{}'", source.display()),
+                            error,
+                        )
+                    })?;
+                    if expected != actual {
+                        return Err(RepositoryError::IntegrityMismatch {
+                            artifact: format!("committed artifact at '{}'", destination.display()),
+                            expected: format!("{} ({} bytes)", expected.sha256, expected.size),
+                            actual: format!("{} ({} bytes)", actual.sha256, actual.size),
+                        });
+                    }
+                }
+                // The prior copy may have reached rename/link but failed its
+                // directory sync. Re-sync while preserving the existing name.
+                sync_dir(parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hard_link_or_copy_file_with_sha256(source, &destination)?;
+                sync_dir(parent)?;
+            }
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read artifact metadata '{}'", destination.display()),
+                    error,
+                ));
+            }
         }
         let destination_metadata = fs::metadata(&destination).map_err(|error| {
             RepositoryError::backend(
@@ -302,6 +398,10 @@ impl PosixFsArtifactStore {
                 ));
             }
         }
+        // The dense file is fsynced before rename; sync the containing
+        // directory as well so the immutable managed-layer name survives a
+        // crash before the catalog record is published.
+        sync_dir(&destination_parent)?;
 
         Ok(crate::snapshot::ManagedLayer {
             digest: descriptor.digest,
@@ -510,38 +610,51 @@ impl PosixFsArtifactStore {
     }
 }
 
-fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
-    read_overlaybd_layer_uuid(source)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
-}
-
-fn same_file(source_metadata: &fs::Metadata, destination: &Path) -> RepositoryResult<bool> {
-    match fs::metadata(destination) {
-        Ok(destination_metadata) => Ok(source_metadata.dev() == destination_metadata.dev()
-            && source_metadata.ino() == destination_metadata.ino()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(RepositoryError::backend(
-            format!(
-                "read destination artifact metadata '{}'",
-                destination.display()
-            ),
-            error,
-        )),
-    }
-}
-
 fn hard_link_or_copy_file_with_sha256(source: &Path, destination: &Path) -> RepositoryResult<()> {
     match fs::hard_link(source, destination) {
         Ok(()) => {
             finalize_hard_linked_file(destination)?;
             return Ok(());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(RepositoryError::backend(
+                format!(
+                    "refuse to replace existing committed artifact '{}'",
+                    destination.display()
+                ),
+                error,
+            ));
+        }
         Err(_) => {}
     }
-    copy_file_with_sha256(source, destination)
+    let parent = destination
+        .parent()
+        .ok_or_else(|| RepositoryError::Backend {
+            message: format!(
+                "resolve parent dir for artifact '{}'",
+                destination.display()
+            ),
+            source: None,
+        })?;
+    let temp = NamedTempFile::new_in(parent).map_err(|error| {
+        RepositoryError::backend(
+            format!("create temp artifact next to '{}'", destination.display()),
+            error,
+        )
+    })?;
+    copy_file_with_sha256(source, temp.path())?;
+    let temp_path = temp.path().to_path_buf();
+    temp.persist_noclobber(destination).map_err(|error| {
+        RepositoryError::backend(
+            format!(
+                "persist artifact temp '{}' -> '{}'",
+                temp_path.display(),
+                destination.display()
+            ),
+            error.error,
+        )
+    })?;
+    Ok(())
 }
 
 fn hard_link_or_copy_managed_layer(
@@ -609,14 +722,6 @@ fn finalize_hard_linked_file(path: &Path) -> RepositoryResult<()> {
         .map_err(|error| {
             RepositoryError::backend(format!("sync hard-linked file '{}'", path.display()), error)
         })?;
-    Ok(())
-}
-
-fn sync_dir(path: &Path) -> RepositoryResult<()> {
-    fs::File::open(path)
-        .map_err(|error| RepositoryError::backend(format!("open '{}'", path.display()), error))?
-        .sync_all()
-        .map_err(|error| RepositoryError::backend(format!("sync '{}'", path.display()), error))?;
     Ok(())
 }
 
@@ -699,6 +804,24 @@ pub(crate) struct CollectedBuiltArtifacts {
     pub(crate) rootfs_layers: Vec<OverlaybdLayerRef>,
     pub(crate) memory_layers: Vec<ManagedLayer>,
     pub(crate) attached_drives: Vec<CommittedAttachedDrive>,
+}
+
+pub(crate) fn committed_snapshot(
+    metadata: &SnapshotPublishMetadata,
+    built: CollectedBuiltArtifacts,
+) -> CommittedSnapshot {
+    CommittedSnapshot {
+        context: metadata.context.clone(),
+        startup: metadata.startup.clone(),
+        runtime_versions: metadata.runtime_versions.clone(),
+        virtualization_mode: metadata.virtualization_mode,
+        image_configs: metadata.image_configs.clone(),
+        custom_extension_params: metadata.custom_extension_params.clone(),
+        rootfs_layers: built.rootfs_layers,
+        attached_drives: built.attached_drives,
+        memory_layers: built.memory_layers,
+        disk_publications: Vec::new(),
+    }
 }
 
 #[cfg(test)]

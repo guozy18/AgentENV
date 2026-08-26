@@ -231,7 +231,9 @@ impl TemplateBuildRunner {
                         let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
 
                         debug!("capturing template snapshot");
-                        let (_, manifest) = sandbox.pause_to_dir(&output_dir).await?;
+                        let (_, manifest) = sandbox
+                            .capture_immutable_checkpoint_to_dir(&output_dir)
+                            .await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {

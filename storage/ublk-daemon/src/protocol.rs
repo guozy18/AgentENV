@@ -47,6 +47,10 @@ pub enum DaemonRequest {
         dev_id: u32,
         output_layer_path: PathBuf,
     },
+    /// Flush a live image while excluding concurrent image I/O.
+    SyncForCheckpoint {
+        dev_id: u32,
+    },
     /// Query daemon capabilities (e.g., dynamic resize support).
     GetFeatures,
     /// Report that the sandbox owning a memory-snapshot device finished

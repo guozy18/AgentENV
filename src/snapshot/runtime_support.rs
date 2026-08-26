@@ -263,7 +263,7 @@ fn attach_local_layer_location(
     }
 }
 
-async fn write_image_config(
+pub(crate) async fn write_image_config(
     destination: &Path,
     label: &str,
     image_config: &ImageConfig,

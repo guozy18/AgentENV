@@ -58,7 +58,6 @@ impl OssBackend {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Result<Self> {
         let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
-        let managed_layers_repo_blob_url = config.managed_layers_repo_blob_url();
         let client = Arc::new(OssClient::new(
             config.bucket().to_string(),
             config.endpoint().to_string(),
@@ -80,9 +79,8 @@ impl OssBackend {
             cache,
             runtime_root,
             store,
-            managed_layers_repo_blob_url,
             p2p_transport,
-        )?);
+        ));
 
         Ok(Self {
             repository,

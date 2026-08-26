@@ -146,6 +146,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    "503":
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
 
   schemas:
     CPUCount:
@@ -181,6 +187,16 @@ components:
       enum:
         - running
         - paused
+
+    SnapshotType:
+      type: string
+      enum:
+        - local
+        - distributed
+      description: >-
+        Storage availability of a reusable snapshot. Local snapshots are
+        available only on the publishing Pod; distributed snapshots are
+        published to the primary repository.
 
     SnapshotInfo:
       type: object
@@ -221,6 +237,9 @@ components:
             OverlayBD-native OCI image reference for the snapshot rootfs when
             source-registry image publication was enabled and succeeded.
             Omitted when no rootfs image was published.
+        snapshotType:
+          $ref: "#/components/schemas/SnapshotType"
+          description: Storage availability of the reusable snapshot.
 
     EnvVars:
       additionalProperties:
@@ -655,7 +674,13 @@ components:
       properties:
         name:
           type: string
-          description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+          description: Optional human-readable alias for a Distributed reusable snapshot. Local snapshots reject aliases.
+        snapshotType:
+          $ref: "#/components/schemas/SnapshotType"
+          default: distributed
+          description: >-
+            Requested storage availability for the reusable snapshot. Omitted
+            requests retain the legacy distributed behavior.
 
     SandboxForkRequest:
       type: object
@@ -1362,6 +1387,8 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1504,7 +1531,6 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
-  # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
   /sandboxes/{sandboxID}/pause:
     post:
       summary: Pause sandbox
@@ -1851,6 +1877,8 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1898,6 +1926,8 @@ paths:
           $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1921,10 +1951,46 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnapshotInfo"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "503":
+          $ref: "#/components/responses/503"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /snapshots/{snapshotID}/promote:
+    post:
+      summary: Promote a Local snapshot
+      description: Promote a Local reusable snapshot to Distributed availability without recapturing the source sandbox. Repeating the request after promotion is idempotent.
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AccessTokenAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "200":
+          description: Snapshot is available as Distributed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotInfo"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 

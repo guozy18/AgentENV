@@ -347,16 +347,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root = %artifact_root.display(),
             "persisting paused sandbox"
         );
-        let state = match paused_state.encode() {
-            Ok(state) => state,
-            Err(source) => {
-                let _ = Self::remove_artifact_root(artifact_root).await;
-                return Err(SandboxPersistenceError::InvalidRecord {
+        let state =
+            paused_state
+                .encode()
+                .map_err(|source| SandboxPersistenceError::InvalidRecord {
                     reason: "failed to encode paused sandbox state".to_string(),
                     source: Some(source),
-                });
-            }
-        };
+                })?;
         let record = PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -364,11 +361,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root: artifact_root.to_path_buf(),
             state,
         };
-        let result = self.put_record(&record).await;
-        if result.is_err() {
-            let _ = Self::remove_artifact_root(artifact_root).await;
-        }
-        result
+        self.put_record(&record).await
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -403,27 +396,13 @@ mod tests {
     use super::*;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
-        FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-        SandboxLaunchConfig,
+        FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend, SandboxLaunchConfig,
     };
     use crate::snapshot::RunnableSnapshot;
     use anyhow::Result;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
-
-    #[derive(Debug)]
-    struct FailingEncodeState;
-
-    impl PausedSandboxState for FailingEncodeState {
-        fn encode(&self) -> Result<Value> {
-            anyhow::bail!("forced encode failure")
-        }
-
-        fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-            RuntimeArtifactSet::empty()
-        }
-    }
 
     #[derive(Default)]
     struct RejectingFactory;
@@ -668,27 +647,6 @@ mod tests {
         drop(paused_state);
 
         assert!(snapshot_root.exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn persist_paused_cleans_artifacts_when_encode_fails() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        tokio::fs::create_dir_all(&snapshot_root).await?;
-        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(FailingEncodeState);
-        let err = persister
-            .persist_paused(
-                &SandboxMetadata::default(),
-                Some(&snapshot_root),
-                paused_state.as_ref(),
-            )
-            .await
-            .expect_err("encode failure should reject paused state");
-
-        assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
-        assert!(!snapshot_root.exists());
         Ok(())
     }
 

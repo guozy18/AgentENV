@@ -7,6 +7,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context, Result};
 use firecracker_client::models::drive::IoEngine;
 use firecracker_client::models::instance_action_info::ActionType;
+use firecracker_client::models::snapshot_create_params::SnapshotType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
@@ -450,18 +451,48 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Creates a diff snapshot containing VM state only.
-    ///
-    /// The memory data path is handled by AgentENV through dirty memory ranges.
-    #[tracing::instrument(skip(self), fields(snapshot_path = %snapshot_path.display()))]
-    pub async fn create_state_only_snapshot(&self, snapshot_path: &Path) -> Result<()> {
+    async fn create_snapshot(
+        &self,
+        snapshot_path: &Path,
+        mem_file_path: Option<&Path>,
+        snapshot_type: SnapshotType,
+    ) -> Result<()> {
         let mut params = SnapshotCreateParams::new(snapshot_path.to_string_lossy().into_owned());
-        params.snapshot_type =
-            Some(firecracker_client::models::snapshot_create_params::SnapshotType::Diff);
+        params.mem_file_path = mem_file_path.map(|path| path.to_string_lossy().into_owned());
+        params.snapshot_type = Some(snapshot_type);
         self.client
             .request_no_content(Method::PUT, "/snapshot/create", Some(&params))
             .await
-            .context("Failed to create state-only snapshot")
+            .with_context(|| format!("Failed to create {snapshot_type:?} snapshot"))
+    }
+
+    /// Creates a Firecracker diff snapshot, optionally including a sparse
+    /// memory file. AgentENV omits the file for its direct dirty-range path.
+    #[tracing::instrument(
+        skip(self),
+        fields(snapshot_path = %snapshot_path.display(), ?mem_file_path)
+    )]
+    pub async fn create_diff_snapshot(
+        &self,
+        snapshot_path: &Path,
+        mem_file_path: Option<&Path>,
+    ) -> Result<()> {
+        self.create_snapshot(snapshot_path, mem_file_path, SnapshotType::Diff)
+            .await
+    }
+
+    /// Creates a complete regular-file memory snapshot for Temporal continuation.
+    #[tracing::instrument(
+        skip(self),
+        fields(snapshot_path = %snapshot_path.display(), mem_file_path = %mem_file_path.display())
+    )]
+    pub async fn create_full_snapshot(
+        &self,
+        snapshot_path: &Path,
+        mem_file_path: &Path,
+    ) -> Result<()> {
+        self.create_snapshot(snapshot_path, Some(mem_file_path), SnapshotType::Full)
+            .await
     }
 
     /// Returns Firecracker's dirty memory ranges for direct memory snapshot packaging.

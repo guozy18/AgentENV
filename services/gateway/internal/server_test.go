@@ -1857,6 +1857,11 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == snapshotPlacementPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"snapshotType":"distributed"}`))
+			return
+		}
 		payload, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("read upstream request body failed: %v", err)
@@ -1901,7 +1906,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"template":"base"}`))
+	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"templateID":"base"}`))
 	if err != nil {
 		t.Fatalf("build request failed: %v", err)
 	}
@@ -1945,8 +1950,8 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	if upstreamReq.contentType != "application/json" {
 		t.Fatalf("upstream content type = %q, want %q", upstreamReq.contentType, "application/json")
 	}
-	if upstreamReq.body != `{"template":"base"}` {
-		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"template":"base"}`)
+	if upstreamReq.body != `{"templateID":"base"}` {
+		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"templateID":"base"}`)
 	}
 	if upstreamReq.forwardedHost != "gateway.test" {
 		t.Fatalf("X-Forwarded-Host = %q, want %q", upstreamReq.forwardedHost, "gateway.test")

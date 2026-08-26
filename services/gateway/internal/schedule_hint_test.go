@@ -25,9 +25,12 @@ func newHintRequest(t *testing.T, method, target, body string) *http.Request {
 func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	r := newHintRequest(t, http.MethodPost, "/sandboxes", `{"templateID":"tmpl"}`)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
 	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint, got %v", hint)
@@ -50,9 +53,12 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 	const reqBody = `{"image":"ubuntu:24.04","cpuCount":4,"memoryMB":2048,"attachedDrives":[{"source":{"image":"data:v1"}},{"source":{"image":"cache:v2"}}]}`
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	cold := hint.GetNewColdSandbox()
 	if cold == nil {
@@ -83,17 +89,23 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 
 func TestBuildScheduleHintTrailingSlash(t *testing.T) {
 
-	hint, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", ""))
+	hint, snapshotRef, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", `{"templateID":"tmpl"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "tmpl" {
+		t.Fatalf("snapshot reference = %q, want tmpl", snapshotRef)
 	}
 	if hint.GetNewSandbox() == nil {
 		t.Fatalf("expected new_sandbox hint for trailing slash, got %v", hint)
 	}
 
-	hint, err = buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes-cold/", `{"image":"img"}`))
+	hint, snapshotRef, err = buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes-cold/", `{"image":"img"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	if hint.GetNewColdSandbox() == nil {
 		t.Fatalf("expected cold sandbox hint for trailing slash, got %v", hint)
@@ -114,12 +126,15 @@ func TestBuildScheduleHintNoHint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			hint, err := buildScheduleHint(newHintRequest(t, tc.method, tc.target, ""))
+			hint, snapshotRef, err := buildScheduleHint(newHintRequest(t, tc.method, tc.target, ""))
 			if err != nil {
 				t.Fatalf("buildScheduleHint returned error: %v", err)
 			}
 			if hint != nil {
 				t.Fatalf("expected nil hint, got %v", hint)
+			}
+			if snapshotRef != "" {
+				t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 			}
 		})
 	}
@@ -179,9 +194,12 @@ func TestBuildScheduleHintColdSandboxOversizedBodyStreams(t *testing.T) {
 	}
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
 
-	hint, err := buildScheduleHint(r)
+	hint, snapshotRef, err := buildScheduleHint(r)
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	if snapshotRef != "" {
+		t.Fatalf("snapshot reference = %q, want empty", snapshotRef)
 	}
 	cold := hint.GetNewColdSandbox()
 	if cold == nil {

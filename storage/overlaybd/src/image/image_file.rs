@@ -62,6 +62,13 @@ impl ImageFileBase {
             Self::ReadWrite(file) => Some(file),
         }
     }
+
+    async fn sync(&self) -> Result<()> {
+        match self {
+            Self::ReadOnly(file) => file.sync().await,
+            Self::ReadWrite(file) => file.sync().await,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -188,6 +195,16 @@ impl ImageFile {
             .context("export_upper_as_sealed requires a writable upper layer")?
             .export_upper_as_sealed(args)
             .await
+    }
+
+    /// Flush image state while excluding concurrent I/O through this image.
+    ///
+    /// The caller must first stop the owning VM from issuing new requests.
+    /// Taking the write lock then waits for already-dispatched requests before
+    /// syncing the writable index and data files.
+    pub async fn sync_for_checkpoint(&self) -> Result<()> {
+        let state = self.state.write().await;
+        state.base.sync().await
     }
 
     pub async fn create_snapshot_and_restack(
@@ -862,10 +879,7 @@ impl VirtualFile for ImageFile {
 
     async fn sync(&self) -> Result<()> {
         let state = self.state.read().await;
-        match &state.base {
-            ImageFileBase::ReadOnly(file) => file.sync().await,
-            ImageFileBase::ReadWrite(file) => file.sync().await,
-        }
+        state.base.sync().await
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {

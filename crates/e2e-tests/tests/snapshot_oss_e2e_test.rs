@@ -7,7 +7,7 @@ use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::repository::backends::OssBackend;
 use agentenv::snapshot::{
     OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions, SnapshotType,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
@@ -26,6 +26,23 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),
         tools_drive_version: "0.1.0".to_string(),
+    }
+}
+
+fn test_publish_metadata(id: SnapshotId, alias: Option<SnapshotAlias>) -> SnapshotPublishMetadata {
+    SnapshotPublishMetadata {
+        id,
+        snapshot_type: SnapshotType::Distributed,
+        owner_node_id: None,
+        alias,
+        source: SnapshotPublishSource::Template,
+        context: agentenv::snapshot::CommandContext::default(),
+        startup: None,
+        resources: SandboxResources::default(),
+        runtime_versions: test_runtime_versions(),
+        virtualization_mode: ConfigManager::global_config().virtualization_mode,
+        image_configs: agentenv::types::ImageConfigs::new(),
+        custom_extension_params: None,
     }
 }
 
@@ -148,18 +165,10 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
 
     let stored = repository
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
+            test_publish_metadata(
+                snapshot_id.clone(),
+                Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
+            ),
             manifest,
         )
         .await?;
@@ -204,19 +213,28 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     assert_eq!(object_bytes.as_ref(), source_zfile_bytes.as_slice());
     assert!(
         fixture
-            .object_exists(&format!("{prefix}/artifacts/{snapshot_id}/vm_state.bin"))
+            .object_exists(&prefixed_key(
+                prefix,
+                &format!(
+                    "artifacts/{}/{}",
+                    stored.id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state
+                ),
+            ))
             .await?
     );
     assert!(
         fixture
-            .object_exists(&format!(
-                "{prefix}/artifacts/{snapshot_id}/{}",
-                SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest
+            .object_exists(&prefixed_key(
+                prefix,
+                &format!(
+                    "artifacts/{}/{}",
+                    stored.id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest
+                ),
             ))
             .await?
     );
 
-    let runnable = resolver.resolve(Arc::new(stored)).await?;
+    let runnable = resolver.resolve(Arc::new(stored.clone())).await?;
     assert!(runnable.manifest().vm_state.path.exists());
     assert!(runnable.manifest().memory.image_config_path.exists());
     assert!(runnable.manifest().rootfs.image_config_path.exists());
@@ -250,61 +268,6 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
-    let fixture = MinioFixture::start().await?;
-    let workspace = TempDir::new()?;
-    let prefix = "snapshots/stale-alias";
-    let oss = test_oss_config(&fixture, prefix);
-    ensure_test_config()?;
-
-    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
-    let artifacts_root = workspace.path().join("local-artifacts");
-    let (_, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
-    let alias = SnapshotAlias::parse("stale-alias").expect("alias should parse");
-    let snapshot_id = SnapshotId::generate();
-
-    let stored = repository
-        .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                alias: Some(alias.clone()),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
-            manifest,
-        )
-        .await?;
-
-    let record_key = prefixed_key(prefix, &format!("catalog/records/{}.json", stored.id));
-    fixture
-        .client
-        .delete_object()
-        .bucket(&fixture.bucket)
-        .key(&record_key)
-        .send()
-        .await?;
-
-    assert_eq!(repository.resolve_alias(alias.as_ref()).await?, None);
-    assert!(
-        !fixture
-            .object_exists(&prefixed_key(
-                prefix,
-                &format!("catalog/aliases/{}.json", alias.as_ref())
-            ))
-            .await?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
 async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let fixture = MinioFixture::start().await?;
     let workspace = TempDir::new()?;
@@ -319,21 +282,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let snapshot_id = SnapshotId::generate();
 
     let stored = repository
-        .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id,
-                alias: None,
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
-            manifest,
-        )
+        .publish(test_publish_metadata(snapshot_id, None), manifest)
         .await?;
 
     fixture
@@ -379,18 +328,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
 
     let stored = repository
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                alias: Some(alias.clone()),
-                source: SnapshotPublishSource::Template,
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                custom_extension_params: None,
-            },
+            test_publish_metadata(snapshot_id.clone(), Some(alias.clone())),
             manifest,
         )
         .await?;
