@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -212,12 +212,14 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name. Defaults to the image’s repository segment.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command used to wait until the sandbox is ready (polled until it exits 0)</td></tr>
-<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
+<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
-<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete</td></tr>
+<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -233,15 +235,29 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 </thead>
 <tbody>
 <tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--image &lt;image&gt;</code></td><td>Override the <code>FROM</code> image used as the rootfs base</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Override the rootfs base. Defaults to the first concrete <code>FROM</code> image, then the server’s <code>[image.resolver].default_image</code> if none is usable. Alias: <code>--user-image</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>aenv build</code> submits the build and returns immediately. Use
+<code>aenv template watch &lt;template&gt;</code> to wait for completion.</p>
 <h3 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h3>
 <p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
 <pre><code class="language-bash">aenv template list
 aenv template list --output json
 </code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-template-watch-template"><a class="header" href="#aenv-template-watch-template"><code>aenv template watch &lt;template&gt;</code></a></h3>
 <p>Watch a template build until it succeeds or fails. Accepts either a template name/alias or a template UUID.</p>
 <pre><code class="language-bash">aenv template watch my-ubuntu
@@ -255,11 +271,13 @@ aenv template delete &lt;template-id&gt;
 <hr>
 <h2 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h2>
 <h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
-<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> is a template name or template UUID.</p>
+<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
+or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
-aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </code></pre>
+<p>Sandboxes started by <code>aenv</code> always require token-authenticated envd access. The
+CLI obtains and manages the access token automatically.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -267,15 +285,15 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </thead>
 <tbody>
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
-<tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
-<tr><td><code>--cpu-count &lt;n&gt;</code> / <code>--cpu</code></td><td>CPU cores — only valid with <code>--cold</code></td></tr>
-<tr><td><code>--memory-mb &lt;n&gt;</code> / <code>--mem</code></td><td>Memory in MiB — only valid with <code>--cold</code></td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>&lt;target&gt;</code> accepts a template UUID, template name, or (with <code>--cold</code>) an OCI image reference.</p>
+<p>CPU, memory, and disk overrides are supported only for cold starts.</p>
 <h3 id="aenv-pause-sandbox-id"><a class="header" href="#aenv-pause-sandbox-id"><code>aenv pause &lt;sandbox-id&gt;</code></a></h3>
 <p>Pause a running sandbox. The sandbox state is preserved and can be resumed later.</p>
 <pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
@@ -290,7 +308,7 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300)</td></tr>
+<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300). Must be longer than the sandbox’s current remaining TTL.</td></tr>
 </tbody>
 </table>
 </div>
@@ -368,12 +386,59 @@ extended attributes, or hard-link relationships.</p>
 <p>List all sandboxes. Alias: <code>aenv ls</code>.</p>
 <pre><code class="language-bash">aenv list
 </code></pre>
-<p>Outputs a table on a TTY and JSON when piped. Override with <code>--output table|json</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-delete-sandbox-id"><a class="header" href="#aenv-delete-sandbox-id"><code>aenv delete &lt;sandbox-id&gt;</code></a></h3>
 <p>Kill and delete a sandbox. Alias: <code>aenv rm</code>.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
 aenv rm &lt;sandbox-id&gt;
 </code></pre>
+<hr>
+<h2 id="volumes"><a class="header" href="#volumes">Volumes</a></h2>
+<h3 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h3>
+<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and <code>exclusive</code> mode.</p>
+<pre><code class="language-bash">aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size. A copy-on-write fork must use the same size as its source.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image.</td></tr>
+</tbody>
+</table>
+</div>
+<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+</code></pre>
+<p>See <a href="../concepts/volumes.html">Volumes</a> for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.</p>
+<h3 id="inspect-and-delete-volumes"><a class="header" href="#inspect-and-delete-volumes">Inspect and delete volumes</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+</code></pre>
+<p>A mounted volume cannot be deleted. <code>aenv volume ls</code> is an alias for
+<code>aenv volume list</code>.</p>
 <hr>
 <h2 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h2>
 <h3 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h3>
@@ -387,7 +452,7 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-base
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias. If omitted, the generated snapshot ID identifies the snapshot.</td></tr>
 </tbody>
 </table>
 </div>
@@ -404,12 +469,83 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>--sandbox-id &lt;id&gt;</code></td><td>Filter snapshots by source sandbox ID</td></tr>
-<tr><td><code>--output &lt;format&gt;</code></td><td>Output format: <code>table</code> (default on TTY) or <code>json</code></td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
 </tbody>
 </table>
 </div>
 <p>The table output includes an <code>IMAGE REF</code> column (<code>-</code> when no image was published); JSON output includes the optional <code>imageRef</code> field.</p>
 <p>To delete a snapshot, use <code>aenv template delete &lt;snapshot-id&gt;</code> or <code>aenv template delete &lt;name&gt;</code> — snapshots share the same underlying store as templates and are deleted through the same command.</p>
+<hr>
+<h2 id="shell-completion"><a class="header" href="#shell-completion">Shell completion</a></h2>
+<p><code>aenv completion &lt;shell&gt;</code> prints a shell-completion registration script for the
+<code>aenv</code> CLI to stdout. Supported shells: <code>bash</code>, <code>zsh</code>, and <code>fish</code>.</p>
+<p>The script registers a completion function that calls back into the <code>aenv</code>
+binary at completion time (<code>COMPLETE=&lt;shell&gt; aenv ...</code>), so completion logic
+always matches the installed CLI version — upgrading <code>aenv</code> does not require
+regenerating the script. The script invokes <code>aenv</code> by name, so the binary must
+be on your <code>PATH</code>.</p>
+<h3 id="generate-and-install-a-script"><a class="header" href="#generate-and-install-a-script">Generate and install a script</a></h3>
+<h4 id="bash"><a class="header" href="#bash">Bash</a></h4>
+<pre><code class="language-bash">mkdir -p ~/.local/share/bash-completion/completions
+aenv completion bash &gt; ~/.local/share/bash-completion/completions/aenv
+</code></pre>
+<p>The Bash completion file is loaded on demand by
+<a href="https://github.com/scop/bash-completion"><code>bash-completion</code></a>.
+This requires <code>bash-completion</code> to be installed and initialized in the current
+shell.</p>
+<h4 id="zsh"><a class="header" href="#zsh">Zsh</a></h4>
+<pre><code class="language-zsh">mkdir -p ~/.local/share/zsh/site-functions
+aenv completion zsh &gt; ~/.local/share/zsh/site-functions/_aenv
+</code></pre>
+<p>Zsh loads completion functions from directories listed in <code>fpath</code>.
+<code>~/.local/share/zsh/site-functions</code> is not included in <code>fpath</code> by default on
+all systems. Add the following lines to <code>~/.zshrc</code> before any existing
+<code>compinit</code> invocation:</p>
+<pre><code class="language-zsh">fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+compinit
+</code></pre>
+<h4 id="fish"><a class="header" href="#fish">Fish</a></h4>
+<pre><code class="language-shell">mkdir -p ~/.config/fish/completions
+aenv completion fish &gt; ~/.config/fish/completions/aenv.fish
+</code></pre>
+<h3 id="activate-without-installing"><a class="header" href="#activate-without-installing">Activate without installing</a></h3>
+<p>To test completion for the current shell session without saving a generated
+file:</p>
+<pre><code class="language-bash">source &lt;(aenv completion bash)         # Bash
+eval "$(aenv completion zsh)"         # Zsh
+aenv completion fish | source          # Fish
+</code></pre>
+<h3 id="what-completion-covers"><a class="header" href="#what-completion-covers">What completion covers</a></h3>
+<p>Static completion covers the full CLI surface:</p>
+<pre><code class="language-bash">aenv &lt;TAB&gt;                       # top-level commands
+aenv snapshot &lt;TAB&gt;              # nested subcommands (create, list, ...)
+aenv list --output &lt;TAB&gt;         # enum values: table, json
+aenv build ./&lt;TAB&gt;               # local path arguments
+</code></pre>
+<p>Commands that take a sandbox ID also complete live sandbox IDs dynamically,
+filtered to the states each command accepts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Completed sandboxes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pause</code>, <code>exec</code>, <code>timeout</code>, <code>upload</code>, <code>download</code>, <code>snapshot create</code></td><td>running</td></tr>
+<tr><td><code>resume</code></td><td>paused</td></tr>
+<tr><td><code>connect</code>, <code>delete</code></td><td>running and paused</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash">aenv resume &lt;TAB&gt;                # paused sandbox IDs
+aenv exec &lt;TAB&gt;                  # running sandbox IDs
+</code></pre>
+<p>Where the shell supports it, candidates carry a description with the sandbox’s
+template and state.</p>
+<p>Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
+request) and silently returns no candidates when credentials, the server, or
+the network are unavailable. Static command and flag completion keeps working
+in that case, and no diagnostic output is written to your command line.</p>
 
                     </main>
 
