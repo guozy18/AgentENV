@@ -43,8 +43,8 @@ use crate::sandbox::extra_drive::{
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
-    UblkCreateSpec, UblkDeviceManager,
+    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedReadOnlyDevice,
+    UblkBackend, UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
@@ -183,7 +183,8 @@ pub struct FirecrackerSandbox {
     current_custom_extension_params: Option<CustomExtensionParams>,
     envd_instance: Option<EnvdInstance>,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
-    mem_ublk_device: Option<SharedMemDevice>,
+    mem_ublk_device: Option<SharedReadOnlyDevice>,
+    tools_ublk_device: Option<SharedReadOnlyDevice>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -796,12 +797,33 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
+        self.prepare_tools_drive().await?;
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
             LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await,
             LaunchMode::Resume(config) => self.start_resume(config.clone()).await,
         }
+    }
+
+    async fn prepare_tools_drive(&mut self) -> Result<()> {
+        if self.tools_ublk_device.is_some() {
+            return Ok(());
+        }
+        let config = ConfigManager::global_config();
+        if let Some(image_config) =
+            crate::setup::resolve_tools_image(config, self.tools_drive_version()).await?
+        {
+            self.tools_ublk_device = Some(
+                UblkDeviceManager::global()
+                    .get_or_create_shared_tools(&UblkCreateSpec::Overlaybd {
+                        image_config,
+                        global_config: config.ublk.overlaybd.global_config_path.clone(),
+                    })
+                    .await?,
+            );
+        }
+        Ok(())
     }
 
     /// Wait for the sandbox to be fully ready.
@@ -818,6 +840,11 @@ impl FirecrackerSandbox {
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        if let Some(tools) = &self.tools_ublk_device {
+            let _ = UblkDeviceManager::global()
+                .notify_sandbox_ready(tools.image_config_path())
+                .await;
+        }
         if let Some(device_key) = &self.mem_snapshot_image_config_path {
             // envd is up: release held background downloads for this memory
             // device. Best-effort — downloads would also start after the
@@ -1314,8 +1341,13 @@ impl FirecrackerSandbox {
             }
         }
 
-        // Shared memory device: release explicitly so a following resume for
-        // the same memory image cannot race the detached Drop cleanup.
+        // Release shared devices explicitly so a following resume for the same
+        // image cannot race the detached Drop cleanup.
+        if let Some(tools_device) = self.tools_ublk_device.take() {
+            if let Err(error) = tools_device.release().await {
+                warn!(error = %error, "failed to release shared tools device during stop");
+            }
+        }
         if let Some(mem_device) = self.mem_ublk_device.take() {
             if let Err(e) = mem_device.release().await {
                 warn!(error = %e, "failed to release shared memory ublk device during stop");
@@ -1583,6 +1615,7 @@ impl Drop for FirecrackerSandbox {
         // via the orchestrator's stop() path.
         self.rootfs_runtime.take();
         self.mem_ublk_device.take();
+        self.tools_ublk_device.take();
         // In daemon mode, extra-drive devices survive sandbox drop. They are
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
@@ -1623,6 +1656,7 @@ impl FirecrackerSandbox {
             envd_instance: None,
             rootfs_runtime: None,
             mem_ublk_device: None,
+            tools_ublk_device: None,
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
@@ -1640,7 +1674,7 @@ impl FirecrackerSandbox {
 
         let global_config = ConfigManager::global_config();
 
-        // ── Tools drive: plain ext4, read-only, shared across sandboxes ──
+        // ── Tools drive: shared read-only ublk, or legacy ext4 ──
         // Symlink work_dir/rootfs.ext4 → tools drive so Firecracker can use a
         // relative path inside the work directory.
         self.link_tools_drive(&config.common, work_dir)?;
@@ -2131,14 +2165,16 @@ impl FirecrackerSandbox {
     }
 
     fn link_tools_drive(&self, common: &FirecrackerCommonConfig, work_dir: &Path) -> Result<()> {
-        let tools_drive_path = common
-            .resolved_tools_drive_path(ConfigManager::global_config())
-            .with_context(|| {
-                format!(
-                    "resolve tools drive version '{}' for sandbox {}",
-                    common.tools_drive_version, self.id
-                )
-            })?;
+        let tools_drive_path = match &self.tools_ublk_device {
+            Some(device) => Ok(device.device_path().to_path_buf()),
+            None => common.resolved_tools_drive_path(ConfigManager::global_config()),
+        }
+        .with_context(|| {
+            format!(
+                "resolve tools drive version '{}' for sandbox {}",
+                common.tools_drive_version, self.id
+            )
+        })?;
         let tools_drive_path = fs::canonicalize(&tools_drive_path).with_context(|| {
             format!(
                 "open tools drive version '{}' at {} for sandbox {}",
@@ -2469,6 +2505,9 @@ impl FirecrackerSandbox {
 
     fn runtime_image_config_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
+        if let Some(tools) = &self.tools_ublk_device {
+            paths.push(tools.image_config_path().to_path_buf());
+        }
         if let Some(rootfs_runtime) = &self.rootfs_runtime {
             paths.push(rootfs_runtime.image_config_path.clone());
         }

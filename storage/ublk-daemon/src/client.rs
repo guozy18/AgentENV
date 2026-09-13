@@ -536,7 +536,7 @@ impl UblkDaemonClient {
         &self,
         image_config: &Path,
         global_config: &Path,
-        virtual_size: u64,
+        virtual_size: Option<u64>,
         access_mode: AccessMode,
     ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {

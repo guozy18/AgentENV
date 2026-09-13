@@ -59,7 +59,8 @@ pub enum DaemonRequest {
     AcquireOverlaybd {
         image_config: PathBuf,
         global_config: PathBuf,
-        virtual_size: u64,
+        /// Expected capacity; omit to use the published image capacity.
+        virtual_size: Option<u64>,
         access_mode: AccessMode,
     },
     /// Release an overlaybd device back to the pool.
@@ -369,7 +370,7 @@ mod tests {
         let req = DaemonRequest::AcquireOverlaybd {
             image_config: PathBuf::from("/img.json"),
             global_config: PathBuf::from("/global.json"),
-            virtual_size: 1024 * 1024 * 1024,
+            virtual_size: Some(1024 * 1024 * 1024),
             access_mode: AccessMode::Exclusive,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -380,7 +381,7 @@ mod tests {
                 access_mode,
                 ..
             } => {
-                assert_eq!(virtual_size, 1024 * 1024 * 1024);
+                assert_eq!(virtual_size, Some(1024 * 1024 * 1024));
                 assert_eq!(access_mode, AccessMode::Exclusive);
             }
             _ => panic!("unexpected variant"),

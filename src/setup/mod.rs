@@ -5,6 +5,8 @@ pub mod overlaybd;
 mod packages;
 mod ublk;
 
+pub(crate) use deps::resolve_tools_image;
+
 use anyhow::{Context, Result};
 use nix::sys::resource::{getrlimit, setrlimit, Resource};
 use nix::unistd::{Gid, Group, User};
@@ -97,7 +99,7 @@ fn is_valid_runtime_account_name(name: &str) -> bool {
 /// Steps:
 /// 1. Verify the configured KVM/PVM host mode and `/dev/kvm` access
 /// 2. Ensure ublk kernel module is loaded and permissions are set
-/// 3. Download dependencies (firecracker, kernel, tools drive, overlaybd) if missing
+/// 3. Provision firecracker, kernel, local tools overrides, and OverlayBD
 pub async fn ensure_environment(
     config: &AppConfig,
     p2p_facade_address: Option<&str>,

@@ -245,7 +245,7 @@ impl FirecrackerCommonConfig {
 
     pub fn validate(&self) -> Result<()> {
         let config = ConfigManager::global_config();
-        let tools_drive_path = self.resolved_tools_drive_path(config)?;
+        self.resolved_tools_drive_path(config)?;
         if !cfg!(target_os = "linux") {
             anyhow::bail!("Firecracker requires a Linux host");
         }
@@ -253,21 +253,6 @@ impl FirecrackerCommonConfig {
             anyhow::bail!(
                 "firecracker binary not found at {}",
                 self.firecracker_binary.display()
-            );
-        }
-        if !tools_drive_path.exists() {
-            anyhow::bail!(
-                "tools drive version '{}' is not installed on this node; resolved path: {}; dependency root: {}; install this immutable release before launching the sandbox",
-                self.tools_drive_version,
-                tools_drive_path.display(),
-                config.deps_path.display()
-            );
-        }
-        if !tools_drive_path.is_file() {
-            anyhow::bail!(
-                "tools drive version '{}' resolved to a non-file path: {}",
-                self.tools_drive_version,
-                tools_drive_path.display()
             );
         }
         self.validate_persisted_artifacts()
