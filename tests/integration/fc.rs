@@ -145,8 +145,21 @@ async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Res
 async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
+    let mut peer = FirecrackerSandbox::new(sandbox_config.clone())?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
-    sandbox.start().await?;
+    tokio::try_join!(sandbox.start(), peer.start())?;
+
+    assert_eq!(
+        fs::canonicalize(sandbox.work_rootfs_path().with_file_name("rootfs.ext4"))?,
+        fs::canonicalize(peer.work_rootfs_path().with_file_name("rootfs.ext4"))?,
+        "sandboxes using the same tools release should share its backing device or file"
+    );
+    peer.stop().await?;
+    let tools = sandbox
+        .run_command("/agentenv/bin/busybox", &["cat", "/sys/block/vda/ro"])
+        .await?;
+    assert_eq!(tools.exit_code, 0);
+    assert_eq!(tools.stdout.trim(), "1");
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot = sandbox.pause().await?;
@@ -210,6 +223,7 @@ async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
 async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
+    let tools_version = sandbox_config.common.tools_drive_version.clone();
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
@@ -220,6 +234,9 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     sandbox.stop().await?;
 
     let encoded = paused_state.encode()?;
+    assert_eq!(encoded["common"]["tools_drive_version"], tools_version);
+    assert!(encoded.get("tools").is_none());
+    assert!(!artifact_root.join("tools").exists());
     drop(paused_state);
 
     let decoded =
