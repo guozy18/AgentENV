@@ -673,7 +673,7 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
-            runtime.actual_virtual_size,
+            Some(runtime.actual_virtual_size),
             AccessMode::Exclusive,
         )
         .await
@@ -1029,7 +1029,7 @@ async fn handle_acquire_overlaybd(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
-    virtual_size: u64,
+    virtual_size: Option<u64>,
     access_mode: AccessMode,
 ) -> Result<DaemonResponse> {
     let pool = pool_state
@@ -1052,11 +1052,13 @@ async fn handle_acquire_overlaybd(
         )
     };
     let actual_virtual_size = image.size_bytes();
-    anyhow::ensure!(
-        virtual_size == actual_virtual_size,
-        "requested overlaybd acquire virtual size {virtual_size} does not match image virtual size {actual_virtual_size}: {}",
-        image_config.display()
-    );
+    if let Some(virtual_size) = virtual_size {
+        anyhow::ensure!(
+            virtual_size == actual_virtual_size,
+            "requested overlaybd acquire virtual size {virtual_size} does not match image virtual size {actual_virtual_size}: {}",
+            image_config.display()
+        );
+    }
 
     match access_mode {
         AccessMode::Exclusive => {

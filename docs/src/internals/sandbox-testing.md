@@ -511,7 +511,7 @@ resumed_sandbox.stop().await?;
 
 ## 4) End-to-End Execution Checklist
 
-1. Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. These are automatically downloaded when the server starts, or you can run `cargo run --bin server -- --setup-only` to provision runtime dependencies independently.
+1. Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. Host dependencies are downloaded when the server starts, or with `cargo run --bin server -- --setup-only`. Tools are prepared on launch or restore using the recorded tools version.
 2. Provision host access once as root with `server --setup-host --runtime-user
    <user> --runtime-group <group>`. The group is the runtime service group: it
    owns AgentENV state and receives ublk device access. Normal server startup

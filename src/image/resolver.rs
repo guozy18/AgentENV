@@ -139,6 +139,22 @@ impl ImageResolver {
         ))
     }
 
+    pub(crate) async fn resolve_tools(
+        &self,
+        image_ref: &str,
+    ) -> ImageResult<Option<ResolvedBlockImage>> {
+        // System dependencies use their configured release source, independently
+        // of the admission policy and conversion settings for user images.
+        let arch = detect_arch()?;
+        let fetched = oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
+        if fetched.format() != ImageFormat::OverlaybdNative {
+            return Ok(None);
+        }
+        self.resolve_fetched_manifest(image_ref, &arch, fetched)
+            .await
+            .map(Some)
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
         let candidates = image_ref_candidates(
             image_ref,

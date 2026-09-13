@@ -86,7 +86,7 @@ RUN mkdir -p /workspace/config
 
 # deps-stage: best-effort deps pre-bake. Runs `--setup-only` against a freshly
 # built server purely to materialize the runtime deps tree (firecracker,
-# kernel, tools.ext4, overlaybd CLI) and regctl into `/workspace/env` and
+# kernel, overlaybd CLI) and regctl into `/workspace/env` and
 # `/usr/local/bin/regctl`. The final stage copies that tree as its own clean
 # layer, keeping the deps payload independent of the server binary.
 FROM runtime-base AS deps-stage
