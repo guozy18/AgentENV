@@ -62,7 +62,7 @@ const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
 /// VM sees this as the rootfs device capacity; actual storage is only what the
 /// layers contain. 64 GiB comfortably covers common base images.
-const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
+pub(super) const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
 const OCI_INDEX_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -1757,7 +1757,8 @@ mod tests {
     fn uuid_from_layer_digest_is_stable_and_digest_specific() {
         let digests = ["sha256:aaa", "sha256:aab", "sha256:aac", "sha256:aad"];
         let uuid = uuid_from_layer_digest(digests[0]);
-        assert_eq!(uuid, uuid_from_layer_digest(digests[0]));
+        // OCI tools v1 keeps this layer identity across runtime upgrades.
+        assert_eq!(uuid.to_string(), "6d4f1c33-bc1f-8f3d-89f7-46f7fecb5234");
         assert_ne!(
             uuid_from_layer_digest("sha256:aaa"),
             uuid_from_layer_digest("sha256:bbb")

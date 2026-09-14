@@ -210,9 +210,7 @@ pub(crate) async fn resolve_tools_image(
         ensure_legacy_tools_drive(config, version).await?;
         return Ok(None);
     }
-    // Keep the tools download policy separate from the shared source image config.
-    let image_path =
-        tools_path.with_file_name(format!("image-{}.json", config.tools.background_download));
+    let image_path = tools_path.with_file_name("image.json");
     if file_exists_nonempty(&image_path) {
         return Ok(Some(image_path));
     }
@@ -227,14 +225,12 @@ pub(crate) async fn resolve_tools_image(
         .await?
     {
         Some(resolved) => {
-            let mut image = overlaybd::config::load_image_config(resolved.overlaybd_config_path)?;
-            image.download_override = Some(config.tools.download_config());
-            let parent = image_path.parent().context("tools image directory")?;
-            std::fs::create_dir_all(parent)?;
-            let temp = tempfile::NamedTempFile::new_in(parent)?;
-            serde_json::to_writer(temp.as_file(), &image)?;
-            temp.persist(&image_path)
-                .context("cache tools image config")?;
+            let destination = image_path.clone();
+            tokio::task::spawn_blocking(move || {
+                install_tools_image(&resolved.overlaybd_config_path, &destination)
+            })
+            .await
+            .context("join tools image installation")??;
             Ok(Some(image_path))
         }
         None => {
@@ -242,6 +238,41 @@ pub(crate) async fn resolve_tools_image(
             Ok(None)
         }
     }
+}
+
+fn install_tools_image(source: &Path, destination: &Path) -> Result<()> {
+    let mut image = overlaybd::config::load_image_config(source)?;
+    // Always prefetch tools independently of user disks and memory.
+    image.download_override = Some(DownloadConfig {
+        enable: true,
+        delay: 0,
+        delay_extra: 1,
+        ..Default::default()
+    });
+    let parent = destination.parent().context("tools image directory")?;
+    std::fs::create_dir_all(parent)?;
+    // Like tools.ext4, installed releases outlive image-cache eviction.
+    // Relative paths also keep dependency bundles relocatable.
+    for layer in &mut image.lowers {
+        if layer.file.is_empty() {
+            continue;
+        }
+        let name = format!("{}.commit", layer.digest.replace(':', "-"));
+        let installed = parent.join(&name);
+        if !installed.exists() && std::fs::hard_link(&layer.file, &installed).is_err() {
+            let copy = tempfile::NamedTempFile::new_in(parent)?;
+            std::fs::copy(&layer.file, copy.path()).context("copy tools layer")?;
+            set_file_mode(copy.path(), 0o644)?;
+            copy.persist(&installed).context("install tools layer")?;
+        }
+        layer.file = name;
+    }
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(temp.as_file(), &image)?;
+    set_file_mode(temp.path(), 0o644)?;
+    temp.persist(destination)
+        .context("cache tools image config")?;
+    Ok(())
 }
 
 fn ensure_tools_version(
@@ -283,16 +314,14 @@ fn ensure_tools_version(
     Ok(())
 }
 
-async fn ensure_legacy_tools_drive(config: &AppConfig, version: &str) -> Result<PathBuf> {
-    let path = config.resolved_tools_drive_path_for_version(version)?;
+async fn ensure_legacy_tools_drive(config: &AppConfig, version: &str) -> Result<()> {
     let config = config.clone();
     let version = version.to_string();
     tokio::task::spawn_blocking(move || {
         ensure_tools_version(&config, &config.deps_path, bundled_manifest(), &version)
     })
     .await
-    .context("join tools ext4 download")??;
-    Ok(path)
+    .context("join tools ext4 download")?
 }
 
 fn install_explicit_tools_drive(source: &Path, destination: &Path, version: &str) -> Result<()> {
@@ -1053,7 +1082,12 @@ mod tests {
         ensure_kernel(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit kernel");
-        ensure_tools(&config).expect("import explicit tools");
+        tokio::try_join!(
+            ensure_legacy_tools_drive(&config, "0.1.0"),
+            ensure_legacy_tools_drive(&config, "0.1.0"),
+        )
+        .expect("concurrent imports of the same tools release");
+        ensure_tools(&config).expect("reuse imported tools");
 
         assert!(!deps_path.join("firecracker").exists());
         assert!(!deps_path.join("kernel").exists());
@@ -1084,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_url_override_requires_explicit_version_before_cache_hit() {
+    fn tools_url_requires_a_version_but_defers_download_until_launch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut config = AppConfig {
             deps_path: temp.path().join("deps"),
@@ -1096,7 +1130,7 @@ mod tests {
         std::fs::create_dir_all(tools_path.parent().expect("tools directory"))
             .expect("create tools directory");
         std::fs::write(&tools_path, b"cached tools").expect("write cached tools");
-        config.tools.url = Some("registry.example.com/custom/tools:{version}".to_string());
+        config.tools.url = Some("registry.unavailable.example/tools:{version}".to_string());
 
         let error =
             ensure_tools(&config).expect_err("custom tools URL must declare its release version");
@@ -1104,21 +1138,52 @@ mod tests {
         assert!(error.to_string().contains(
             "tools.version is required when tools.drive_path or tools.url is configured"
         ));
+        config.tools.version = Some("0.2.0".into());
+        ensure_tools(&config).expect("tools are resolved when starting a fresh sandbox");
+        assert!(!config.resolved_tools_drive_path().unwrap().exists());
     }
 
     #[test]
-    fn tools_setup_does_not_require_the_default_release_source() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut config = AppConfig {
-            deps_path: temp.path().join("deps"),
-            ..AppConfig::default()
-        };
-        config.tools.version = Some("0.2.0".into());
-        config.tools.url = Some("registry.unavailable.example/tools:{version}".into());
-
-        ensure_tools(&config).expect("tools are resolved when starting a fresh sandbox");
-
-        assert!(!config.deps_path.exists());
+    fn installed_tools_layers_survive_cache_removal_and_bundle_relocation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = temp.path().join("image-cache");
+        std::fs::create_dir_all(&cache)?;
+        let layer = cache.join("layer.commit");
+        std::fs::write(&layer, b"immutable tools layer")?;
+        let source = cache.join("image.json");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "lowers": [{"file": layer, "digest": "sha256:tools"}],
+                "download": {"enable": false}
+            }))?,
+        )?;
+        let installed = temp.path().join("tools/1.0.0/image.json");
+        super::install_tools_image(&source, &installed)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&installed)?.permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert!(
+            !overlaybd::config::load_image_config(&source)?
+                .download_override
+                .unwrap()
+                .enable
+        );
+        std::fs::remove_dir_all(cache)?;
+        let relocated = temp.path().join("relocated-tools");
+        std::fs::rename(installed.parent().unwrap(), &relocated)?;
+        let image = overlaybd::config::load_image_config(relocated.join("image.json"))?;
+        assert_eq!(
+            std::fs::read(&image.lowers[0].file)?,
+            b"immutable tools layer"
+        );
+        assert!(image.download_override.unwrap().enable);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1143,35 +1208,8 @@ mod tests {
         assert!(!old_path.exists());
 
         std::fs::write(&old_path, b"old tools").unwrap();
-        let restored = ensure_legacy_tools_drive(&config, "0.1.0").await.unwrap();
-        assert_eq!(std::fs::read(restored).unwrap(), b"old tools");
-    }
-
-    #[tokio::test]
-    async fn concurrent_legacy_restores_reuse_the_versioned_tools_file() {
-        use std::os::unix::fs::MetadataExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("tools.ext4");
-        std::fs::write(&source, b"immutable tools").unwrap();
-        let mut config = AppConfig {
-            deps_path: temp.path().join("deps"),
-            ..AppConfig::default()
-        };
-        config.tools.version = Some("0.1.0".into());
-        config.tools.drive_path = Some(source);
-
-        let (first, second) = tokio::join!(
-            ensure_legacy_tools_drive(&config, "0.1.0"),
-            ensure_legacy_tools_drive(&config, "0.1.0"),
-        );
-        let first = first.unwrap();
-        let second = second.unwrap();
-        assert_eq!(
-            std::fs::metadata(&first).unwrap().ino(),
-            std::fs::metadata(second).unwrap().ino()
-        );
-        assert_eq!(std::fs::read(first).unwrap(), b"immutable tools");
+        ensure_legacy_tools_drive(&config, "0.1.0").await.unwrap();
+        assert_eq!(std::fs::read(old_path).unwrap(), b"old tools");
     }
 
     #[test]

@@ -145,21 +145,8 @@ async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Res
 async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
-    let mut peer = FirecrackerSandbox::new(sandbox_config.clone())?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
-    tokio::try_join!(sandbox.start(), peer.start())?;
-
-    assert_eq!(
-        fs::canonicalize(sandbox.work_rootfs_path().with_file_name("rootfs.ext4"))?,
-        fs::canonicalize(peer.work_rootfs_path().with_file_name("rootfs.ext4"))?,
-        "sandboxes using the same tools release should share its backing device or file"
-    );
-    peer.stop().await?;
-    let tools = sandbox
-        .run_command("/agentenv/bin/busybox", &["cat", "/sys/block/vda/ro"])
-        .await?;
-    assert_eq!(tools.exit_code, 0);
-    assert_eq!(tools.stdout.trim(), "1");
+    sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot = sandbox.pause().await?;
@@ -175,6 +162,181 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
+    Ok(())
+}
+
+async fn serve_tools_rootfs(
+    rootfs: &Path,
+) -> Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {
+    use axum::{extract::Path as RoutePath, routing::get, Router};
+    use bytes::Bytes;
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let mut archive = tar::Builder::new(Vec::new());
+    archive.follow_symlinks(false);
+    archive.append_dir_all(".", rootfs)?;
+    let layer = archive.into_inner()?;
+    let digest = |bytes: &[u8]| format!("sha256:{:x}", Sha256::digest(bytes));
+    let layer_digest = digest(&layer);
+    let config = serde_json::to_vec(&json!({
+        "architecture": if std::env::consts::ARCH == "x86_64" { "amd64" } else { "arm64" },
+        "os": "linux",
+        "config": {"Labels": {"io.agentenv.tools-drive.format": "oci-rootfs-v1"}},
+        "rootfs": {"type": "layers", "diff_ids": [layer_digest]}
+    }))?;
+    let config_digest = digest(&config);
+    let manifest_type = "application/vnd.oci.image.manifest.v1+json";
+    let manifest = Bytes::from(serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": manifest_type,
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": layer_digest, "size": layer.len()}]
+    }))?);
+    let manifest_digest = digest(&manifest);
+    let blobs = Arc::new(std::collections::HashMap::from([
+        (layer_digest, Bytes::from(layer)),
+        (config_digest, Bytes::from(config)),
+    ]));
+    let app = Router::new()
+        .route("/v2/", get(|| async { "{}" }))
+        .route(
+            "/v2/tools/manifests/{reference}",
+            get(move || {
+                let body = manifest.clone();
+                let digest = manifest_digest.clone();
+                async move {
+                    (
+                        [
+                            ("content-type", manifest_type.to_string()),
+                            ("docker-content-digest", digest),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v2/tools/blobs/{digest}",
+            get(move |RoutePath(digest): RoutePath<String>| {
+                let blobs = Arc::clone(&blobs);
+                async move {
+                    blobs
+                        .get(&digest)
+                        .cloned()
+                        .ok_or(axum::http::StatusCode::NOT_FOUND)
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let registry = listener.local_addr()?.to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((registry, server))
+}
+
+#[tokio::test]
+async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Result<()> {
+    use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+
+    common::setup().await;
+    let global = ConfigManager::global_config();
+    let tools_dir = global.deps_path.join("tools");
+    fs::create_dir_all(&tools_dir)?;
+    let release = tempfile::Builder::new()
+        .prefix("0.0.0-oci-")
+        .tempdir_in(&tools_dir)?;
+    let version = release
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let rootfs = release.path().join("rootfs");
+    fs::create_dir(&rootfs)?;
+
+    // Reuse the provisioned guest binaries, regardless of the default tools format.
+    let mut seed = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    seed.start().await?;
+    let extracted = tokio::process::Command::new("debugfs")
+        .args(["-R", &format!("rdump / {}", rootfs.display())])
+        .arg(seed.work_rootfs_path().with_file_name("rootfs.ext4"))
+        .output()
+        .await;
+    seed.stop().await?;
+    let extracted = extracted?;
+    assert!(
+        extracted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    fs::write(
+        rootfs.join("agentenv/tools-drive-version"),
+        format!("{version}\n"),
+    )?;
+
+    let mut setup = global.clone();
+    setup.home_path = release.path().join("home");
+    setup.image.cache.root_dir = release.path().join("image-cache");
+    setup.deps_path = release.path().join("deps");
+    setup.ublk.overlaybd.global_config_path = release.path().join("config/overlaybd.json");
+    setup.memory_snapshot.overlaybd_global_config_path = release.path().join("config/memory.json");
+    setup.firecracker.binary_path = Some(global.resolved_firecracker_binary_path());
+    setup.kernel.image_path = Some(global.resolved_kernel_image_path());
+    setup.tools.drive_path = None;
+    setup.tools.version = Some(version.clone());
+    let regctl = setup.resolved_regctl_binary();
+    fs::create_dir_all(regctl.parent().unwrap())?;
+    symlink(
+        global.deps_path.join("overlaybd"),
+        setup.deps_path.join("overlaybd"),
+    )?;
+    let (registry, server) = serve_tools_rootfs(&rootfs).await?;
+    setup.tools.url = Some(format!("{registry}/tools:{{version}}"));
+    let prepared = async {
+        fs::write(
+            &regctl,
+            format!(
+                "#!/bin/sh\nexec {} --host reg={registry},tls=disabled \"$@\"\n",
+                shell_util::shell_quote(&global.resolved_regctl_binary().to_string_lossy())
+            ),
+        )?;
+        fs::set_permissions(&regctl, fs::Permissions::from_mode(0o755))?;
+        agentenv::setup::ensure_provisioning(&setup).await
+    }
+    .await;
+    server.abort();
+    prepared?;
+    for entry in fs::read_dir(setup.deps_path.join("tools").join(&version))? {
+        let entry = entry?;
+        fs::rename(entry.path(), release.path().join(entry.file_name()))?;
+    }
+
+    let mut config = common::default_sandbox_config()?;
+    config.common.tools_drive_version = version.clone();
+    let mut first = FirecrackerSandbox::new(config.clone())?;
+    let mut second = FirecrackerSandbox::new(config)?;
+    tokio::try_join!(first.start(), second.start())?;
+    let backing = |sandbox: &FirecrackerSandbox| {
+        fs::canonicalize(sandbox.work_rootfs_path().with_file_name("rootfs.ext4"))
+    };
+    let device = backing(&first)?;
+    assert!(fs::metadata(&device)?.file_type().is_block_device());
+    assert_eq!(device, backing(&second)?);
+    first.stop().await?;
+    let output = second
+        .run_command(
+            "/agentenv/bin/busybox",
+            &["cat", "/agentenv/tools-drive-version", "/sys/block/vda/ro"],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout.trim(), format!("{version}\n1"));
+    let paused = second.pause().await?;
+    assert_eq!(paused.common.tools_drive_version, version);
+    second.resume().await?;
+    assert_eq!(device, backing(&second)?);
+    second.stop().await?;
     Ok(())
 }
 

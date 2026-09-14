@@ -28,11 +28,40 @@ struct ConfiguredOverlaybdRelease {
     package_url: String,
 }
 
+/// OCI tools v1 must keep the same block layout when the runtime is upgraded.
+pub(crate) async fn ensure_tools_converter_v1(deps: &Path) -> Result<std::path::PathBuf> {
+    let arch = super::deps::detect_arch()?;
+    let release = OverlaybdDependencyConfig {
+        version: "v1.0.18-aenv.1".into(),
+        url: None,
+        package_url: Some("https://github.com/kvcache-ai/overlaybd/releases/download/static-{version}/overlaybd-tools-{version}-linux-{arch}.tar.gz".into()),
+    };
+    let current = deps.join("overlaybd");
+    let configured = configured_overlaybd_release(&release, &arch)?;
+    let expected = desired_overlaybd_installed_release(
+        &configured,
+        &format!("overlaybd-tools-{}-linux-{arch}.tar.gz", release.version),
+    );
+    if read_overlaybd_installed_release(&current.join("tools-release.json"))? == Some(expected)
+        && overlaybd_tools_present(&current)
+    {
+        return Ok(current);
+    }
+    let pinned = deps.join("tools-converter-v1");
+    ensure_release_tools(&release, &pinned, &arch).await?;
+    Ok(pinned)
+}
+
 pub async fn ensure_release_tools(
     overlaybd: &OverlaybdDependencyConfig,
     overlaybd_dir: &Path,
     arch: &str,
 ) -> Result<()> {
+    // Different tools releases can request the same converter concurrently.
+    // Serialize the complete installation, including its cache check and cleanup.
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = INSTALL.lock().await;
+
     let configured_release = configured_overlaybd_release(overlaybd, arch)?;
     let asset_name = configured_release
         .package_url
@@ -381,6 +410,78 @@ mod tests {
     use crate::cfg::OverlaybdDependencyConfig;
     use nix::unistd::Gid;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[tokio::test]
+    async fn tools_converter_is_installed_once_and_retained_across_upgrades() -> anyhow::Result<()>
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir()?;
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for path in OVERLAYBD_TOOL_NAMES
+            .iter()
+            .map(|tool| format!("bin/{tool}"))
+            .chain(std::iter::once("etc/overlaybd/overlaybd.json".into()))
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, path, &b"{}"[..])?;
+        }
+        let package = archive.into_inner()?.finish()?;
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&downloads);
+        let arch = crate::setup::deps::detect_arch()?;
+        let asset = format!("overlaybd-tools-v1.0.18-aenv.1-linux-{arch}.tar.gz");
+        let app = axum::Router::new().route(
+            &format!("/{asset}"),
+            axum::routing::get(move || {
+                let package = package.clone();
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    package
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let release = OverlaybdDependencyConfig {
+            version: "v1.0.18-aenv.1".into(),
+            url: None,
+            package_url: Some(format!("http://{}/{asset}", listener.local_addr()?)),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let current = temp.path().join("overlaybd");
+        let results = tokio::join!(
+            super::ensure_release_tools(&release, &current, &arch),
+            super::ensure_release_tools(&release, &current, &arch),
+        );
+        server.abort();
+        results.0?;
+        results.1?;
+        assert_eq!(downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            super::ensure_tools_converter_v1(temp.path()).await?,
+            current
+        );
+        let pinned = temp.path().join("tools-converter-v1");
+        std::fs::rename(&current, &pinned)?;
+        std::fs::create_dir_all(&current)?;
+        std::fs::write(
+            current.join("tools-release.json"),
+            br#"{
+            "tag_name":"future-runtime-release", "asset_name":"other.tar.gz", "digest":null
+        }"#,
+        )?;
+        assert_eq!(super::ensure_tools_converter_v1(temp.path()).await?, pinned);
+        Ok(())
+    }
 
     #[test]
     fn configured_overlaybd_release_expands_arch_url() {

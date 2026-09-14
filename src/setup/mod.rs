@@ -27,7 +27,9 @@ pub async fn ensure_dependencies(config: &AppConfig) -> Result<()> {
 pub async fn ensure_provisioning(config: &AppConfig) -> Result<()> {
     packages::ensure()?;
     ensure_dependencies(config).await?;
-    deps::write_generated_overlaybd_global_configs(config, None)
+    deps::write_generated_overlaybd_global_configs(config, None)?;
+    deps::resolve_tools_image(config, config.resolved_tools_version()).await?;
+    Ok(())
 }
 
 /// Provision machine-wide prerequisites for the configured runtime account.

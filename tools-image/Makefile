@@ -2,7 +2,6 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := build
 
-REPO_ROOT := ..
 TOOLS_VERSION ?= 0.1.1
 ENVD_REF ?= 2026.17
 ENVD_UPSTREAM_REPO ?= https://github.com/e2b-dev/infra.git
@@ -24,9 +23,6 @@ $(error unsupported ARCH '$(ARCH)' (expected amd64 or arm64))
 endif
 PLATFORM := linux/$(ARCH)
 PUBLISH_PLATFORMS ?= linux/amd64,linux/arm64
-OUTPUT_DIR ?= out
-OUTPUT_NAME ?= tools-$(TOOLS_VERSION)-$(ARCH).ext4
-OUTPUT_PATH := $(OUTPUT_DIR)/$(OUTPUT_NAME)
 IMAGE ?= agentenv-tools:$(TOOLS_VERSION)
 DOCKER ?= docker
 
@@ -34,7 +30,7 @@ DOCKER ?= docker
 
 check-buildx:
 	@"$(DOCKER)" buildx version >/dev/null 2>&1 || { \
-		echo "docker buildx is required to build tools.ext4." >&2; \
+		echo "docker buildx is required to build the tools image." >&2; \
 		echo "Install Docker Buildx or use a Docker version that includes it." >&2; \
 		exit 1; \
 	}
@@ -68,17 +64,15 @@ check-publish-image:
 	}
 
 build: check-buildx check-tools-version
-	mkdir -p "$(OUTPUT_DIR)"
 	"$(DOCKER)" buildx build \
 		--platform "$(PLATFORM)" \
 		--target artifact \
 		--build-arg "TOOLS_VERSION=$(TOOLS_VERSION)" \
 		--build-arg "ENVD_REF=$(ENVD_REF)" \
 		--build-arg "ENVD_UPSTREAM_REPO=$(ENVD_UPSTREAM_REPO)" \
-		--output "type=local,dest=$(OUTPUT_DIR)" \
+		-t "$(IMAGE)" \
+		--load \
 		.
-	mv "$(OUTPUT_DIR)/tools.ext4" "$(OUTPUT_PATH)"
-	@echo "Wrote $(OUTPUT_PATH)"
 publish: check-buildx check-tools-version check-publish-image
 	"$(DOCKER)" buildx build \
 		--platform "$(PUBLISH_PLATFORMS)" \
