@@ -249,23 +249,9 @@ pub struct ToolsConfig {
     pub version: Option<String>,
     /// Container registry URL template (e.g. "ghcr.io/org/agentenv-tools:{version}").
     pub url: Option<String>,
-    /// Prefetch remote tools layers independently of user disks and memory.
-    #[config(default = true)]
-    pub background_download: bool,
     /// Control plane port inside the VM (default: 49983).
     #[config(default = 49983u16)]
     pub control_plane_port: u16,
-}
-
-impl ToolsConfig {
-    pub(crate) fn download_config(&self) -> overlaybd::config::DownloadConfig {
-        overlaybd::config::DownloadConfig {
-            enable: self.background_download,
-            delay: 0,
-            delay_extra: 1,
-            ..Default::default()
-        }
-    }
 }
 
 #[derive(Debug, Config, Clone)]

@@ -140,15 +140,48 @@ impl ImageResolver {
     }
 
     pub(crate) async fn resolve_tools(
-        &self,
+        mut self,
         image_ref: &str,
     ) -> ImageResult<Option<ResolvedBlockImage>> {
         // System dependencies use their configured release source, independently
         // of the admission policy and conversion settings for user images.
         let arch = detect_arch()?;
-        let fetched = oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
+        let mut fetched =
+            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
         if fetched.format() != ImageFormat::OverlaybdNative {
-            return Ok(None);
+            let metadata = oci_image::fetch_oci_image_config_metadata(
+                &self.regctl_binary,
+                &fetched.selected_image_ref,
+                fetched.config_digest(),
+            )
+            .await?;
+            match metadata
+                .base_context
+                .labels
+                .get("io.agentenv.tools-drive.format")
+                .map(String::as_str)
+            {
+                None => return Ok(None),
+                Some("oci-rootfs-v1") => {}
+                Some(format) => {
+                    return Err(ImageError::UnsupportedImage {
+                        reason: format!("unsupported tools image format '{format}'"),
+                    })
+                }
+            }
+            // v1 is part of the immutable tools release contract, independently
+            // of runtime upgrades and the conversion policy for user images.
+            const _: () = assert!(oci_image::LAYER_VIRTUAL_SIZE_GIB == 64);
+            let deps = self
+                .overlaybd_install_root
+                .parent()
+                .context("overlaybd dependency root")?;
+            self.overlaybd_install_root =
+                crate::setup::overlaybd::ensure_tools_converter_v1(deps).await?;
+            self.overlaybd_oci_converter_id = "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1".into();
+            self.convert_standard_oci = true;
+            self.try_referrers_overlaybd_prefixes.clear();
+            fetched.repository_scope = Some("tools-oci-rootfs-v1".into());
         }
         self.resolve_fetched_manifest(image_ref, &arch, fetched)
             .await

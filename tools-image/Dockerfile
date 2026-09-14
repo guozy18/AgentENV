@@ -2,23 +2,19 @@
 
 # AgentENV envd tools drive.
 #
-# This image is a reproducible build recipe for the small ext4 tools drive that
+# This image is a reproducible build recipe for the tools drive that
 # AgentENV attaches to each Firecracker guest as /dev/vda. The guest boots from
 # this drive, pivots into the user rootfs on /dev/vdb, then keeps /agentenv
 # bind-mounted so the compiled envd binary and BusyBox helpers remain available.
 #
-# The final artifact stage is intentionally a scratch image containing only:
-#
-#   /tools.ext4
-#
-# AgentENV's setup path consumes prebuilt images with this shape by extracting
-# /tools.ext4 from the OCI image. Normal server startup does not rebuild this
-# Dockerfile; this source exists so the runtime artifact can be audited and
-# reproduced.
+# The final artifact stage is a scratch image containing the tools rootfs.
+# AgentENV downloads and converts each immutable release locally to OverlayBD.
+# Normal server startup does not rebuild this Dockerfile; this source exists
+# so the runtime artifact can be audited and reproduced.
 #
 # Build example:
 #
-#   make -C tools-image TOOLS_VERSION=0.1.0 ENVD_REF=2026.17
+#   make -C tools-image TOOLS_VERSION=0.1.1 ENVD_REF=2026.17
 #
 # Important build args:
 #   TOOLS_VERSION        Immutable AgentENV tools drive release version.
@@ -121,43 +117,19 @@ RUN set -eux; \
       { echo "BusyBox ionice applet missing; rebuild with CONFIG_IONICE=y" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Stage 3: materialize the rootfs as an ext4 disk image.
+# Stage 3: export contract.
 #
-# We do this inside Docker so contributors do not need host e2fsprogs. The
-# image gets 50% content headroom and a 16 MiB floor to leave room for ext4
-# metadata, journal, and inode tables.
-# ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM debian:${DEBIAN_VERSION}-slim AS ext4-builder
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends e2fsprogs findutils \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=rootfs /tools-rootfs /rootfs
-
-RUN set -eux; \
-    mkdir -p /out; \
-    content_bytes="$(find /rootfs -type f -printf '%s\n' | awk '{sum += $1} END {print sum + 0}')"; \
-    image_bytes="$((content_bytes * 3 / 2))"; \
-    image_size_mb="$(((image_bytes + 1048575) / 1048576))"; \
-    if [ "$image_size_mb" -lt 16 ]; then image_size_mb=16; fi; \
-    dd if=/dev/zero of=/out/tools.ext4 bs=1M count="$image_size_mb" status=none; \
-    mkfs.ext4 -q -d /rootfs -L tools /out/tools.ext4; \
-    chmod 0644 /out/tools.ext4
-
-# ---------------------------------------------------------------------------
-# Stage 4: export contract.
-#
-# Keep the final stage tiny and stable: consumers should only rely on
-# /tools.ext4 being present at the root of this image.
+# Export the rootfs directly. The format label selects AgentENV's stable
+# local OverlayBD conversion contract.
 # ---------------------------------------------------------------------------
 FROM scratch AS artifact
 
 ARG TOOLS_VERSION
 LABEL org.opencontainers.image.title="AgentENV tools drive" \
-      org.opencontainers.image.version="${TOOLS_VERSION}"
+      org.opencontainers.image.version="${TOOLS_VERSION}" \
+      io.agentenv.tools-drive.format="oci-rootfs-v1"
 
-COPY --from=ext4-builder /out/tools.ext4 /tools.ext4
+COPY --from=rootfs /tools-rootfs/ /
 # This artifact image is never meant to run. Keep an invalid command so an
 # accidental `docker run` fails immediately instead of appearing useful.
 CMD ["/nonexistent"]

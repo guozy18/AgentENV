@@ -639,6 +639,10 @@ struct SharedReadOnlyDeviceInner {
     /// Canonical key used for the shared device pool lookup.
     image_config_key: PathBuf,
     released: AtomicBool,
+    // Linux clears a block device's page cache when its last opener closes
+    // (blkdev_put_whole -> kill_bdev). Keep an opener between sandbox launches;
+    // the daemon's /dev/ublkcN handle does not keep /dev/ublkbN open. This does
+    // not prevent normal cache reclaim under memory pressure.
     cache_fd: std::sync::Mutex<Option<File>>,
 }
 

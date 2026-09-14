@@ -69,7 +69,6 @@ The default release is selected automatically; most deployments can leave this s
 | `version` | string | manifest value | Immutable SemVer release of the complete tools drive; custom distributions should use a unique prerelease such as `0.1.0-custom.1` |
 | `url` | string | manifest value | Optional OCI image URL template override with a `{version}` placeholder; requires an explicit `version` when set |
 | `drive_path` | string | unset | Local tools ext4 source imported into the versioned dependency directory; requires an explicit `version` |
-| `background_download` | boolean | `true` | Prefetch remote tools layers after envd is ready; independent of memory and user disk download settings |
 | `control_plane_port` | integer | `49983` | Port used by envd inside the guest |
 
 Snapshots and paused sandboxes record only `tools_drive_version`. Launch and
@@ -77,13 +76,17 @@ restore fetch that version from the configured URL template when it is missing
 locally. Releases must be immutable and retained for the lifetime of their
 snapshots; changing the default version affects new sandboxes and templates.
 
-The existing `tools.ext4` wrapper is downloaded and mounted read-only. Native
-OverlayBD images are read lazily through a shared read-only ublk device, with
-capacity taken from the published image and tools-only background download.
-Tools are not uploaded into snapshot storage. Standard OCI filesystem images
-must first be published as a fixed block artifact; per-node filesystem creation
-cannot guarantee the block layout required by VM memory snapshots.
-A local `drive_path` only identifies its declared version.
+OCI tools rootfs images carry `io.agentenv.tools-drive.format=oci-rootfs-v1`
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+`--setup-only` prepares the default release for dependency bundles.
+
+Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide `tools.ext4`, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+`drive_path` only identifies its declared version.
 
 ## Template Rootfs Images
 

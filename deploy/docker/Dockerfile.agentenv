@@ -83,12 +83,14 @@ RUN export DEBIAN_FRONTEND=noninteractive \
 WORKDIR /workspace
 RUN mkdir -p /workspace/config
 
+# overlaybd-apply validates its built-in default service config path even when
+# AgentENV passes an explicit generated config. Both build stages need it.
+RUN mkdir -p /etc/overlaybd \
+    && printf '{}\n' > /etc/overlaybd/overlaybd.json
 
-# deps-stage: best-effort deps pre-bake. Runs `--setup-only` against a freshly
-# built server purely to materialize the runtime deps tree (firecracker,
-# kernel, overlaybd CLI) and regctl into `/workspace/env` and
-# `/usr/local/bin/regctl`. The final stage copies that tree as its own clean
-# layer, keeping the deps payload independent of the server binary.
+# deps-stage: prepare runtime dependencies and the default tools release.
+# `--setup-only` converts OCI tools here, before the final image is assembled.
+# The final stage copies the dependency tree independently of the server binary.
 FROM runtime-base AS deps-stage
 ARG AENV_VIRTUALIZATION_MODE
 COPY --from=builder --chmod=0755 /out-server /server
@@ -102,11 +104,6 @@ RUN DEBIAN_FRONTEND=noninteractive /server --setup-only
 # final image.
 FROM runtime-base
 ARG AENV_VIRTUALIZATION_MODE
-
-# overlaybd-apply validates its built-in default service config path even when
-# AgentENV passes an explicit generated config at runtime.
-RUN mkdir -p /etc/overlaybd \
-    && printf '{}\n' > /etc/overlaybd/overlaybd.json
 
 # Pre-baked runtime deps from `deps-stage`. Paths must match what `--setup-only`
 # produces; see src/setup/deps.rs and src/setup/overlaybd.rs.

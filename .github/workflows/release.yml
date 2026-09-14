@@ -136,6 +136,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang libclang-dev libprotobuf-dev protobuf-compiler
+          # overlaybd-apply requires its default config path during argument parsing.
+          sudo mkdir -p /etc/overlaybd
+          sudo sh -c 'test -e /etc/overlaybd/overlaybd.json || printf "{}\n" > /etc/overlaybd/overlaybd.json'
 
       - uses: dtolnay/rust-toolchain@stable
 
