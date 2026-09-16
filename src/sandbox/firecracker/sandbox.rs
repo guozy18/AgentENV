@@ -794,7 +794,8 @@ impl FirecrackerSandbox {
         }
         let config = ConfigManager::global_config();
         if let Some(image_config) =
-            crate::setup::resolve_tools_image(config, self.tools_drive_version()).await?
+            crate::setup::resolve_tools_image(config, &self.launch.common().tools_drive_version)
+                .await?
         {
             self.tools_ublk_device = Some(
                 UblkDeviceManager::global()
