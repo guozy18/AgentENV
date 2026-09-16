@@ -335,17 +335,14 @@ class BuildKitTests(unittest.TestCase):
             all(build[0].poll() is None for _, build in builds),
             "workers did not overlap",
         )
-        if os.environ.get("E2E_MODE") == "compose":
-            self.wait_for(
-                lambda: (
-                    sum(
-                        counts[0] > self.baseline[node][0]
-                        for node, counts in self.node_counts().items()
-                    )
-                    >= 2
-                ),
-                "concurrent builders on different nodes",
-            )
+        # Scheduling also handles metadata requests, so builders may share a node.
+        self.wait_for(
+            lambda: sum(
+                counts[0] - self.baseline[node][0]
+                for node, counts in self.node_counts().items()
+            ) >= len(builds),
+            "concurrent builders across the cluster",
+        )
         for name, build in builds:
             self.finish(build)
             self.assertEqual(self.result(build, name)[0], seed)

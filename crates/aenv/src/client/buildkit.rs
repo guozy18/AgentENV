@@ -118,7 +118,12 @@ where
     let downstream = async {
         while let Some(message) = receiver.next().await {
             match message? {
-                Message::Binary(bytes) => write.write_all(&bytes).await?,
+                // buildctl may close its reader while a final response is in flight.
+                Message::Binary(bytes) => match write.write_all(&bytes).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                    Err(error) => return Err(error.into()),
+                },
                 Message::Close(_) => break,
                 Message::Text(_) => bail!("expected binary BuildKit stream"),
                 _ => {}
@@ -136,6 +141,56 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, UnixStream};
+
+    #[tokio::test]
+    async fn closed_local_reader_does_not_abort_other_buildkit_connections() -> Result<()> {
+        let (_work, listener, address) = bind_local().await?;
+        let path = address.strip_prefix("unix://").unwrap();
+        let remote = TcpListener::bind("127.0.0.1:0").await?;
+        let client = Client::new(&format!("http://{}", remote.local_addr()?), "test-key")?;
+        let (closed, disconnected) = tokio::sync::oneshot::channel();
+        let mut closed = Some(closed);
+        let mut server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = remote.accept().await?;
+                let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                socket
+                    .send(Message::Binary(b"response".to_vec().into()))
+                    .await?;
+                let _ = socket.next().await;
+                if let Some(closed) = closed.take() {
+                    let _ = closed.send(());
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut tunnel =
+            tokio::spawn(async move { client.buildkit_tunnel("/builder", listener).await });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            // Make a late response hit EPIPE without racing the upstream EOF.
+            stream.shutdown(std::net::Shutdown::Read)?;
+            let exchange = async {
+                disconnected.await?;
+                let mut next = UnixStream::connect(path).await?;
+                let mut response = [0; 8];
+                next.read_exact(&mut response).await?;
+                assert_eq!(&response, b"response");
+                drop(next);
+                (&mut server).await??;
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::select! {
+                result = &mut tunnel => { result??; bail!("tunnel exited after one connection closed"); }
+                result = exchange => result,
+            }
+        })
+        .await;
+        tunnel.abort();
+        server.abort();
+        result??;
+        Ok(())
+    }
 
     #[tokio::test]
     #[allow(clippy::result_large_err)] // The WebSocket handshake fixes the callback error type.
