@@ -1,0 +1,3 @@
+test/rootfs/
+plain-snapshotter
+containerd-plain-snapshotter
