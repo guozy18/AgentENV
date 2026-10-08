@@ -28,6 +28,18 @@ const ZFILE_FINE_DURATION_BUCKETS: &[f64] = &[
     30.0,
 ];
 
+/// Buckets for `agentenv_ublk_io_duration_seconds`: the standard
+/// `DURATION_BUCKETS` ladder truncated at 30s, matching the slow-I/O
+/// threshold in `storage/ublk/src/metrics.rs` (`SLOW_IO_THRESHOLD`). The
+/// two signals are complementary: the histogram's `+Inf` bucket captures
+/// I/Os that took longer than the threshold to *complete*, while the
+/// `agentenv_ublk_io_in_flight{slow_io="true"}` gauge captures I/Os that
+/// have been *pending* past the threshold — including ones that never
+/// complete and therefore never enter the histogram.
+const UBLK_IO_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.002, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 pub fn init_prometheus_recorder() -> anyhow::Result<()> {
@@ -49,6 +61,10 @@ pub fn init_prometheus_recorder() -> anyhow::Result<()> {
         .set_buckets_for_metric(
             Matcher::Full("agentenv_overlaybd_zfile_decompress_duration_seconds".to_owned()),
             ZFILE_FINE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("agentenv_ublk_io_duration_seconds".to_owned()),
+            UBLK_IO_DURATION_BUCKETS,
         )?
         .install_recorder()?;
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
