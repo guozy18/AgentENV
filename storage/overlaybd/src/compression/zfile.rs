@@ -112,7 +112,7 @@ impl Drop for PooledBatchBuffer {
     }
 }
 
-const HEADER_TRAILER_SPACE: usize = 512;
+pub(crate) const HEADER_TRAILER_SPACE: usize = 512;
 const HEADER_TRAILER_BODY_SIZE: usize = 96;
 const BUF_SIZE: usize = 512;
 const NOI_WELL_KNOWN_PRIME: u32 = 100_007;
@@ -2416,15 +2416,19 @@ pub async fn is_zfile(file: Arc<dyn VirtualFile>) -> Result<i32> {
     let mut buf = [0u8; HEADER_TRAILER_SPACE];
     read_exact_at(file.as_ref(), &mut buf, 0).await?;
 
-    let ht = HeaderTrailer::decode_from_512(&buf)?;
+    Ok(i32::from(is_zfile_header(&buf)?))
+}
+
+pub(crate) fn is_zfile_header(buf: &[u8; HEADER_TRAILER_SPACE]) -> Result<bool> {
+    let ht = HeaderTrailer::decode_from_512(buf)?;
     if !ht.verify_magic() || !ht.is_header() {
-        return Ok(0);
+        return Ok(false);
     }
     ensure!(
-        ht.is_valid(&buf),
+        ht.is_valid(buf),
         "file is zfile but header digest is invalid"
     );
-    Ok(1)
+    Ok(true)
 }
 
 #[cfg(test)]
