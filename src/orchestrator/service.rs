@@ -563,9 +563,10 @@ where
                 if !launch_image_configs.is_empty() {
                     extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
                 };
+                // Keep the source image reference out of guest-visible MMDS metadata.
                 let launch_config = SandboxLaunchConfig {
                     sandbox_id,
-                    snapshot_id: image_ref.clone(),
+                    snapshot_id: "unknown".to_owned(),
                     env_vars,
                     network: network_policy.runtime_policy(),
                     extra_mmds,
