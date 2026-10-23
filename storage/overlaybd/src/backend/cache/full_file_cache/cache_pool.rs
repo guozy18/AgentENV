@@ -29,6 +29,8 @@ pub struct FileCacheBackendOptions {
     /// Initial cache data capacity; use `FileCacheBackend::set_capacity_bytes`
     /// to change the limit after construction.
     pub capacity_bytes: u64,
+    /// Maximum idle time for a closed cache entry. Zero disables idle eviction.
+    pub max_idle_secs: u64,
     /// Initial mmap capacity (default 32 TiB). GC targets 90% of this limit;
     /// it does not prevent new mappings or evict open/refilling entries.
     /// Zero asks GC to reclaim every idle mapping. Change at runtime with
@@ -67,6 +69,7 @@ impl Default for FileCacheBackendOptions {
         Self {
             cache_dir: PathBuf::from(DEFAULT_CACHE_DIR),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
+            max_idle_secs: 0,
             mmap_capacity_bytes: DEFAULT_MMAP_CAPACITY_BYTES,
             block_size: DEFAULT_BLOCK_SIZE,
             bk_download_max_inflight_blocks: download.max_inflight_blocks,
@@ -84,6 +87,7 @@ impl FileCacheBackendOptions {
         let mut opt = Self {
             cache_dir: PathBuf::from(&cfg.cache_dir),
             capacity_bytes: u64::from(cfg.cache_size_gb).saturating_mul(GIB),
+            max_idle_secs: cfg.max_idle_secs,
             mmap_capacity_bytes: DEFAULT_MMAP_CAPACITY_BYTES,
             block_size: if cfg.refill_size > 0 {
                 u64::from(cfg.refill_size)
@@ -534,13 +538,36 @@ impl FileCacheBackend {
         weak_state: std::sync::Weak<BackendState>,
         options: Arc<FileCacheBackendOptions>,
     ) {
-        let mut interval = tokio::time::interval(DEFAULT_EVICTION_PERIOD);
+        let mut capacity_interval = tokio::time::interval(DEFAULT_EVICTION_PERIOD);
+        capacity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut idle_interval = (options.max_idle_secs > 0).then(|| {
+            let period = std::time::Duration::from_secs((options.max_idle_secs / 10).max(1));
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+
         loop {
-            interval.tick().await;
-            let Some(state) = weak_state.upgrade() else {
-                break;
-            };
-            Self::eviction_inner_for(&state, &options).await;
+            tokio::select! {
+                biased;
+                _ = capacity_interval.tick() => {
+                    let Some(state) = weak_state.upgrade() else {
+                        break;
+                    };
+                    Self::capacity_eviction_inner_for(&state, &options).await;
+                }
+                _ = async {
+                    match idle_interval.as_mut() {
+                        Some(interval) => interval.tick().await,
+                        None => std::future::pending::<tokio::time::Instant>().await,
+                    }
+                } => {
+                    let Some(state) = weak_state.upgrade() else {
+                        break;
+                    };
+                    Self::idle_eviction_inner_for(&state, &options).await;
+                }
+            }
         }
     }
 
@@ -654,13 +681,13 @@ impl FileCacheBackend {
 
     /// Return idle cache IDs from oldest to newest, including entries with no
     /// cached data: removing them still releases their file and mapping.
-    fn evictable_cache_ids_by_lru(state: &BackendState) -> Vec<String> {
+    fn evictable_cache_ids_by_lru(state: &BackendState, evictable_before: u64) -> Vec<String> {
         let mut candidates = Vec::new();
         for slot_ref in state.cache_entries.iter() {
             let Some(entry) = slot_ref.value().as_active() else {
                 continue;
             };
-            if !Self::entry_is_busy(entry) {
+            if entry.last_access() <= evictable_before && !Self::entry_is_busy(entry) {
                 candidates.push((entry.last_access(), entry.cache_id.clone()));
             }
         }
@@ -753,6 +780,7 @@ impl FileCacheBackend {
         options: &FileCacheBackendOptions,
         cache_id: &str,
         counter: EvictionCounter,
+        evictable_before: u64,
     ) -> EvictedBytes {
         let (entry, notify) = {
             let mut slot_ref = match state.cache_entries.get_mut(cache_id) {
@@ -760,7 +788,9 @@ impl FileCacheBackend {
                 None => return EvictedBytes::default(),
             };
             let entry = match slot_ref.value().as_active() {
-                Some(e) if !Self::entry_is_busy(e) => e.clone(),
+                Some(e) if e.last_access() <= evictable_before && !Self::entry_is_busy(e) => {
+                    e.clone()
+                }
                 _ => return EvictedBytes::default(),
             };
             let notify = Arc::new(Notify::new());
@@ -829,7 +859,7 @@ impl FileCacheBackend {
         }
     }
 
-    async fn eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
+    async fn capacity_eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
         let disk = Self::capture_disk_pressure(options);
         let (disk_target, mmap_target, current_bytes, mmap_bytes) = {
             let _pressure_guard = state.pressure_lock.lock();
@@ -854,12 +884,13 @@ impl FileCacheBackend {
             let mut removed_mmap_bytes = 0u64;
             let mut cleared_open_entries = 0usize;
             let mut cleared_open_disk_bytes = 0u64;
-            for cache_id in Self::evictable_cache_ids_by_lru(state) {
+            for cache_id in Self::evictable_cache_ids_by_lru(state, u64::MAX) {
                 if disk_remaining == 0 && mmap_remaining == 0 {
                     break;
                 }
                 let evicted =
-                    Self::evict_entry(state, options, &cache_id, EvictionCounter::Global).await;
+                    Self::evict_entry(state, options, &cache_id, EvictionCounter::Global, u64::MAX)
+                        .await;
                 // Every removed entry has a non-empty mapping.
                 if evicted.mmap > 0 {
                     evicted_entries += 1;
@@ -939,8 +970,32 @@ impl FileCacheBackend {
         Self::publish_pressure_locked(state, final_disk);
     }
 
-    pub(crate) async fn eviction_inner(&self) {
-        Self::eviction_inner_for(&self.state, &self.options).await;
+    async fn idle_eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
+        if options.max_idle_secs == 0 {
+            return;
+        }
+
+        let max_idle_nanos = options.max_idle_secs.saturating_mul(1_000_000_000);
+        let evictable_before = now_unix_nanos().saturating_sub(max_idle_nanos);
+        for cache_id in Self::evictable_cache_ids_by_lru(state, evictable_before) {
+            Self::evict_entry(
+                state,
+                options,
+                &cache_id,
+                EvictionCounter::Global,
+                evictable_before,
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn capacity_eviction_inner(&self) {
+        Self::capacity_eviction_inner_for(&self.state, &self.options).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn idle_eviction_inner(&self) {
+        Self::idle_eviction_inner_for(&self.state, &self.options).await;
     }
 
     // -------------------------------------------------------------------
@@ -1128,13 +1183,18 @@ impl FileCacheBackend {
 
     pub async fn evict_by_size(&self, mut size: u64) -> Result<u64> {
         let mut evicted = 0u64;
-        for cache_id in Self::evictable_cache_ids_by_lru(&self.state) {
+        for cache_id in Self::evictable_cache_ids_by_lru(&self.state, u64::MAX) {
             if size == 0 {
                 break;
             }
-            let bytes =
-                Self::evict_entry(&self.state, &self.options, &cache_id, EvictionCounter::User)
-                    .await;
+            let bytes = Self::evict_entry(
+                &self.state,
+                &self.options,
+                &cache_id,
+                EvictionCounter::User,
+                u64::MAX,
+            )
+            .await;
             evicted = evicted.saturating_add(bytes.disk);
             size = size.saturating_sub(bytes.disk);
         }
@@ -1172,6 +1232,7 @@ impl FileCacheBackend {
                 &self.options,
                 &cache_id,
                 EvictionCounter::Global,
+                u64::MAX,
             )
             .await;
         }
@@ -1725,7 +1786,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            FileCacheBackend::eviction_inner_for(&state, &options),
+            FileCacheBackend::capacity_eviction_inner_for(&state, &options),
         )
         .await
         .expect("first eviction pass timed out");
@@ -1741,7 +1802,7 @@ mod tests {
         // entry. It ends when candidates run out, despite the retained mapping.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            FileCacheBackend::eviction_inner_for(&state, &options),
+            FileCacheBackend::capacity_eviction_inner_for(&state, &options),
         )
         .await
         .expect("second eviction pass timed out");

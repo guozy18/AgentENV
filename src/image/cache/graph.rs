@@ -730,6 +730,27 @@ impl ImageCacheMetadataStore {
         })
     }
 
+    /// Select all source configs whose last use is at or before the cutoff,
+    /// independently of cache capacity pressure.
+    pub(crate) async fn plan_idle_eviction(
+        &self,
+        evictable_before: u64,
+    ) -> Result<Vec<CapacityEvictionCandidate>> {
+        let mut candidates = self
+            .config_last_used_map()
+            .await?
+            .into_iter()
+            .filter(|(_, last_used)| *last_used <= evictable_before)
+            .map(|(config_id, last_used)| CapacityEvictionCandidate {
+                config_id,
+                last_used,
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .sort_unstable_by_key(|candidate| (candidate.last_used, candidate.config_id.clone()));
+        Ok(candidates)
+    }
+
     async fn hold_refs_set(&self, owner: &ImageCacheHoldOwner) -> Result<BTreeSet<HardCommitId>> {
         let prefix = hold_to_hard_prefix_for_owner(owner);
         let mut refs = BTreeSet::new();
@@ -1570,6 +1591,44 @@ mod tests {
                 .map(|candidate| candidate.config_id.clone())
                 .collect::<Vec<_>>(),
             vec![a, b]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_idle_eviction_selects_only_configs_before_cutoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = test_store(&temp).await;
+        let old = config_id("old-image.json");
+        let fresh = config_id("fresh-image.json");
+        for (id, digest) in [(&old, "sha256:old"), (&fresh, "sha256:fresh")] {
+            record_config(
+                &store,
+                &temp.path().join(id.as_str()),
+                json!([{
+                    "file": format!("../commits/{digest}/overlaybd.commit"),
+                    "digest": digest,
+                    "size": 10
+                }]),
+            )
+            .await;
+        }
+        store
+            .store
+            .write_batch(vec![
+                config_last_used_put_op(&old, 10).expect("old last-used record"),
+                config_last_used_put_op(&fresh, 20).expect("fresh last-used record"),
+            ])
+            .await
+            .expect("set last-used times");
+
+        let candidates = store.plan_idle_eviction(15).await.expect("idle plan");
+
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.config_id)
+                .collect::<Vec<_>>(),
+            vec![old]
         );
     }
 }

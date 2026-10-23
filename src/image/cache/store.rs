@@ -90,6 +90,7 @@ struct ImageCacheStore {
     cache: Arc<ImageCacheService>,
     gc_watermark: Option<(u64, u64)>,
     gc_min_age: Duration,
+    gc_max_idle: Option<Duration>,
 }
 
 struct ImageCacheSourceImageEntry {
@@ -206,7 +207,12 @@ impl RuntimeImageRefs for ImageCacheStore {
             .collect();
         let summary = self
             .cache
-            .run_maintenance(running, self.gc_watermark, self.gc_min_age)
+            .run_maintenance(
+                running,
+                self.gc_watermark,
+                self.gc_min_age,
+                self.gc_max_idle,
+            )
             .await?;
         info!(
             reclaimed = summary.collected,
@@ -233,6 +239,7 @@ pub(crate) fn local_image_services_from_app_config(config: &AppConfig) -> LocalI
         cache,
         gc_watermark: gc.watermark_bytes(capacity_bytes),
         gc_min_age: gc.min_age,
+        gc_max_idle: gc.max_idle,
     }))
 }
 
@@ -258,5 +265,6 @@ pub(crate) fn test_local_image_services_from_service(
         cache,
         gc_watermark,
         gc_min_age,
+        gc_max_idle: None,
     }))
 }

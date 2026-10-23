@@ -71,6 +71,10 @@ pub struct ImageRemoteBlocksCacheConfig {
     /// for both the remote-blocks and memory-blocks caches.
     #[config(default = 600u64)]
     pub open_evict_idle_secs: u64,
+    /// Delete closed cache entries that have not been accessed for this long.
+    /// Zero disables idle eviction.
+    #[config(default = 0u64)]
+    pub max_idle_secs: u64,
 }
 
 /// Background hard-commit GC scheduling. When enabled it runs the
@@ -85,6 +89,11 @@ pub struct ImageCacheGcConfig {
     /// capacity-driven eviction (the LRU floor).
     #[config(default = 600u64)]
     pub min_age_secs: u64,
+    /// Delete source configs with cache-owned local commits when they have not
+    /// been used for this long, regardless of capacity pressure. Zero disables
+    /// idle eviction.
+    #[config(default = 0u64)]
+    pub max_idle_secs: u64,
     /// Start evicting when local commit bytes exceed `capacity_gb` * this ratio.
     #[config(default = 0.95)]
     pub high_watermark_ratio: f64,
@@ -110,6 +119,7 @@ pub struct ResolvedImageCacheGcConfig {
     pub enabled: bool,
     pub interval: Duration,
     pub min_age: Duration,
+    pub max_idle: Option<Duration>,
     /// Validated to `0 < low_watermark_ratio <= high_watermark_ratio <= 1`.
     pub high_watermark_ratio: f64,
     pub low_watermark_ratio: f64,
@@ -155,6 +165,8 @@ impl ImageCacheConfig {
             enabled: self.gc.enabled,
             interval: Duration::from_secs(self.gc.interval_secs),
             min_age: Duration::from_secs(self.gc.min_age_secs),
+            max_idle: (self.gc.max_idle_secs > 0)
+                .then(|| Duration::from_secs(self.gc.max_idle_secs)),
             high_watermark_ratio: self.gc.high_watermark_ratio,
             low_watermark_ratio: self.gc.low_watermark_ratio,
         }

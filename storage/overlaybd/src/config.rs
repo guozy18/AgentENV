@@ -282,6 +282,9 @@ pub struct CacheConfig {
     pub cache_dir: String,
     #[serde(rename = "cacheSizeGB")]
     pub cache_size_gb: u32,
+    /// Delete closed cache entries that have not been accessed for this long.
+    /// Zero disables idle eviction.
+    pub max_idle_secs: u64,
     /// Block size for the cache (used as both the I/O unit and bitmap
     /// granularity). Must be a power of two >= 4096. Replaces the former
     /// separate `refill_size` setting.
@@ -298,6 +301,7 @@ impl Default for CacheConfig {
             cache_type: String::new(),
             cache_dir: "/opt/overlaybd/registry_cache".to_string(),
             cache_size_gb: 4,
+            max_idle_secs: 0,
             refill_size: 262_144,
             open_evict_idle_secs: 600,
         }

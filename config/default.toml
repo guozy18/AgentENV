@@ -95,6 +95,8 @@ capacity_gb = 100
 [image.cache.remote_blocks]
 # Maximum registry-backed remote block-cache size in GiB.
 max_size_gb = 100
+# Remove closed remote-file entries after this idle age; 0 disables idle eviction.
+max_idle_secs = 0
 
 [image.cache.gc]
 # Reconcile cache metadata and delete unreferenced hard commits in the
@@ -105,6 +107,8 @@ enabled = true
 interval_secs = 1800
 # Minimum idle age in seconds before capacity eviction (600 = 10 minutes).
 min_age_secs = 600
+# Remove idle source configs even without capacity pressure; 0 disables it.
+max_idle_secs = 0
 # Start capacity eviction at this fraction of capacity_gb (0.95 = 95%).
 high_watermark_ratio = 0.95
 # Evict down to this fraction of capacity_gb (0.70 = 70%).

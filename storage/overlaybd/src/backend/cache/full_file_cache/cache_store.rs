@@ -645,7 +645,7 @@ impl FileCacheBackend {
                                 retried_after_eviction = true;
                                 drop(_guard);
                                 drop(_barrier);
-                                self.eviction_inner().await;
+                                self.capacity_eviction_inner().await;
                             }
                             Err(err) => return Err(err),
                         }
@@ -656,8 +656,10 @@ impl FileCacheBackend {
             }
         }
 
-        // Trigger eviction if over capacity.
-        self.eviction_inner().await;
+        // Trigger capacity eviction only; idle eviction runs in the background worker.
+        // TODO: Removing this inline pass may improve refill latency, at the cost of
+        // allowing cache usage to exceed capacity until the background pass runs.
+        self.capacity_eviction_inner().await;
         Ok(())
     }
 
@@ -894,8 +896,10 @@ impl FileCacheBackend {
 
         entry.record_refill();
 
-        // Trigger eviction check asynchronously.
-        self.eviction_inner().await;
+        // Trigger capacity eviction only; idle eviction runs in the background worker.
+        // TODO: Removing this inline pass may improve write latency, at the cost of
+        // allowing cache usage to exceed capacity until the background pass runs.
+        self.capacity_eviction_inner().await;
         Ok(data.len())
     }
 

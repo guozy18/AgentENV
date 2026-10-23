@@ -1322,7 +1322,7 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
         })
         .collect();
     let summary = image_cache
-        .run_maintenance(running, None, Duration::from_secs(0))
+        .run_maintenance(running, None, Duration::from_secs(0), None)
         .await
         .expect("run gc");
 

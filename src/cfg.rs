@@ -1489,6 +1489,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn image_cache_idle_eviction_is_disabled_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().image.cache.gc.max_idle_secs, 0);
+        assert_eq!(config.config().image.cache.remote_blocks.max_idle_secs, 0);
+        Ok(())
+    }
+
+    #[test]
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;

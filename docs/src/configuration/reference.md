@@ -179,12 +179,16 @@ image-cache leases, or referenced by the in-process running set. Committed
 snapshots are durable repository state and do not pin ImageCache
 commits. With `capacity_gb` set, GC first evicts least-recently-used source
 configs over the high watermark so hard-commit GC can reclaim what they unrooted.
+When `max_idle_secs` is non-zero, source configs with cache-owned local commits
+that have been idle for at least that long are also evicted without requiring
+capacity pressure.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable the background image-cache GC task |
 | `interval_secs` | integer | `1800` | Seconds between GC passes (a value `<= 0` falls back to the default) |
 | `min_age_secs` | integer | `600` | Minimum time since last use before a source config is eligible for capacity eviction (the LRU floor) |
+| `max_idle_secs` | integer | `0` | Evict source configs with cache-owned local commits after this many idle seconds, even without capacity pressure. `0` disables idle eviction |
 | `high_watermark_ratio` | float | `0.95` | Begin capacity eviction once local commit bytes exceed `capacity_gb` × this ratio. Clamped to `(0, 1]` |
 | `low_watermark_ratio` | float | `0.70` | Evict down to `capacity_gb` × this ratio once the high watermark trips. Clamped to `(0, high_watermark_ratio]` |
 
@@ -201,6 +205,10 @@ Overlaybd registryfs_v2 remote block cache settings. The directory is always
 |-----|------|---------|-------------|
 | `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
 | `open_evict_idle_secs` | integer | `600` | Idle age in seconds after which a cache entry held open by a running sandbox may have its cached blocks reclaimed under capacity pressure. The entry is kept and refills on demand; `0` disables open-entry eviction. Written to generated overlaybd `cacheConfig.openEvictIdleSecs` and applies to both `remote-blocks` and `memory-blocks` caches |
+| `max_idle_secs` | integer | `0` | Evict closed remote-file cache entries idle for at least this many seconds. `0` disables idle eviction |
+
+Idle-entry scans are throttled to once every `max_idle_secs / 10` seconds
+(minimum one second), independently of the capacity-eviction worker.
 
 Resolved image data is cached under:
 

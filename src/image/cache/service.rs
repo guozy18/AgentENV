@@ -535,22 +535,29 @@ impl ImageCacheService {
         Ok(())
     }
 
-    /// Run a maintenance pass (optional capacity eviction + fail-closed GC),
-    /// deriving live refs from the running-set artifacts the adapter passes in.
-    /// Callers never see holds, digests, or the metadata graph.
+    /// Run a maintenance pass (optional capacity/idle eviction + fail-closed
+    /// GC), deriving live refs from the running-set artifacts the adapter passes
+    /// in. Callers never see holds, digests, or the metadata graph.
     pub(crate) async fn run_maintenance(
         self: &Arc<Self>,
         running: Vec<(String, Vec<PathBuf>)>,
         watermark: Option<(u64, u64)>,
         min_age: Duration,
+        max_idle: Option<Duration>,
     ) -> Result<ImageCacheGcSummary> {
-        let reconciled = if let Some((high, low)) = watermark {
+        let mut reconciled = false;
+        if let Some((high, low)) = watermark {
             self.evict_source_configs_over_capacity(high, low, min_age)
                 .await?;
-            true
-        } else {
-            false
-        };
+            reconciled = true;
+        }
+        if let Some(max_idle) = max_idle {
+            if !reconciled {
+                self.rebuild_metadata_from_configs().await?;
+            }
+            self.evict_idle_source_configs(max_idle).await?;
+            reconciled = true;
+        }
         let live_refs = self.live_refs_from_running(running).await?;
         let report = self.run_gc(live_refs, !reconciled).await?;
         Ok(ImageCacheGcSummary::from_report(&report))
@@ -931,6 +938,20 @@ impl ImageCacheService {
                 .await;
         }
 
+        Ok(())
+    }
+
+    async fn evict_idle_source_configs(&self, max_idle: Duration) -> Result<()> {
+        let evictable_before = unix_now_secs().saturating_sub(max_idle.as_secs());
+        let candidates = self
+            .metadata_store()
+            .await?
+            .plan_idle_eviction(evictable_before)
+            .await?;
+        for candidate in &candidates {
+            self.delete_source_image_config_best_effort(candidate, evictable_before)
+                .await;
+        }
         Ok(())
     }
 
@@ -2129,7 +2150,7 @@ mod tests {
         // Evicting the source must collect only its local copy, even while the
         // published config continues to refer to the same digest in POSIX.
         let report = service
-            .run_maintenance(Vec::new(), Some((0, 0)), Duration::ZERO)
+            .run_maintenance(Vec::new(), Some((0, 0)), Duration::ZERO, None)
             .await?;
         assert_eq!(report.collected, 1);
         assert_eq!(report.freed_bytes, layer.size);
@@ -2553,5 +2574,60 @@ mod tests {
             .await
             .expect("eviction");
         assert!(!config_path.exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_evicts_idle_configs_without_capacity_pressure() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let config_path = service.config_dir.join("base-image.json");
+        let commit = write_commit_file(&service, "sha256:hard", b"hard-commit");
+        write_config(&config_path);
+
+        let summary = service
+            .run_maintenance(
+                Vec::new(),
+                None,
+                Duration::from_secs(600),
+                Some(Duration::ZERO),
+            )
+            .await
+            .expect("maintenance");
+
+        assert!(!config_path.exists());
+        assert!(!commit.exists());
+        assert_eq!(summary.collected, 1);
+        assert_eq!(summary.freed_bytes, 11);
+    }
+    #[tokio::test]
+    async fn idle_eviction_preserves_leased_commits_until_release() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let config_path = service.config_dir.join("base-image.json");
+        let commit = write_commit_file(&service, "sha256:hard", b"hard-commit");
+        write_config(&config_path);
+        let owner = ImageCacheHoldOwner::new("paused", "sandbox-paused").unwrap();
+        service
+            .acquire_hold_for_config_paths(owner.clone(), [config_path.clone()])
+            .await
+            .unwrap();
+
+        let summary = service
+            .run_maintenance(Vec::new(), None, Duration::ZERO, Some(Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(!config_path.exists());
+        assert!(commit.exists(), "a paused sandbox still owns the commit");
+        assert_eq!(summary.collected, 0);
+
+        service
+            .release_hold_best_effort(&owner, "test_resume_and_delete")
+            .await;
+        let summary = service
+            .run_maintenance(Vec::new(), None, Duration::ZERO, Some(Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(summary.collected, 1);
+        assert!(!commit.exists());
     }
 }

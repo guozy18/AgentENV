@@ -1314,6 +1314,71 @@ async fn test_closed_entry_is_removed_by_evict_size() {
     assert!(backend.get_cache_entry(&cache_id).is_none());
 }
 
+#[tokio::test]
+async fn test_idle_eviction_is_separate_from_capacity_passes() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 32 * 4096;
+    opt.block_size = 4096;
+    opt.max_idle_secs = 86400;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    for key in ["idle-entry", "fresh-entry"] {
+        let src = Arc::new(MockSource::new(vec![7u8; 4096], Duration::ZERO));
+        let file = backend.open_file(key, src).await.expect("open file");
+        let _ = file.read_at(0, 4096).await.expect("fill cache");
+    }
+
+    let idle_id = super::cache_key_digest("idle-entry");
+    let fresh_id = super::cache_key_digest("fresh-entry");
+    backend
+        .get_cache_entry(&idle_id)
+        .expect("idle entry")
+        .last_access_nanos
+        .store(0, Ordering::Relaxed);
+
+    let open_source = Arc::new(MockSource::new(vec![9u8; 4096], Duration::ZERO));
+    let open_file = backend
+        .open_file("open-entry", open_source.clone())
+        .await
+        .expect("open");
+    let _ = open_file.read_at(0, 4096).await.expect("fill open entry");
+    let open_id = super::cache_key_digest("open-entry");
+    backend
+        .get_cache_entry(&open_id)
+        .unwrap()
+        .last_access_nanos
+        .store(0, Ordering::Relaxed);
+
+    backend.capacity_eviction_inner().await;
+    assert!(
+        backend.get_cache_entry(&idle_id).is_some(),
+        "capacity-only passes must not run idle eviction"
+    );
+    backend.idle_eviction_inner().await;
+
+    assert!(backend.get_cache_entry(&idle_id).is_none());
+    assert!(backend.get_cache_entry(&fresh_id).is_some());
+    assert!(backend.get_cache_entry(&open_id).is_some());
+    let _ = open_file
+        .read_at(0, 4096)
+        .await
+        .expect("open handle stays usable");
+    assert_eq!(open_source.read_calls(), 1);
+
+    let source = Arc::new(MockSource::new(vec![7u8; 4096], Duration::ZERO));
+    let reopened = backend
+        .open_file("idle-entry", source.clone())
+        .await
+        .expect("reopen");
+    assert_eq!(reopened.read_at(0, 4096).await.unwrap(), vec![7u8; 4096]);
+    assert_eq!(
+        source.read_calls(),
+        1,
+        "evicted data refills from its source"
+    );
+}
+
 // Ported from C++ RoCachedFs.Basic (commonTest(false, false, false)).
 #[tokio::test]
 async fn test_ro_cached_fs_basic() {
@@ -2038,7 +2103,7 @@ async fn test_mmap_capacity_initial_limit_and_growth_are_shared() {
     assert_eq!(backend.mmap_capacity_bytes(), 4 * page);
     drop(a);
     drop(b);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().entries, 2);
     assert_eq!(backend.stats().mmap_bytes, 2 * page);
     assert!(!backend.state.is_full.load(Ordering::Relaxed));
@@ -2084,7 +2149,7 @@ async fn test_mmap_capacity_background_gc_reclaims_empty_entries_by_lru() {
     assert!(backend.file_stats("open-map").is_some());
 
     backend.set_mmap_capacity_bytes(0);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().mmap_bytes, page);
     // Filling an existing mapping consumes no more VA, even above the mmap limit.
     assert!(!backend.state.is_full.load(Ordering::Relaxed));
@@ -2093,7 +2158,7 @@ async fn test_mmap_capacity_background_gc_reclaims_empty_entries_by_lru() {
         .expect("fill open mapping");
     assert_eq!(backend.stats().mmap_bytes, page);
     drop(open);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().mmap_bytes, 0);
 }
 
@@ -2143,7 +2208,7 @@ async fn test_mmap_capacity_gc_satisfies_disk_and_mapping_targets() {
             .last_access_nanos
             .store(age, Ordering::Relaxed);
     }
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     // An overlapping periodic pass may own an entry whose I/O is still pending.
     tokio::time::timeout(Duration::from_secs(5), async {
         while backend.stats().bytes_used != 0 || backend.stats().mmap_bytes > page {
@@ -2193,7 +2258,7 @@ async fn test_mmap_capacity_disk_gc_also_reclaims_empty_entries() {
             .last_access_nanos
             .store(age, Ordering::Relaxed);
     }
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while backend.stats().bytes_used != 0 || backend.stats().mmap_bytes != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2227,12 +2292,12 @@ async fn test_mmap_capacity_gc_preserves_inflight_refills() {
     ));
     drop(file);
     assert_eq!(entry.open_count.load(Ordering::SeqCst), 0);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert!(backend.file_stats("refilling").is_some());
     assert_eq!(backend.stats().mmap_bytes, page);
     entry.finish_refill(0);
     drop(entry);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().mmap_bytes, 0);
 }
 
@@ -2494,10 +2559,10 @@ async fn test_runtime_capacity_shrink_background_gc_preserves_open_entries() {
 
     // Zero still cannot evict an open entry, even when all its bytes exceed the limit.
     backend.set_capacity_bytes(0);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().bytes_used, 4096);
     drop(open);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().bytes_used, 0);
 }
 
@@ -2525,7 +2590,7 @@ async fn test_runtime_capacity_growth_keeps_idle_cache_and_allows_refill() {
     backend.set_capacity_bytes(64 * 1024);
     drop(a);
     drop(b);
-    backend.eviction_inner().await;
+    backend.capacity_eviction_inner().await;
     assert_eq!(backend.stats().bytes_used, 8192);
     assert!(backend.file_stats("grow-a").is_some());
     assert!(backend.file_stats("grow-b").is_some());

@@ -805,6 +805,7 @@ fn write_generated_overlaybd_global_config(
             "cacheDir": image_cache.remote_blocks_dir,
             "cacheSizeGB": image_cache.remote_blocks_size_gb,
             "openEvictIdleSecs": image_cache.open_evict_idle_secs,
+            "maxIdleSecs": app_config.image.cache.remote_blocks.max_idle_secs,
             "refillSize": 262144,
             "blockSize": 65536
         },
@@ -1562,18 +1563,20 @@ mod tests {
     }
 
     #[test]
-    fn generated_overlaybd_cache_config_sets_open_evict_idle() {
+    fn generated_overlaybd_cache_config_sets_idle_eviction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let rootfs = temp.path().join("overlaybd-global.json");
         let mem = temp.path().join("mem-overlaybd-global.json");
         let mut config =
             app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
         config.image.cache.remote_blocks.open_evict_idle_secs = 120;
+        config.image.cache.remote_blocks.max_idle_secs = 3600;
 
         write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
 
         for path in [&rootfs, &mem] {
             let value = read_global_config_value(path);
+            assert_eq!(value["cacheConfig"]["maxIdleSecs"].as_u64(), Some(3600));
             assert_eq!(
                 value["cacheConfig"]["openEvictIdleSecs"].as_u64(),
                 Some(120),
